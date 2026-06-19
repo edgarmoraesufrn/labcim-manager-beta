@@ -629,36 +629,24 @@ def request_access_code(conn, email: str) -> tuple[bool, str]:
 def page_login(conn) -> None:
     hero()
     st.subheader("Acesso ao sistema")
-    st.caption("Entre com seu e-mail cadastrado. O sistema envia uma senha volátil com validade curta.")
+    st.caption("Digite seu e-mail cadastrado. O sistema enviará uma senha volátil com validade curta.")
 
-    users = query_df(
-        conn,
-        """
-        SELECT full_name, email, role
-        FROM users
-        WHERE active = 1
-          AND email IS NOT NULL
-          AND TRIM(email) != ''
-        ORDER BY full_name
-        """,
-    )
+    query_email = clean_input(st.query_params.get("email", "")).lower()
+    if "login_email" not in st.session_state and query_email:
+        st.session_state["login_email"] = query_email
 
-    query_email = clean_input(st.query_params.get("email", ""))
-    selected_email = query_email
     with st.container(border=True):
         st.markdown("### Solicitar senha volátil")
-        if not users.empty:
-            options = ["Digitar e-mail manualmente"] + users.apply(
-                lambda r: f"{clean_value(r.get('full_name'))} — {clean_value(r.get('email'))}",
-                axis=1,
-            ).tolist()
-            choice = st.selectbox("Pré-preencher a partir dos usuários cadastrados", options, key="login_prefill_user")
-            if choice != "Digitar e-mail manualmente":
-                selected_email = str(users.iloc[options.index(choice) - 1]["email"])
-        email = st.text_input("E-mail", value=selected_email, key="login_email").strip().lower()
+        email = st.text_input(
+            "E-mail cadastrado",
+            placeholder="nome@ufrn.br",
+            key="login_email",
+        ).strip().lower()
         if st.button("Enviar senha volátil", type="primary", key="send_access_code"):
             ok, msg = request_access_code(conn, email)
             (st.success if ok else st.error)(msg)
+            if ok:
+                st.info(f"Use o código mais recente enviado para: {email}")
 
         if st.session_state.get("last_access_code"):
             st.warning(
@@ -669,16 +657,23 @@ def page_login(conn) -> None:
     with st.container(border=True):
         st.markdown("### Validar código")
         pending_email = st.session_state.get("pending_login_email", email)
-        verify_email = st.text_input("E-mail de validação", value=pending_email, key="verify_email").strip().lower()
-        code = st.text_input("Código recebido", max_chars=6, key="verify_code")
+        verify_email = st.text_input(
+            "Mesmo e-mail usado na solicitação",
+            value=pending_email,
+            key="verify_email",
+        ).strip().lower()
+        code = st.text_input("Código recebido", max_chars=6, key="verify_code").strip()
         if st.button("Entrar", type="primary", key="verify_access_code"):
-            ok, msg, row = verify_access_code_record(conn, email=verify_email, code_hash=_hash_access_code(code.strip()))
-            if ok and row is not None:
-                _set_authenticated_user(row)
-                st.success("Acesso liberado.")
-                st.rerun()
+            if not verify_email or not code:
+                st.error("Informe o e-mail e o código recebido.")
             else:
-                st.error(msg)
+                ok, msg, row = verify_access_code_record(conn, email=verify_email, code_hash=_hash_access_code(code))
+                if ok and row is not None:
+                    _set_authenticated_user(row)
+                    st.success("Acesso liberado.")
+                    st.rerun()
+                else:
+                    st.error(msg)
 
     if not email_is_configured():
         with st.expander("Configuração de e-mail SMTP para produção"):
