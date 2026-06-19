@@ -11,7 +11,6 @@ env/
 
 # Streamlit secrets - nunca subir senha/API key para o GitHub
 .streamlit/secrets.toml
-labcim_manager/.streamlit/secrets.toml
 
 # Banco local mutável
 # Para deploy no Streamlit Cloud, o app recria a base inicial a partir de data/LabCim_Base.xlsx.

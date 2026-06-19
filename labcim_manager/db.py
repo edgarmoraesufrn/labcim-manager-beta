@@ -331,12 +331,10 @@ def create_access_code_record(
 
 def verify_access_code_record(conn: sqlite3.Connection, *, email: str, code_hash: str) -> tuple[bool, str, sqlite3.Row | None]:
     email = str(email or "").strip().lower()
-    code_hash = str(code_hash or "").strip()
-    if not email or not code_hash:
-        return False, "Informe o e-mail e o código recebido.", None
-
-    # Procura primeiro um código ativo que combine com o e-mail E com o código informado.
-    # Isso evita falha quando há mais de um OTP recente para o mesmo usuário.
+    if not email:
+        return False, "E-mail não informado. Solicite uma nova senha volátil.", None
+    if not code_hash:
+        return False, "Código não informado.", None
     row = conn.execute(
         """
         SELECT ac.*, u.full_name, u.role, u.active, u.email AS user_email
@@ -350,54 +348,44 @@ def verify_access_code_record(conn: sqlite3.Connection, *, email: str, code_hash
         """,
         [email, code_hash],
     ).fetchone()
-
-    if row:
-        if int(row["active"] or 0) != 1:
-            return False, "Usuário inativo.", None
-        try:
-            expired = datetime.fromisoformat(str(row["expires_at"])) < datetime.now()
-        except Exception:
-            expired = True
-        if expired:
-            conn.execute("UPDATE access_codes SET used_at = CURRENT_TIMESTAMP WHERE id = ?", [row["id"]])
+    if not row:
+        active_for_email = conn.execute(
+            """
+            SELECT id
+            FROM access_codes
+            WHERE LOWER(TRIM(email)) = ?
+              AND used_at IS NULL
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            [email],
+        ).fetchone()
+        if active_for_email:
+            conn.execute(
+                "UPDATE access_codes SET attempts = COALESCE(attempts, 0) + 1 WHERE id = ?",
+                [active_for_email["id"]],
+            )
             conn.commit()
-            return False, "Código expirado. Solicite um novo código.", None
-        if int(row["attempts"] or 0) >= 5:
-            conn.execute("UPDATE access_codes SET used_at = CURRENT_TIMESTAMP WHERE id = ?", [row["id"]])
-            conn.commit()
-            return False, "Muitas tentativas. Solicite um novo código.", None
-        conn.execute("UPDATE access_codes SET used_at = CURRENT_TIMESTAMP WHERE id = ?", [row["id"]])
-        conn.commit()
-        return True, "Acesso liberado.", row
-
-    # Diagnóstico mais claro para o usuário.
-    latest = conn.execute(
-        """
-        SELECT ac.*, u.active
-        FROM access_codes ac
-        JOIN users u ON u.id = ac.user_id
-        WHERE LOWER(TRIM(ac.email)) = ?
-        ORDER BY ac.created_at DESC, ac.id DESC
-        LIMIT 1
-        """,
-        [email],
-    ).fetchone()
-    if not latest:
-        return False, "Não há código ativo para este e-mail. Solicite uma nova senha volátil.", None
-    if latest["used_at"]:
-        return False, "O código mais recente já foi utilizado. Solicite uma nova senha volátil.", None
+            return False, "Código inválido. Use o código mais recente recebido por e-mail.", None
+        return False, "Nenhum código ativo encontrado para este e-mail. Solicite uma nova senha volátil.", None
+    if int(row["active"] or 0) != 1:
+        return False, "Usuário inativo.", None
     try:
-        expired = datetime.fromisoformat(str(latest["expires_at"])) < datetime.now()
+        expired = datetime.fromisoformat(str(row["expires_at"])) < datetime.now()
     except Exception:
         expired = True
     if expired:
-        conn.execute("UPDATE access_codes SET used_at = CURRENT_TIMESTAMP WHERE id = ?", [latest["id"]])
+        conn.execute("UPDATE access_codes SET used_at = CURRENT_TIMESTAMP WHERE id = ?", [row["id"]])
         conn.commit()
         return False, "Código expirado. Solicite um novo código.", None
-
-    conn.execute("UPDATE access_codes SET attempts = COALESCE(attempts, 0) + 1 WHERE id = ?", [latest["id"]])
+    if int(row["attempts"] or 0) >= 5:
+        conn.execute("UPDATE access_codes SET used_at = CURRENT_TIMESTAMP WHERE id = ?", [row["id"]])
+        conn.commit()
+        return False, "Muitas tentativas. Solicite um novo código.", None
+    conn.execute("UPDATE access_codes SET used_at = CURRENT_TIMESTAMP WHERE id = ?", [row["id"]])
     conn.commit()
-    return False, "Código incorreto. Confira o e-mail mais recente e digite apenas os 6 números.", None
+    return True, "Acesso liberado.", row
+
 
 def log_notification(
     conn: sqlite3.Connection,
