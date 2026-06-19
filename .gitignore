@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Streamlit secrets - nunca subir senha/API key para o GitHub
+.streamlit/secrets.toml
+labcim_manager/.streamlit/secrets.toml
+
+# Banco local mutável
+# Para deploy no Streamlit Cloud, o app recria a base inicial a partir de data/LabCim_Base.xlsx.
+data/labcim_manager.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+
+# Uploads e arquivos temporários gerados em uso
+uploads/
+data/_uploaded_base.xlsx
+
+# Sistema operacional/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
