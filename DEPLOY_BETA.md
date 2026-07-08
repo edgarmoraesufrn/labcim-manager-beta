@@ -81,20 +81,36 @@ smtp_user = "labcim.manager@gmail.com"
 smtp_password = "COLE_AQUI_A_SENHA_DE_APP_DO_GOOGLE"
 smtp_from = "LabCim Manager <labcim.manager@gmail.com>"
 smtp_tls = true
+
+# PostgreSQL externo para persistência em produção/beta.
+# Substitua por uma URL real apenas nos Secrets do Streamlit Cloud.
+DATABASE_URL = "postgresql://USUARIO:SENHA@HOST:5432/NOME_DO_BANCO?sslmode=require"
 ```
 
 8. Clique em `Deploy`.
 
 ## 6. Atenção sobre persistência
 
-O Streamlit Community Cloud não deve ser tratado como armazenamento definitivo para SQLite local.
+O Streamlit Community Cloud não deve ser tratado como armazenamento definitivo para SQLite local. Para produção/beta, use PostgreSQL externo via `DATABASE_URL`.
 
-Nesta versão beta, o app recria a base inicial a partir de `data/LabCim_Base.xlsx`. Registros feitos durante o uso podem não sobreviver a reinícios/redeploys.
+Comportamento esperado:
 
-Para uso real contínuo, migrar para banco externo:
+- sem `DATABASE_URL`, o app usa SQLite local em `data/labcim_manager.db`;
+- com `DATABASE_URL`, o app usa PostgreSQL externo;
+- `data/LabCim_Base.xlsx` é importado apenas quando o banco operacional está vazio;
+- `data/labcim_manager.db` não deve ser versionado, pois é mutável e pode conter dados de uso.
+
+Opções comuns de PostgreSQL externo:
 
 - Supabase;
 - Neon PostgreSQL;
 - Render PostgreSQL;
 - outro PostgreSQL institucional.
 
+Para validar persistência:
+
+1. Configure `DATABASE_URL` nos Secrets.
+2. Faça deploy.
+3. Cadastre usuário, reserva e insumo/movimentação.
+4. Reinicie ou redeploye o app.
+5. Confirme que os dados continuam no app e no painel do provedor PostgreSQL.

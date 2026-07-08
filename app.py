@@ -39,6 +39,7 @@ from labcim_manager.db import (
     get_active_user_by_email,
     import_base_xlsx,
     init_db,
+    is_operational_database_empty,
     log_notification,
     query_df,
     seed_default_pops,
@@ -377,10 +378,32 @@ def setup_page() -> None:
     )
 
 
+def _database_url() -> str | None:
+    for key in ("DATABASE_URL", "database_url"):
+        try:
+            if hasattr(st, "secrets") and key in st.secrets:
+                value = str(st.secrets[key]).strip()
+                if value:
+                    return value
+        except Exception:
+            pass
+    try:
+        if hasattr(st, "secrets") and "database" in st.secrets:
+            database_secrets = st.secrets["database"]
+            for key in ("url", "DATABASE_URL", "database_url"):
+                if key in database_secrets:
+                    value = str(database_secrets[key]).strip()
+                    if value:
+                        return value
+    except Exception:
+        pass
+    return os.environ.get("DATABASE_URL") or None
+
+
 def get_conn():
-    conn = connect(DB_PATH)
+    conn = connect(DB_PATH, database_url=_database_url())
     init_db(conn)
-    if BASE_XLSX.exists() and table_counts(conn)["equipment"] == 0:
+    if BASE_XLSX.exists() and is_operational_database_empty(conn):
         import_base_xlsx(conn, BASE_XLSX)
     seed_default_pops(conn)
     return conn
@@ -486,6 +509,7 @@ def maintenance_notification_recipients(conn, equipment_id: int, include_future_
     ).fetchall()
     emails = [r["email"] for r in manager_rows] + [r["email"] for r in specific_rows]
     if include_future_users:
+        now_iso = datetime.now().isoformat(timespec="minutes")
         future_rows = conn.execute(
             """
             SELECT DISTINCT u.email
@@ -493,12 +517,12 @@ def maintenance_notification_recipients(conn, equipment_id: int, include_future_
             JOIN users u ON u.id = b.user_id
             WHERE b.equipment_id = ?
               AND b.status = 'scheduled'
-              AND datetime(b.start_datetime) >= datetime('now')
+              AND b.start_datetime >= ?
               AND u.active = 1
               AND u.email IS NOT NULL
               AND TRIM(u.email) != ''
             """,
-            [equipment_id],
+            [equipment_id, now_iso],
         ).fetchall()
         emails.extend([r["email"] for r in future_rows])
     return _unique_emails(emails)
@@ -1056,6 +1080,8 @@ def _operator_options(operators: pd.DataFrame) -> list[str]:
 
 
 def _booking_query_for_equipment(conn, equipment_id: int, start_date: date, end_date: date, include_cancelled: bool = True) -> pd.DataFrame:
+    start_iso = datetime.combine(start_date, time.min).isoformat(timespec="minutes")
+    end_iso = datetime.combine(end_date + timedelta(days=1), time.min).isoformat(timespec="minutes")
     sql = """
         SELECT b.id, e.equipment_code, e.equipment_name, u.full_name AS solicitante,
                p.project_name, op.full_name AS operador, perf.full_name AS executante,
@@ -1068,9 +1094,10 @@ def _booking_query_for_equipment(conn, equipment_id: int, start_date: date, end_
         LEFT JOIN users perf ON perf.id=b.performed_by_id
         LEFT JOIN projects p ON p.id=b.project_id
         WHERE b.equipment_id = ?
-          AND date(b.start_datetime) BETWEEN date(?) AND date(?)
+          AND b.start_datetime >= ?
+          AND b.start_datetime < ?
     """
-    params = [equipment_id, start_date.isoformat(), end_date.isoformat()]
+    params = [equipment_id, start_iso, end_iso]
     if not include_cancelled:
         sql += " AND b.status != 'cancelled'"
     sql += " ORDER BY b.start_datetime"
@@ -1094,8 +1121,8 @@ def _calendar_events_for_equipment(conn, equipment_id: int, start_date: date, en
         LEFT JOIN users perf ON perf.id=b.performed_by_id
         LEFT JOIN projects p ON p.id=b.project_id
         WHERE b.equipment_id = ?
-          AND datetime(b.start_datetime) < datetime(?)
-          AND datetime(b.end_datetime) > datetime(?)
+          AND b.start_datetime < ?
+          AND b.end_datetime > ?
     """
     params = [equipment_id, end_iso, start_iso]
     if not include_cancelled:
@@ -1119,8 +1146,8 @@ def _calendar_events_for_equipment(conn, equipment_id: int, start_date: date, en
         JOIN equipment e ON e.id=mp.equipment_id
         WHERE mp.equipment_id = ?
           AND mp.planned_date IS NOT NULL
-          AND date(mp.planned_date) <= date(?)
-          AND date(COALESCE(mp.planned_end_date, mp.planned_date)) >= date(?)
+          AND mp.planned_date <= ?
+          AND COALESCE(mp.planned_end_date, mp.planned_date) >= ?
         ORDER BY mp.planned_date
         """,
         [equipment_id, end_date.isoformat(), start_date.isoformat()],
@@ -1508,7 +1535,7 @@ def page_reservas(conn):
             else:
                 if max_capacity and sample_count and int(sample_count) > max_capacity:
                     st.warning("A quantidade informada excede a capacidade usual. Como o bloqueio rígido não está ativo, a reserva será tentada mesmo assim.")
-                ok, msg = create_booking(
+                ok, msg, booking_id = create_booking(
                     conn,
                     equipment_id=equipment_id,
                     user_id=user_id,
@@ -1521,10 +1548,6 @@ def page_reservas(conn):
                     purpose=purpose,
                 )
                 if ok:
-                    try:
-                        booking_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-                    except Exception:
-                        booking_id = None
                     st.session_state["booking_confirmation"] = {
                         "id": booking_id,
                         "equipment": f"{clean_value(selected_eq.get('equipment_code'))} — {clean_value(selected_eq.get('equipment_name'))}",
@@ -2710,7 +2733,7 @@ def _filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, 
         LEFT JOIN users op ON op.id=b.operator_id
         LEFT JOIN users perf ON perf.id=b.performed_by_id
         LEFT JOIN projects p ON p.id=b.project_id
-        WHERE date(b.start_datetime) BETWEEN date(?) AND date(?)
+        WHERE SUBSTR(b.start_datetime, 1, 10) BETWEEN ? AND ?
         ORDER BY b.start_datetime
         """,
         [start_date.isoformat(), end_date.isoformat()],
@@ -2727,7 +2750,7 @@ def _filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, 
                mp.created_at, mp.updated_at
         FROM maintenance_preventive mp
         JOIN equipment e ON e.id=mp.equipment_id
-        WHERE date(COALESCE(mp.performed_date, mp.planned_date, mp.created_at)) BETWEEN date(?) AND date(?)
+        WHERE SUBSTR(COALESCE(mp.performed_date, mp.planned_date, mp.created_at), 1, 10) BETWEEN ? AND ?
         ORDER BY COALESCE(mp.performed_date, mp.planned_date, mp.created_at)
         """,
         [start_date.isoformat(), end_date.isoformat()],
@@ -2745,7 +2768,7 @@ def _filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, 
         FROM maintenance_corrective mc
         JOIN equipment e ON e.id=mc.equipment_id
         LEFT JOIN users u ON u.id=mc.reporter_id
-        WHERE date(COALESCE(mc.conclusion_date, mc.occurrence_datetime, mc.created_at)) BETWEEN date(?) AND date(?)
+        WHERE SUBSTR(COALESCE(mc.conclusion_date, mc.occurrence_datetime, mc.created_at), 1, 10) BETWEEN ? AND ?
         ORDER BY COALESCE(mc.conclusion_date, mc.occurrence_datetime, mc.created_at)
         """,
         [start_date.isoformat(), end_date.isoformat()],
@@ -2762,7 +2785,7 @@ def _filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, 
         JOIN supplies s ON s.id=sm.supply_id
         LEFT JOIN users u ON u.id=sm.user_id
         LEFT JOIN projects p ON p.id=sm.project_id
-        WHERE date(sm.movement_date) BETWEEN date(?) AND date(?)
+        WHERE SUBSTR(sm.movement_date, 1, 10) BETWEEN ? AND ?
         ORDER BY sm.movement_date
         """,
         [start_date.isoformat(), end_date.isoformat()],
