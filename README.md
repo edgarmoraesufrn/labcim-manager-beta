@@ -70,3 +70,30 @@ Para testar persistência em produção:
 3. Cadastre um usuário, uma reserva e um insumo ou movimentação de insumo.
 4. Reinicie ou redeploye o app.
 5. Confirme que os registros continuam aparecendo no sistema.
+
+## Armazenamento de arquivos
+
+O banco PostgreSQL/SQLite guarda apenas metadados dos anexos. PDFs, imagens, planilhas e vídeos enviados pelos usuários não são armazenados no banco.
+
+Comportamento esperado:
+
+- sem `DATABASE_URL` e sem configuração R2: usa armazenamento local em `data/uploads`, apenas para desenvolvimento;
+- com `DATABASE_URL` e R2 completo: usa Cloudflare R2;
+- com `DATABASE_URL` e R2 ausente/incompleto: o app bloqueia uploads e mostra erro claro, para evitar perda silenciosa de arquivos em produção.
+
+Secrets/variáveis aceitos no formato top-level do Streamlit Cloud:
+
+```toml
+DATABASE_URL = "postgresql://USUARIO:SENHA@HOST:5432/NOME_DO_BANCO?sslmode=require"
+R2_ACCOUNT_ID = "SEU_ACCOUNT_ID"
+R2_ENDPOINT_URL = "https://SEU_ACCOUNT_ID.r2.cloudflarestorage.com"
+R2_ACCESS_KEY_ID = "SEU_ACCESS_KEY_ID"
+R2_SECRET_ACCESS_KEY = "SEU_SECRET_ACCESS_KEY"
+R2_BUCKET = "labcim-manager-arquivos"
+```
+
+Também são aceitas as seções `[database]` com `url` e `[r2]` com as mesmas chaves R2. Para uploads em produção, `R2_ENDPOINT_URL`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` e `R2_BUCKET` precisam estar configurados; `R2_ACCOUNT_ID` é mantido no exemplo para facilitar a conferência do endpoint.
+
+O bucket R2 deve permanecer privado. Downloads devem ser feitos pelo app via URL assinada temporária. Caminhos e links antigos nos campos `*_path` continuam tratados como modo legado, sem migração destrutiva.
+
+`data/uploads` não deve ser versionado porque contém arquivos enviados por usuários e é efêmero em deploys como Streamlit Cloud.

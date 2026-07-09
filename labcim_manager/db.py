@@ -296,6 +296,31 @@ def init_db(conn: DatabaseConnection) -> None:
             FOREIGN KEY(project_id) REFERENCES projects(id)
         );
 
+        CREATE TABLE IF NOT EXISTS attachments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_type TEXT NOT NULL,
+            entity_id INTEGER NOT NULL,
+            attachment_role TEXT NOT NULL DEFAULT 'general',
+            original_filename TEXT NOT NULL,
+            storage_key TEXT NOT NULL,
+            storage_backend TEXT NOT NULL,
+            mime_type TEXT,
+            file_size INTEGER,
+            sha256 TEXT,
+            uploaded_by_id INTEGER,
+            uploaded_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            notes TEXT,
+            is_active INTEGER DEFAULT 1,
+            FOREIGN KEY(uploaded_by_id) REFERENCES users(id),
+            UNIQUE(storage_backend, storage_key)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_attachments_entity
+            ON attachments (entity_type, entity_id, is_active);
+
+        CREATE INDEX IF NOT EXISTS idx_attachments_sha256
+            ON attachments (sha256);
+
         CREATE TABLE IF NOT EXISTS access_codes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -383,6 +408,7 @@ OPERATIONAL_TABLES = [
 
 ALL_TABLES = [
     *OPERATIONAL_TABLES,
+    "attachments",
     "access_codes",
     "notification_log",
 ]
@@ -405,13 +431,137 @@ def insert_returning_id(
     sql: str,
     params: list[Any] | tuple[Any, ...],
 ) -> int:
+    new_id = _execute_insert_returning_id(conn, sql, params)
+    conn.commit()
+    return new_id
+
+
+def _execute_insert_returning_id(
+    conn: DatabaseConnection,
+    sql: str,
+    params: list[Any] | tuple[Any, ...],
+) -> int:
     if db_backend(conn) == "postgres":
         row = conn.execute(f"{sql.rstrip().rstrip(';')} RETURNING id", params).fetchone()
-        conn.commit()
         return int(row["id"])
     cur = conn.execute(sql, params)
-    conn.commit()
     return int(cur.lastrowid)
+
+
+def create_attachment(
+    conn: DatabaseConnection,
+    *,
+    entity_type: str,
+    entity_id: int,
+    attachment_role: str,
+    original_filename: str,
+    storage_key: str,
+    storage_backend: str,
+    mime_type: str | None,
+    file_size: int,
+    sha256: str,
+    uploaded_by_id: int | None,
+    notes: str | None = None,
+    is_active: int = 1,
+) -> int:
+    return insert_returning_id(
+        conn,
+        """
+        INSERT INTO attachments (
+            entity_type, entity_id, attachment_role, original_filename,
+            storage_key, storage_backend, mime_type, file_size, sha256,
+            uploaded_by_id, notes, is_active
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            entity_type,
+            entity_id,
+            attachment_role,
+            original_filename,
+            storage_key,
+            storage_backend,
+            mime_type,
+            file_size,
+            sha256,
+            uploaded_by_id,
+            notes,
+            is_active,
+        ],
+    )
+
+
+def list_attachments(
+    conn: DatabaseConnection,
+    *,
+    entity_type: str,
+    entity_id: int,
+    attachment_role: str | None = None,
+    active_only: bool = True,
+) -> list[Any]:
+    sql = """
+        SELECT *
+        FROM attachments
+        WHERE entity_type = ?
+          AND entity_id = ?
+    """
+    params: list[Any] = [entity_type, entity_id]
+    if attachment_role:
+        sql += " AND attachment_role = ?"
+        params.append(attachment_role)
+    if active_only:
+        sql += " AND COALESCE(is_active, 1) = 1"
+    sql += " ORDER BY uploaded_at DESC, id DESC"
+    return conn.execute(sql, params).fetchall()
+
+
+def get_attachment(conn: DatabaseConnection, attachment_id: int) -> Any | None:
+    return conn.execute("SELECT * FROM attachments WHERE id = ?", [attachment_id]).fetchone()
+
+
+def get_latest_attachment_for_entity(
+    conn: DatabaseConnection,
+    *,
+    entity_type: str,
+    entity_id: int,
+    attachment_role: str | None = None,
+) -> Any | None:
+    rows = list_attachments(
+        conn,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        attachment_role=attachment_role,
+        active_only=True,
+    )
+    return rows[0] if rows else None
+
+
+def deactivate_attachment(conn: DatabaseConnection, attachment_id: int) -> None:
+    conn.execute("UPDATE attachments SET is_active = 0 WHERE id = ?", [attachment_id])
+    conn.commit()
+
+
+_LEGACY_ATTACHMENT_COLUMNS: dict[str, set[str]] = {
+    "supplies": {"safety_doc_path", "technical_doc_path"},
+    "supply_movements": {"document_path"},
+    "maintenance_preventive": {"checklist_path", "certificate_path"},
+    "maintenance_corrective": {"attachment_path"},
+}
+
+
+def update_legacy_attachment_path(
+    conn: DatabaseConnection,
+    *,
+    table: str,
+    row_id: int,
+    column: str,
+    value: str | None,
+) -> None:
+    if column not in _LEGACY_ATTACHMENT_COLUMNS.get(table, set()):
+        raise ValueError("Campo legado de anexo não permitido.")
+    updated_at = ", updated_at = CURRENT_TIMESTAMP" if table != "supply_movements" else ""
+    conn.execute(f"UPDATE {table} SET {column} = ?{updated_at} WHERE id = ?", [value, row_id])
+    conn.commit()
 
 
 def get_active_user_by_email(conn: sqlite3.Connection, email: str) -> sqlite3.Row | None:
@@ -1390,8 +1540,9 @@ def create_corrective_ticket(
     notify_manager: int,
     notify_supplier: int,
     notify_reporter: int,
-) -> None:
-    conn.execute(
+) -> int:
+    return insert_returning_id(
+        conn,
         """
         INSERT INTO maintenance_corrective (
             equipment_id, reporter_id, title, description, occurrence_datetime, impact,
@@ -1428,7 +1579,6 @@ def create_corrective_ticket(
             notify_reporter,
         ],
     )
-    conn.commit()
 
 
 def update_corrective_status(conn: sqlite3.Connection, ticket_id: int, status: str) -> None:
@@ -1591,12 +1741,12 @@ def create_supply_movement(
     project_id: int | None,
     purpose: str | None,
     document_path: str | None,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, int | None]:
     row = conn.execute("SELECT * FROM supplies WHERE id = ?", [supply_id]).fetchone()
     if not row:
-        return False, "Insumo não encontrado."
+        return False, "Insumo não encontrado.", None
     if quantity <= 0:
-        return False, "A quantidade precisa ser maior que zero."
+        return False, "A quantidade precisa ser maior que zero.", None
 
     movement_type = movement_type.lower()
     current = float(row["current_quantity"] or 0)
@@ -1609,12 +1759,13 @@ def create_supply_movement(
         "ajuste negativo": -quantity,
     }
     if movement_type not in delta_map:
-        return False, "Tipo de movimentação inválido."
+        return False, "Tipo de movimentação inválido.", None
     new_quantity = current + delta_map[movement_type]
     if new_quantity < -1e-9:
-        return False, f"Saldo insuficiente. Saldo atual: {current:g} {row['unit'] or ''}."
+        return False, f"Saldo insuficiente. Saldo atual: {current:g} {row['unit'] or ''}.", None
 
-    conn.execute(
+    movement_id = _execute_insert_returning_id(
+        conn,
         """
         INSERT INTO supply_movements (
             supply_id, movement_type, movement_date, quantity, unit,
@@ -1639,4 +1790,4 @@ def create_supply_movement(
         [new_quantity, supply_id],
     )
     conn.commit()
-    return True, f"Movimentação registrada. Novo saldo: {new_quantity:g} {row['unit'] or ''}."
+    return True, f"Movimentação registrada. Novo saldo: {new_quantity:g} {row['unit'] or ''}.", movement_id

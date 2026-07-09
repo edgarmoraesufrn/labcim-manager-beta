@@ -27,6 +27,7 @@ import streamlit as st
 
 from labcim_manager.db import (
     connect,
+    create_attachment,
     create_booking,
     create_corrective_ticket,
     create_equipment,
@@ -37,6 +38,8 @@ from labcim_manager.db import (
     create_supply_movement,
     create_user,
     get_active_user_by_email,
+    get_attachment,
+    get_latest_attachment_for_entity,
     import_base_xlsx,
     init_db,
     is_operational_database_empty,
@@ -48,10 +51,18 @@ from labcim_manager.db import (
     update_corrective_status,
     update_equipment_master,
     update_equipment_operational_info,
+    update_legacy_attachment_path,
     update_project,
     update_supply,
     update_user,
     verify_access_code_record,
+)
+from labcim_manager.storage import (
+    LocalStorageBackend,
+    R2StorageBackend,
+    StorageConfigurationError,
+    get_active_storage_backend,
+    get_storage_backend_for_name,
 )
 
 APP_TITLE = "LabCim Manager"
@@ -2011,15 +2022,74 @@ def _equipment_id_from_label(equipment: pd.DataFrame, label: str) -> int:
     return int(equipment.iloc[labels.index(label)]["id"])
 
 
-def _save_upload(uploaded_file, folder: str) -> str | None:
+def _current_user_id() -> int | None:
+    user = current_user()
+    try:
+        return int(user.get("id")) if user.get("id") is not None else None
+    except Exception:
+        return None
+
+
+def _attachment_ref(attachment_id: int) -> str:
+    return f"attachment:{int(attachment_id)}"
+
+
+def _attachment_id_from_ref(path_value) -> int | None:
+    path_text = clean_input(path_value)
+    if not path_text.lower().startswith("attachment:"):
+        return None
+    try:
+        return int(path_text.split(":", 1)[1])
+    except Exception:
+        return None
+
+
+def _ensure_storage_ready_for_upload(*uploaded_files) -> bool:
+    if not any(uploaded_file is not None for uploaded_file in uploaded_files):
+        return True
+    try:
+        get_active_storage_backend(database_url=_database_url())
+        return True
+    except StorageConfigurationError as exc:
+        st.error(str(exc))
+        return False
+
+
+def _save_upload(
+    conn,
+    uploaded_file,
+    *,
+    entity_type: str,
+    entity_id: int,
+    attachment_role: str,
+    notes: str | None = None,
+) -> str | None:
     if uploaded_file is None:
         return None
-    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", uploaded_file.name)
-    target_dir = Path("data/uploads") / folder
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_name}"
-    target.write_bytes(uploaded_file.getvalue())
-    return str(target)
+    backend = get_active_storage_backend(database_url=_database_url())
+    content = uploaded_file.getvalue()
+    stored = backend.save_file(
+        entity_type=entity_type,
+        entity_id=int(entity_id),
+        original_filename=uploaded_file.name,
+        content=content,
+        mime_type=getattr(uploaded_file, "type", None),
+    )
+    attachment_id = create_attachment(
+        conn,
+        entity_type=entity_type,
+        entity_id=int(entity_id),
+        attachment_role=attachment_role,
+        original_filename=stored.original_filename,
+        storage_key=stored.storage_key,
+        storage_backend=stored.storage_backend,
+        mime_type=stored.mime_type,
+        file_size=stored.file_size,
+        sha256=stored.sha256,
+        uploaded_by_id=_current_user_id(),
+        notes=notes,
+    )
+    return _attachment_ref(attachment_id)
 
 
 def _supply_options(supplies: pd.DataFrame) -> list[str]:
@@ -2045,7 +2115,55 @@ def _select_index_by_supply_id(supplies: pd.DataFrame, supply_id: str | int | No
     return ids.index(supply_id) if supply_id in ids else 0
 
 
-def _download_or_link_document(path_value, label: str, key: str) -> None:
+def _render_attachment_download(attachment_row, label: str, key: str) -> bool:
+    if not attachment_row:
+        return False
+    try:
+        backend = get_storage_backend_for_name(attachment_row["storage_backend"])
+        filename = clean_value(attachment_row["original_filename"], "arquivo")
+        mime = clean_value(attachment_row["mime_type"], "application/octet-stream")
+        if isinstance(backend, R2StorageBackend):
+            url = backend.generate_download_url(attachment_row["storage_key"], filename)
+            st.link_button(label, url)
+            return True
+        if isinstance(backend, LocalStorageBackend):
+            st.download_button(
+                label,
+                data=backend.get_file_bytes(attachment_row["storage_key"]),
+                file_name=filename,
+                mime=mime,
+                key=key,
+            )
+            return True
+    except Exception as exc:
+        st.warning(f"Não foi possível abrir o anexo persistido: {exc}")
+    return False
+
+
+def _download_or_link_document(
+    conn,
+    path_value,
+    label: str,
+    key: str,
+    *,
+    entity_type: str | None = None,
+    entity_id: int | None = None,
+    attachment_role: str | None = None,
+) -> None:
+    if entity_type and entity_id is not None:
+        latest = get_latest_attachment_for_entity(
+            conn,
+            entity_type=entity_type,
+            entity_id=int(entity_id),
+            attachment_role=attachment_role,
+        )
+        if _render_attachment_download(latest, label, key):
+            return
+
+    attachment_id = _attachment_id_from_ref(path_value)
+    if attachment_id is not None and _render_attachment_download(get_attachment(conn, attachment_id), label, key):
+        return
+
     path_text = clean_input(path_value)
     if not path_text:
         return
@@ -2058,7 +2176,7 @@ def _download_or_link_document(path_value, label: str, key: str) -> None:
         st.download_button(label, data=doc_path.read_bytes(), file_name=doc_path.name, mime=mime, key=key)
 
 
-def render_supply_quick_card(supply_row: pd.Series) -> None:
+def render_supply_quick_card(conn, supply_row: pd.Series) -> None:
     alert = _supply_alert_status(supply_row)
     qty = 0.0 if is_blank(supply_row.get("current_quantity")) else float(supply_row.get("current_quantity"))
     min_qty = 0.0 if is_blank(supply_row.get("minimum_quantity")) else float(supply_row.get("minimum_quantity"))
@@ -2078,9 +2196,25 @@ def render_supply_quick_card(supply_row: pd.Series) -> None:
     )
     c1, c2 = st.columns(2)
     with c1:
-        _download_or_link_document(supply_row.get("safety_doc_path"), "📄 Baixar/abrir FDS/FISPQ", f"supply_safety_qr_{int(supply_row['id'])}")
+        _download_or_link_document(
+            conn,
+            supply_row.get("safety_doc_path"),
+            "📄 Baixar/abrir FDS/FISPQ",
+            f"supply_safety_qr_{int(supply_row['id'])}",
+            entity_type="supply",
+            entity_id=int(supply_row["id"]),
+            attachment_role="safety_doc",
+        )
     with c2:
-        _download_or_link_document(supply_row.get("technical_doc_path"), "📎 Baixar/abrir ficha técnica", f"supply_technical_qr_{int(supply_row['id'])}")
+        _download_or_link_document(
+            conn,
+            supply_row.get("technical_doc_path"),
+            "📎 Baixar/abrir ficha técnica",
+            f"supply_technical_qr_{int(supply_row['id'])}",
+            entity_type="supply",
+            entity_id=int(supply_row["id"]),
+            attachment_role="technical_doc",
+        )
 
 
 def _project_id_from_label(projects: pd.DataFrame, label: str) -> int | None:
@@ -2136,7 +2270,7 @@ def page_insumos(conn):
             qr_supply = pd.DataFrame()
         if not qr_supply.empty:
             st.markdown("### Ficha rápida do insumo")
-            render_supply_quick_card(qr_supply.iloc[0])
+            render_supply_quick_card(conn, qr_supply.iloc[0])
             st.info("QR de insumo detectado. Use a aba **Movimentar estoque** para registrar entrada, saída, descarte ou ajuste.")
         else:
             st.warning("QR de insumo detectado, mas o insumo não foi encontrado no banco atual.")
@@ -2264,11 +2398,9 @@ def page_insumos(conn):
                 st.error("Cadastro/edição estrutural de insumos exige perfil Gerente ou Administrador.")
             elif not supply_name.strip():
                 st.error("Informe o nome do insumo.")
+            elif not _ensure_storage_ready_for_upload(safety_upload, technical_upload):
+                pass
             else:
-                safety_uploaded_path = _save_upload(safety_upload, "supply_safety_docs")
-                technical_uploaded_path = _save_upload(technical_upload, "supply_technical_docs")
-                safety_final = safety_uploaded_path or safety_doc_path.strip() or None
-                technical_final = technical_uploaded_path or technical_doc_path.strip() or None
                 if mode == "Novo insumo":
                     supply_id = create_supply(
                         conn,
@@ -2286,8 +2418,8 @@ def page_insumos(conn):
                         expiration_date=expiration_date.isoformat() if expiration_date else None,
                         location=location.strip() or None,
                         responsible_name=responsible_name.strip() or None,
-                        safety_doc_path=safety_final,
-                        technical_doc_path=technical_final,
+                        safety_doc_path=safety_doc_path.strip() or None,
+                        technical_doc_path=technical_doc_path.strip() or None,
                         density=float(density) if density else None,
                         recommended_concentration=recommended_concentration.strip() or None,
                         recommended_temperature=recommended_temperature.strip() or None,
@@ -2306,12 +2438,61 @@ def page_insumos(conn):
                             purpose="Saldo inicial cadastrado.",
                             document_path=None,
                         )
+                    if safety_upload is not None:
+                        safety_ref = _save_upload(
+                            conn,
+                            safety_upload,
+                            entity_type="supply",
+                            entity_id=supply_id,
+                            attachment_role="safety_doc",
+                        )
+                        update_legacy_attachment_path(
+                            conn,
+                            table="supplies",
+                            row_id=supply_id,
+                            column="safety_doc_path",
+                            value=safety_ref,
+                        )
+                    if technical_upload is not None:
+                        technical_ref = _save_upload(
+                            conn,
+                            technical_upload,
+                            entity_type="supply",
+                            entity_id=supply_id,
+                            attachment_role="technical_doc",
+                        )
+                        update_legacy_attachment_path(
+                            conn,
+                            table="supplies",
+                            row_id=supply_id,
+                            column="technical_doc_path",
+                            value=technical_ref,
+                        )
                     st.success("Insumo cadastrado com sucesso.")
                     st.rerun()
                 else:
+                    supply_id = int(selected_supply["id"])
+                    safety_final = safety_doc_path.strip() or None
+                    technical_final = technical_doc_path.strip() or None
+                    if safety_upload is not None:
+                        safety_final = _save_upload(
+                            conn,
+                            safety_upload,
+                            entity_type="supply",
+                            entity_id=supply_id,
+                            attachment_role="safety_doc",
+                        )
+                    if technical_upload is not None:
+                        technical_final = _save_upload(
+                            conn,
+                            technical_upload,
+                            entity_type="supply",
+                            entity_id=supply_id,
+                            attachment_role="technical_doc",
+                        )
                     update_supply(
                         conn,
-                        int(selected_supply["id"]),
+                        supply_id,
                         supply_name=supply_name.strip(),
                         commercial_name=commercial_name.strip() or None,
                         manufacturer=manufacturer.strip() or None,
@@ -2365,21 +2546,36 @@ def page_insumos(conn):
                 move_submitted = st.form_submit_button("Registrar movimentação", type="primary")
 
             if move_submitted:
-                doc_path = _save_upload(movement_doc, "supply_movements")
-                ok, msg = create_supply_movement(
-                    conn,
-                    supply_id=supply_id,
-                    movement_type=movement_type,
-                    movement_date=movement_date.isoformat(),
-                    quantity=float(quantity),
-                    user_id=_user_id_from_label(users, user_label),
-                    project_id=_project_id_from_label(projects, project_label),
-                    purpose=purpose.strip() or None,
-                    document_path=doc_path,
-                )
-                (st.success if ok else st.error)(msg)
-                if ok:
-                    st.rerun()
+                if _ensure_storage_ready_for_upload(movement_doc):
+                    ok, msg, movement_id = create_supply_movement(
+                        conn,
+                        supply_id=supply_id,
+                        movement_type=movement_type,
+                        movement_date=movement_date.isoformat(),
+                        quantity=float(quantity),
+                        user_id=_user_id_from_label(users, user_label),
+                        project_id=_project_id_from_label(projects, project_label),
+                        purpose=purpose.strip() or None,
+                        document_path=None,
+                    )
+                    if ok and movement_doc is not None and movement_id is not None:
+                        doc_ref = _save_upload(
+                            conn,
+                            movement_doc,
+                            entity_type="supply_movement",
+                            entity_id=movement_id,
+                            attachment_role="movement_document",
+                        )
+                        update_legacy_attachment_path(
+                            conn,
+                            table="supply_movements",
+                            row_id=movement_id,
+                            column="document_path",
+                            value=doc_ref,
+                        )
+                    (st.success if ok else st.error)(msg)
+                    if ok:
+                        st.rerun()
 
     with tab_hist:
         st.markdown("### Histórico de movimentações")
@@ -2482,9 +2678,9 @@ def page_manutencao(conn):
                     st.error("Informe a descrição da atividade.")
                 elif planned_end_date and planned_date and planned_end_date < planned_date:
                     st.error("A data final prevista não pode ser anterior à data inicial.")
+                elif not _ensure_storage_ready_for_upload(checklist, certificate):
+                    pass
                 else:
-                    checklist_path = _save_upload(checklist, "preventive_checklists")
-                    cert_path = _save_upload(certificate, "calibration_certificates")
                     preventive_id = create_preventive_activity(
                         conn,
                         equipment_id=equipment_id,
@@ -2495,13 +2691,13 @@ def page_manutencao(conn):
                         planned_end_date=planned_end_date.isoformat() if planned_end_date else None,
                         performed_date=performed_date.isoformat() if performed_date else None,
                         execution_time=execution_time.strip() or None,
-                        checklist_path=checklist_path,
+                        checklist_path=None,
                         internal_responsible=internal_responsible.strip() or None,
                         external_supplier=external_supplier.strip() or None,
                         supplier_contact=supplier_contact.strip() or None,
                         service_order=service_order.strip() or None,
                         status=status,
-                        certificate_path=cert_path,
+                        certificate_path=None,
                         observations=observations.strip() or None,
                         next_date=next_date.isoformat() if next_date else None,
                         blocks_booking=int(blocks_booking),
@@ -2510,6 +2706,36 @@ def page_manutencao(conn):
                         notify_supplier=int(notify_supplier),
                         notify_users=int(notify_users),
                     )
+                    if checklist is not None:
+                        checklist_ref = _save_upload(
+                            conn,
+                            checklist,
+                            entity_type="maintenance_preventive",
+                            entity_id=preventive_id,
+                            attachment_role="preventive_checklist",
+                        )
+                        update_legacy_attachment_path(
+                            conn,
+                            table="maintenance_preventive",
+                            row_id=preventive_id,
+                            column="checklist_path",
+                            value=checklist_ref,
+                        )
+                    if certificate is not None:
+                        cert_ref = _save_upload(
+                            conn,
+                            certificate,
+                            entity_type="maintenance_preventive",
+                            entity_id=preventive_id,
+                            attachment_role="preventive_certificate",
+                        )
+                        update_legacy_attachment_path(
+                            conn,
+                            table="maintenance_preventive",
+                            row_id=preventive_id,
+                            column="certificate_path",
+                            value=cert_ref,
+                        )
                     if blocks_booking and status not in {"realizado", "cancelado"}:
                         sent, total = notify_equipment_maintenance(
                             conn,
@@ -2603,10 +2829,11 @@ def page_manutencao(conn):
             if st.button("Abrir ticket corretivo", type="primary"):
                 if not title.strip() or not description.strip():
                     st.error("Informe o título e a descrição do ticket.")
+                elif not _ensure_storage_ready_for_upload(attachment):
+                    pass
                 else:
-                    attachment_path = _save_upload(attachment, "corrective_tickets")
                     occurrence_dt = datetime.combine(occurrence_date, occurrence_time).isoformat(timespec="minutes")
-                    create_corrective_ticket(
+                    ticket_id = create_corrective_ticket(
                         conn,
                         equipment_id=equipment_id,
                         reporter_id=reporter_id,
@@ -2615,7 +2842,7 @@ def page_manutencao(conn):
                         occurrence_datetime=occurrence_dt,
                         impact=impact,
                         priority=priority,
-                        attachment_path=attachment_path,
+                        attachment_path=None,
                         assigned_to=assigned_to.strip() or None,
                         initial_diagnosis=initial_diagnosis.strip() or None,
                         probable_cause=probable_cause.strip() or None,
@@ -2632,6 +2859,21 @@ def page_manutencao(conn):
                         notify_supplier=int(notify_supplier),
                         notify_reporter=int(notify_reporter),
                     )
+                    if attachment is not None:
+                        attachment_ref = _save_upload(
+                            conn,
+                            attachment,
+                            entity_type="maintenance_corrective",
+                            entity_id=ticket_id,
+                            attachment_role="corrective_attachment",
+                        )
+                        update_legacy_attachment_path(
+                            conn,
+                            table="maintenance_corrective",
+                            row_id=ticket_id,
+                            column="attachment_path",
+                            value=attachment_ref,
+                        )
                     st.success("Ticket corretivo registrado.")
                     st.rerun()
 
@@ -3247,7 +3489,7 @@ def page_qrcodes(conn):
             supply_label = st.selectbox("Insumo", _supply_options(supplies), key="qr_supply")
             supply_id = _supply_id_from_label(supplies, supply_label)
             selected_supply = supplies[supplies["id"] == supply_id].iloc[0]
-            render_supply_quick_card(selected_supply)
+            render_supply_quick_card(conn, selected_supply)
 
             url = f"{base_url}?view=insumo&sid={supply_id}"
             png = _make_qr_png(url)
