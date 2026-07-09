@@ -85,7 +85,16 @@ smtp_tls = true
 # PostgreSQL externo para persistência em produção/beta.
 # Substitua por uma URL real apenas nos Secrets do Streamlit Cloud.
 DATABASE_URL = "postgresql://USUARIO:SENHA@HOST:5432/NOME_DO_BANCO?sslmode=require"
+
+# Cloudflare R2 privado para PDFs e anexos persistentes.
+R2_ACCOUNT_ID = "SEU_ACCOUNT_ID"
+R2_ENDPOINT_URL = "https://SEU_ACCOUNT_ID.r2.cloudflarestorage.com"
+R2_ACCESS_KEY_ID = "SEU_ACCESS_KEY_ID"
+R2_SECRET_ACCESS_KEY = "SEU_SECRET_ACCESS_KEY"
+R2_BUCKET = "labcim-manager-arquivos"
 ```
+
+O app também aceita `[database]` com `url` e `[r2]` com as mesmas chaves R2. O formato top-level acima é o mais direto para conferir no painel de Secrets do Streamlit Cloud.
 
 8. Clique em `Deploy`.
 
@@ -97,8 +106,12 @@ Comportamento esperado:
 
 - sem `DATABASE_URL`, o app usa SQLite local em `data/labcim_manager.db`;
 - com `DATABASE_URL`, o app usa PostgreSQL externo;
+- sem `DATABASE_URL` e sem R2, uploads usam `data/uploads` apenas para desenvolvimento local;
+- com `DATABASE_URL`, uploads exigem R2 completo e não caem silenciosamente para armazenamento local;
 - `data/LabCim_Base.xlsx` é importado apenas quando o banco operacional está vazio;
-- `data/labcim_manager.db` não deve ser versionado, pois é mutável e pode conter dados de uso.
+- `data/labcim_manager.db` e `data/uploads` não devem ser versionados, pois são mutáveis e podem conter dados de uso.
+
+O banco guarda apenas metadados dos anexos na tabela `attachments`. Os arquivos reais ficam no R2 em produção. O bucket deve permanecer privado; o app gera URL assinada temporária para download quando necessário. Campos antigos `*_path` continuam aceitos como modo legado para links/caminhos já cadastrados.
 
 Opções comuns de PostgreSQL externo:
 
@@ -109,8 +122,9 @@ Opções comuns de PostgreSQL externo:
 
 Para validar persistência:
 
-1. Configure `DATABASE_URL` nos Secrets.
+1. Configure `DATABASE_URL` e os secrets R2 nos Secrets.
 2. Faça deploy.
-3. Cadastre usuário, reserva e insumo/movimentação.
+3. Cadastre usuário, reserva e insumo/movimentação com anexo pequeno.
 4. Reinicie ou redeploye o app.
-5. Confirme que os dados continuam no app e no painel do provedor PostgreSQL.
+5. Confirme que os dados continuam no app, os metadados aparecem no PostgreSQL e o arquivo existe no bucket R2.
+6. Confirme que a URL direta do objeto no bucket privado não abre sem assinatura.

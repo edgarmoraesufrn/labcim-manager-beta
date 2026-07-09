@@ -21,6 +21,7 @@ data/*.db-shm
 
 # Uploads e arquivos temporários gerados em uso
 uploads/
+data/uploads/
 data/_uploaded_base.xlsx
 
 # Sistema operacional/editor
