@@ -43,6 +43,7 @@ from labcim_manager.db import (
     import_base_xlsx,
     init_db,
     is_operational_database_empty,
+    list_attachments,
     log_notification,
     query_df,
     seed_default_pops,
@@ -2140,6 +2141,73 @@ def _render_attachment_download(attachment_row, label: str, key: str) -> bool:
     return False
 
 
+def _format_file_size(size_value) -> str:
+    try:
+        size = int(size_value or 0)
+    except Exception:
+        return "-"
+    if size <= 0:
+        return "-"
+    value = float(size)
+    for unit in ["B", "KB", "MB", "GB"]:
+        if value < 1024 or unit == "GB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{value:.1f} GB"
+
+
+def _attachment_metadata_caption(attachment_row) -> str:
+    details = [
+        _format_file_size(attachment_row["file_size"] if "file_size" in attachment_row.keys() else None),
+        _format_datetime(attachment_row["uploaded_at"] if "uploaded_at" in attachment_row.keys() else None),
+    ]
+    backend = clean_input(attachment_row["storage_backend"] if "storage_backend" in attachment_row.keys() else "")
+    if backend:
+        details.append(f"armazenado em {backend.upper() if backend == 'r2' else backend}")
+    return " · ".join(detail for detail in details if detail and detail != "-")
+
+
+def render_attachment_list(
+    conn,
+    *,
+    entity_type: str,
+    entity_id: int,
+    attachment_role: str,
+    legacy_path=None,
+    key_prefix: str,
+) -> None:
+    st.markdown("##### Anexos cadastrados")
+    rows = list_attachments(
+        conn,
+        entity_type=entity_type,
+        entity_id=int(entity_id),
+        attachment_role=attachment_role,
+    )
+    rendered = False
+    for row in rows:
+        rendered = True
+        filename = clean_value(row["original_filename"], "arquivo")
+        st.caption(f"{filename} · {_attachment_metadata_caption(row)}")
+        _render_attachment_download(row, "Baixar", f"{key_prefix}_attachment_{int(row['id'])}")
+
+    listed_ids = {int(row["id"]) for row in rows}
+    legacy_attachment_id = _attachment_id_from_ref(legacy_path)
+    if legacy_attachment_id is not None and legacy_attachment_id not in listed_ids:
+        legacy_attachment = get_attachment(conn, legacy_attachment_id)
+        if legacy_attachment is not None:
+            rendered = True
+            filename = clean_value(legacy_attachment["original_filename"], "arquivo")
+            st.caption(f"{filename} · {_attachment_metadata_caption(legacy_attachment)}")
+            _render_attachment_download(legacy_attachment, "Baixar", f"{key_prefix}_legacy_attachment_{legacy_attachment_id}")
+
+    if not rendered and not is_blank(legacy_path):
+        rendered = True
+        _download_or_link_document(conn, legacy_path, "Baixar anexo legado", f"{key_prefix}_legacy")
+
+    if not rendered:
+        st.caption("Nenhum anexo cadastrado.")
+
+
 def _download_or_link_document(
     conn,
     path_value,
@@ -2393,6 +2461,27 @@ def page_insumos(conn):
             active = st.checkbox("Insumo ativo", value=True if selected_supply is None else truthy(selected_supply.get("active")))
             submitted = st.form_submit_button("Salvar insumo", type="primary")
 
+        if selected_supply is not None:
+            a1, a2 = st.columns(2)
+            with a1:
+                render_attachment_list(
+                    conn,
+                    entity_type="supply",
+                    entity_id=int(selected_supply["id"]),
+                    attachment_role="safety_doc",
+                    legacy_path=selected_supply.get("safety_doc_path"),
+                    key_prefix=f"supply_{int(selected_supply['id'])}_safety_doc",
+                )
+            with a2:
+                render_attachment_list(
+                    conn,
+                    entity_type="supply",
+                    entity_id=int(selected_supply["id"]),
+                    attachment_role="technical_doc",
+                    legacy_path=selected_supply.get("technical_doc_path"),
+                    key_prefix=f"supply_{int(selected_supply['id'])}_technical_doc",
+                )
+
         if submitted:
             if not can_manage_master_data():
                 st.error("Cadastro/edição estrutural de insumos exige perfil Gerente ou Administrador.")
@@ -2595,6 +2684,30 @@ def page_insumos(conn):
             st.info("Ainda não há movimentações registradas.")
         else:
             st.dataframe(_display_df(hist), use_container_width=True, hide_index=True)
+            st.markdown("#### Anexos cadastrados")
+            shown_movements = 0
+            for _, movement in hist.iterrows():
+                attachment_rows = list_attachments(
+                    conn,
+                    entity_type="supply_movement",
+                    entity_id=int(movement["id"]),
+                    attachment_role="movement_document",
+                )
+                legacy_path = movement.get("document_path")
+                if not attachment_rows and is_blank(legacy_path):
+                    continue
+                shown_movements += 1
+                with st.expander(f"Movimentação #{int(movement['id'])} · {clean_value(movement.get('supply_name'))}", expanded=False):
+                    render_attachment_list(
+                        conn,
+                        entity_type="supply_movement",
+                        entity_id=int(movement["id"]),
+                        attachment_role="movement_document",
+                        legacy_path=legacy_path,
+                        key_prefix=f"supply_movement_{int(movement['id'])}",
+                    )
+            if shown_movements == 0:
+                st.caption("Nenhum anexo cadastrado.")
             st.download_button(
                 "Baixar histórico em CSV",
                 data=_display_df(hist).to_csv(index=False).encode("utf-8-sig"),
@@ -2764,7 +2877,7 @@ def page_manutencao(conn):
                    mp.periodicity, mp.planned_date, mp.performed_date, mp.status,
                    mp.planned_end_date, mp.blocks_booking,
                    mp.internal_responsible, mp.external_supplier, mp.service_order, mp.next_date,
-                   mp.observations
+                   mp.observations, mp.checklist_path, mp.certificate_path
             FROM maintenance_preventive mp
             JOIN equipment e ON e.id = mp.equipment_id
             ORDER BY COALESCE(mp.planned_date, mp.created_at) DESC
@@ -2774,6 +2887,49 @@ def page_manutencao(conn):
             st.info("Ainda não há registros preventivos/calibrações.")
         else:
             st.dataframe(prev_df, use_container_width=True, hide_index=True)
+            st.markdown("#### Anexos cadastrados")
+            shown_preventive = 0
+            for _, preventive in prev_df.iterrows():
+                checklist_rows = list_attachments(
+                    conn,
+                    entity_type="maintenance_preventive",
+                    entity_id=int(preventive["id"]),
+                    attachment_role="preventive_checklist",
+                )
+                certificate_rows = list_attachments(
+                    conn,
+                    entity_type="maintenance_preventive",
+                    entity_id=int(preventive["id"]),
+                    attachment_role="preventive_certificate",
+                )
+                has_checklist = checklist_rows or not is_blank(preventive.get("checklist_path"))
+                has_certificate = certificate_rows or not is_blank(preventive.get("certificate_path"))
+                if not has_checklist and not has_certificate:
+                    continue
+                shown_preventive += 1
+                title = f"Preventiva #{int(preventive['id'])} · {clean_value(preventive.get('equipment_code'))} · {clean_value(preventive.get('activity_type'))}"
+                with st.expander(title, expanded=False):
+                    p1, p2 = st.columns(2)
+                    with p1:
+                        render_attachment_list(
+                            conn,
+                            entity_type="maintenance_preventive",
+                            entity_id=int(preventive["id"]),
+                            attachment_role="preventive_checklist",
+                            legacy_path=preventive.get("checklist_path"),
+                            key_prefix=f"preventive_{int(preventive['id'])}_checklist",
+                        )
+                    with p2:
+                        render_attachment_list(
+                            conn,
+                            entity_type="maintenance_preventive",
+                            entity_id=int(preventive["id"]),
+                            attachment_role="preventive_certificate",
+                            legacy_path=preventive.get("certificate_path"),
+                            key_prefix=f"preventive_{int(preventive['id'])}_certificate",
+                        )
+            if shown_preventive == 0:
+                st.caption("Nenhum anexo cadastrado.")
 
     with tab_corr:
         st.markdown("### Manutenção corretiva e suporte")
@@ -2884,7 +3040,7 @@ def page_manutencao(conn):
             SELECT mc.id, e.equipment_code, e.equipment_name, e.location,
                    u.full_name AS reporter, mc.title, mc.impact, mc.priority,
                    mc.status, mc.occurrence_datetime, mc.assigned_to,
-                   mc.downtime_hours, mc.costs, mc.created_at
+                   mc.downtime_hours, mc.costs, mc.created_at, mc.attachment_path
             FROM maintenance_corrective mc
             JOIN equipment e ON e.id = mc.equipment_id
             LEFT JOIN users u ON u.id = mc.reporter_id
@@ -2896,6 +3052,31 @@ def page_manutencao(conn):
             st.info("Nenhum ticket corretivo registrado.")
         else:
             st.dataframe(corr_df, use_container_width=True, hide_index=True)
+            st.markdown("#### Anexos cadastrados")
+            shown_corrective = 0
+            for _, ticket in corr_df.iterrows():
+                attachment_rows = list_attachments(
+                    conn,
+                    entity_type="maintenance_corrective",
+                    entity_id=int(ticket["id"]),
+                    attachment_role="corrective_attachment",
+                )
+                legacy_path = ticket.get("attachment_path")
+                if not attachment_rows and is_blank(legacy_path):
+                    continue
+                shown_corrective += 1
+                title = f"Ticket #{int(ticket['id'])} · {clean_value(ticket.get('equipment_code'))} · {clean_value(ticket.get('title'))}"
+                with st.expander(title, expanded=False):
+                    render_attachment_list(
+                        conn,
+                        entity_type="maintenance_corrective",
+                        entity_id=int(ticket["id"]),
+                        attachment_role="corrective_attachment",
+                        legacy_path=legacy_path,
+                        key_prefix=f"corrective_{int(ticket['id'])}",
+                    )
+            if shown_corrective == 0:
+                st.caption("Nenhum anexo cadastrado.")
             active_ids = corr_df[~corr_df["status"].isin(["concluído", "cancelado"])] ["id"].tolist()
             if active_ids:
                 c1, c2 = st.columns([1, 1])
