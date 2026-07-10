@@ -338,6 +338,18 @@ def setup_page() -> None:
             fill: {LAB_DARK} !important;
             opacity: 1 !important;
         }}
+        [data-testid="stMultiSelect"] [data-baseweb="tag"] {{
+            background-color: {LAB_BLUE} !important;
+            border-color: {LAB_BLUE} !important;
+        }}
+        [data-testid="stMultiSelect"] [data-baseweb="tag"] *,
+        [data-testid="stMultiSelect"] [data-baseweb="tag"] span,
+        [data-testid="stMultiSelect"] [data-baseweb="tag"] button,
+        [data-testid="stMultiSelect"] [data-baseweb="tag"] svg {{
+            color: #FFFFFF !important;
+            fill: #FFFFFF !important;
+            opacity: 1 !important;
+        }}
         .stTextInput input,
         .stTextArea textarea,
         .stNumberInput input,
