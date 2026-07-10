@@ -2507,6 +2507,7 @@ def page_insumos(conn):
         )
         is_spare_part = supply_type == "Peça de reposição"
         selected_equipment_ids: list[int] = []
+        current_item_is_spare_part = _is_spare_part(selected_supply)
 
         with st.form("form_supply"):
             c1, c2, c3 = st.columns(3)
@@ -2540,48 +2541,65 @@ def page_insumos(conn):
                     if selected_supply is not None and clean_input(selected_supply.get("category")):
                         category = st.text_input("Categoria cadastrada", value=clean_input(selected_supply.get("category")))
             with c2:
-                physical_state = st.selectbox("Estado físico", ["Sólido", "Líquido", "Gás", "Pasta/suspensão", "Outro"], key="supply_state")
-                if selected_supply is not None and clean_input(selected_supply.get("physical_state")):
-                    physical_state = st.text_input("Estado físico cadastrado", value=clean_input(selected_supply.get("physical_state")))
-                application_function = st.text_input("Função/aplicação", value=clean_input(selected_supply.get("application_function")) if selected_supply is not None else "", placeholder="Ex.: retardador, expansivo, salmoura, cimento base")
-                addition_mode = st.selectbox("Modo de adição", ["Não se aplica", "Misturado a seco", "Água de mistura", "Solução", "Outro"], key="supply_addition")
-                if selected_supply is not None and clean_input(selected_supply.get("addition_mode")):
-                    addition_mode = st.text_input("Modo de adição cadastrado", value=clean_input(selected_supply.get("addition_mode")))
                 if is_spare_part:
+                    physical_state = clean_input(selected_supply.get("physical_state")) if current_item_is_spare_part and selected_supply is not None else ""
+                    physical_state = physical_state or "Não se aplica"
+                    application_function = clean_input(selected_supply.get("application_function")) if current_item_is_spare_part and selected_supply is not None else ""
+                    addition_mode = clean_input(selected_supply.get("addition_mode")) if current_item_is_spare_part and selected_supply is not None else ""
+                    addition_mode = addition_mode or "Não se aplica"
                     compatible_model_family = st.text_input("Modelo/família compatível", value=compatible_model_family, placeholder="Ex.: Reômetro modelo X, Autoclave série Y")
-                unit = st.selectbox("Unidade de controle", ["kg", "g", "L", "mL", "unidade", "frasco", "saco"], key="supply_unit")
-                if selected_supply is not None and clean_input(selected_supply.get("unit")):
-                    unit = st.text_input("Unidade cadastrada", value=clean_input(selected_supply.get("unit")))
+                    unit = clean_input(selected_supply.get("unit")) if current_item_is_spare_part and selected_supply is not None else ""
+                    unit = unit or "unidade"
+                else:
+                    physical_state = st.selectbox("Estado físico", ["Sólido", "Líquido", "Gás", "Pasta/suspensão", "Outro"], key="supply_state")
+                    if selected_supply is not None and clean_input(selected_supply.get("physical_state")):
+                        physical_state = st.text_input("Estado físico cadastrado", value=clean_input(selected_supply.get("physical_state")))
+                    application_function = st.text_input("Função/aplicação", value=clean_input(selected_supply.get("application_function")) if selected_supply is not None else "", placeholder="Ex.: retardador, expansivo, salmoura, cimento base")
+                    addition_mode = st.selectbox("Modo de adição", ["Não se aplica", "Misturado a seco", "Água de mistura", "Solução", "Outro"], key="supply_addition")
+                    if selected_supply is not None and clean_input(selected_supply.get("addition_mode")):
+                        addition_mode = st.text_input("Modo de adição cadastrado", value=clean_input(selected_supply.get("addition_mode")))
+                    unit = st.selectbox("Unidade de controle", ["kg", "g", "L", "mL", "unidade", "frasco", "saco"], key="supply_unit")
+                    if selected_supply is not None and clean_input(selected_supply.get("unit")):
+                        unit = st.text_input("Unidade cadastrada", value=clean_input(selected_supply.get("unit")))
             with c3:
                 initial_qty_default = float(selected_supply.get("current_quantity") or 0) if selected_supply is not None else 0.0
                 current_quantity = st.number_input("Saldo inicial/atual", min_value=0.0, value=initial_qty_default, step=1.0, disabled=(mode == "Editar item existente"), help="Depois do cadastro, o saldo deve ser alterado por movimentações.")
                 min_qty_default = float(selected_supply.get("minimum_quantity") or 0) if selected_supply is not None else 0.0
                 minimum_quantity = st.number_input("Estoque mínimo", min_value=0.0, value=min_qty_default, step=1.0)
                 lot = st.text_input("Lote", value=clean_input(selected_supply.get("lot")) if selected_supply is not None else "")
-                expiration_date = st.date_input(
-                    "Validade",
-                    value=None if selected_supply is None or is_blank(selected_supply.get("expiration_date")) else datetime.fromisoformat(str(selected_supply.get("expiration_date"))).date(),
-                    key="supply_expiration",
-                )
+                expiration_date = _date_input_value(selected_supply.get("expiration_date")) if is_spare_part and selected_supply is not None else None
+                if not is_spare_part:
+                    expiration_date = st.date_input(
+                        "Validade",
+                        value=None if selected_supply is None or is_blank(selected_supply.get("expiration_date")) else datetime.fromisoformat(str(selected_supply.get("expiration_date"))).date(),
+                        key="supply_expiration",
+                    )
                 location = st.text_input("Localização", value=clean_input(selected_supply.get("location")) if selected_supply is not None else "", placeholder="Ex.: Almoxarifado 1, armário A")
                 responsible_name = st.text_input("Responsável", value=clean_input(selected_supply.get("responsible_name")) if selected_supply is not None else "")
 
-            st.markdown("#### Dados técnicos opcionais")
-            t1, t2, t3 = st.columns(3)
-            with t1:
-                density_default = float(selected_supply.get("density") or 0) if selected_supply is not None and not is_blank(selected_supply.get("density")) else 0.0
-                density = st.number_input("Massa específica", min_value=0.0, value=density_default, step=0.01)
-                recommended_concentration = st.text_input("Faixa de concentração", value=clean_input(selected_supply.get("recommended_concentration")) if selected_supply is not None else "", placeholder="Ex.: 0,5–3,0% BWOC")
-            with t2:
-                recommended_temperature = st.text_input("Faixa de temperatura", value=clean_input(selected_supply.get("recommended_temperature")) if selected_supply is not None else "", placeholder="Ex.: 25–90 °C")
-                characterization_summary = st.text_area("Caracterização resumida", value=clean_input(selected_supply.get("characterization_summary")) if selected_supply is not None else "", placeholder="Ex.: FRX/DRX realizados; arquivo anexado...")
-            with t3:
-                safety_existing = clean_input(selected_supply.get("safety_doc_path")) if selected_supply is not None else ""
-                technical_existing = clean_input(selected_supply.get("technical_doc_path")) if selected_supply is not None else ""
-                safety_doc_path = st.text_input("FDS/FISPQ existente ou link", value=safety_existing)
-                technical_doc_path = st.text_input("Ficha técnica/caracterização existente ou link", value=technical_existing)
-                safety_upload = st.file_uploader("Anexar FDS/FISPQ", type=["pdf", "png", "jpg", "jpeg"], key="safety_doc_upload")
-                technical_upload = st.file_uploader("Anexar ficha/caracterização", type=["pdf", "png", "jpg", "jpeg", "xlsx"], key="technical_doc_upload")
+            density = selected_supply.get("density") if selected_supply is not None else None
+            recommended_concentration = clean_input(selected_supply.get("recommended_concentration")) if selected_supply is not None else ""
+            recommended_temperature = clean_input(selected_supply.get("recommended_temperature")) if selected_supply is not None else ""
+            characterization_summary = clean_input(selected_supply.get("characterization_summary")) if selected_supply is not None else ""
+            safety_doc_path = clean_input(selected_supply.get("safety_doc_path")) if selected_supply is not None else ""
+            technical_doc_path = clean_input(selected_supply.get("technical_doc_path")) if selected_supply is not None else ""
+            safety_upload = None
+            technical_upload = None
+            if not is_spare_part:
+                st.markdown("#### Dados técnicos opcionais")
+                t1, t2, t3 = st.columns(3)
+                with t1:
+                    density_default = float(selected_supply.get("density") or 0) if selected_supply is not None and not is_blank(selected_supply.get("density")) else 0.0
+                    density = st.number_input("Massa específica", min_value=0.0, value=density_default, step=0.01)
+                    recommended_concentration = st.text_input("Faixa de concentração", value=recommended_concentration, placeholder="Ex.: 0,5–3,0% BWOC")
+                with t2:
+                    recommended_temperature = st.text_input("Faixa de temperatura", value=recommended_temperature, placeholder="Ex.: 25–90 °C")
+                    characterization_summary = st.text_area("Caracterização resumida", value=characterization_summary, placeholder="Ex.: FRX/DRX realizados; arquivo anexado...")
+                with t3:
+                    safety_doc_path = st.text_input("FDS/FISPQ existente ou link", value=safety_doc_path)
+                    technical_doc_path = st.text_input("Ficha técnica/caracterização existente ou link", value=technical_doc_path)
+                    safety_upload = st.file_uploader("Anexar FDS/FISPQ", type=["pdf", "png", "jpg", "jpeg"], key="safety_doc_upload")
+                    technical_upload = st.file_uploader("Anexar ficha/caracterização", type=["pdf", "png", "jpg", "jpeg", "xlsx"], key="technical_doc_upload")
 
             if is_spare_part:
                 st.markdown("#### Equipamentos associados")
@@ -2611,7 +2629,7 @@ def page_insumos(conn):
             active = st.checkbox("Item ativo", value=True if selected_supply is None else truthy(selected_supply.get("active")))
             submitted = st.form_submit_button("Salvar insumo", type="primary")
 
-        if selected_supply is not None:
+        if selected_supply is not None and not is_spare_part:
             st.markdown("#### Documentos cadastrados")
             a1, a2 = st.columns(2)
             with a1:
