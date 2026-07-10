@@ -253,13 +253,17 @@ def init_db(conn: DatabaseConnection) -> None:
 
         CREATE TABLE IF NOT EXISTS supplies (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            supply_type TEXT DEFAULT 'Insumo',
             supply_name TEXT NOT NULL,
+            supply_code TEXT,
             commercial_name TEXT,
             manufacturer TEXT,
+            manufacturer_code TEXT,
             category TEXT,
             physical_state TEXT,
             application_function TEXT,
             addition_mode TEXT,
+            compatible_model_family TEXT,
             unit TEXT DEFAULT 'kg',
             current_quantity REAL DEFAULT 0,
             minimum_quantity REAL DEFAULT 0,
@@ -295,6 +299,25 @@ def init_db(conn: DatabaseConnection) -> None:
             FOREIGN KEY(user_id) REFERENCES users(id),
             FOREIGN KEY(project_id) REFERENCES projects(id)
         );
+
+        CREATE TABLE IF NOT EXISTS equipment_spare_parts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            equipment_id INTEGER NOT NULL,
+            supply_id INTEGER NOT NULL,
+            notes TEXT,
+            is_active INTEGER DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(equipment_id) REFERENCES equipment(id),
+            FOREIGN KEY(supply_id) REFERENCES supplies(id),
+            UNIQUE(equipment_id, supply_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_equipment_spare_parts_equipment
+            ON equipment_spare_parts (equipment_id, is_active);
+
+        CREATE INDEX IF NOT EXISTS idx_equipment_spare_parts_supply
+            ON equipment_spare_parts (supply_id, is_active);
 
         CREATE TABLE IF NOT EXISTS attachments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -375,6 +398,11 @@ def init_db(conn: DatabaseConnection) -> None:
     _add_column(conn, "maintenance_preventive", "blocks_booking", "INTEGER DEFAULT 1")
     _add_column(conn, "maintenance_preventive", "updated_at", "TEXT")
     _add_column(conn, "maintenance_corrective", "updated_at", "TEXT")
+    _add_column(conn, "supplies", "supply_type", "TEXT DEFAULT 'Insumo'")
+    _add_column(conn, "supplies", "supply_code", "TEXT")
+    _add_column(conn, "supplies", "manufacturer_code", "TEXT")
+    _add_column(conn, "supplies", "compatible_model_family", "TEXT")
+    conn.execute("UPDATE supplies SET supply_type = 'Insumo' WHERE supply_type IS NULL OR TRIM(supply_type) = ''")
     conn.execute("UPDATE users SET role = 'manager' WHERE LOWER(COALESCE(role, '')) IN ('operator', 'operador', 'gerente')")
     conn.commit()
 
@@ -403,6 +431,7 @@ OPERATIONAL_TABLES = [
     "maintenance_corrective",
     "supplies",
     "supply_movements",
+    "equipment_spare_parts",
 ]
 
 
@@ -446,6 +475,163 @@ def _execute_insert_returning_id(
         return int(row["id"])
     cur = conn.execute(sql, params)
     return int(cur.lastrowid)
+
+
+def link_spare_part_to_equipment(
+    conn: DatabaseConnection,
+    *,
+    equipment_id: int,
+    supply_id: int,
+    notes: str | None = None,
+) -> int:
+    existing = conn.execute(
+        """
+        SELECT id
+        FROM equipment_spare_parts
+        WHERE equipment_id = ? AND supply_id = ?
+        """,
+        [equipment_id, supply_id],
+    ).fetchone()
+    if existing:
+        conn.execute(
+            """
+            UPDATE equipment_spare_parts
+            SET is_active = 1,
+                notes = COALESCE(?, notes),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            [notes, existing["id"]],
+        )
+        conn.commit()
+        return int(existing["id"])
+
+    return insert_returning_id(
+        conn,
+        """
+        INSERT INTO equipment_spare_parts (
+            equipment_id, supply_id, notes, is_active
+        )
+        VALUES (?, ?, ?, 1)
+        """,
+        [equipment_id, supply_id, notes],
+    )
+
+
+def unlink_spare_part_from_equipment(
+    conn: DatabaseConnection,
+    *,
+    equipment_id: int,
+    supply_id: int,
+) -> None:
+    conn.execute(
+        """
+        UPDATE equipment_spare_parts
+        SET is_active = 0,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE equipment_id = ? AND supply_id = ? AND is_active = 1
+        """,
+        [equipment_id, supply_id],
+    )
+    conn.commit()
+
+
+def set_spare_part_equipment_links(
+    conn: DatabaseConnection,
+    *,
+    supply_id: int,
+    equipment_ids: list[int] | tuple[int, ...],
+) -> None:
+    target_ids = sorted({int(equipment_id) for equipment_id in equipment_ids})
+    for equipment_id in target_ids:
+        link_spare_part_to_equipment(conn, equipment_id=equipment_id, supply_id=supply_id)
+
+    if target_ids:
+        placeholders = ", ".join(["?"] * len(target_ids))
+        conn.execute(
+            f"""
+            UPDATE equipment_spare_parts
+            SET is_active = 0,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE supply_id = ?
+              AND is_active = 1
+              AND equipment_id NOT IN ({placeholders})
+            """,
+            [supply_id, *target_ids],
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE equipment_spare_parts
+            SET is_active = 0,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE supply_id = ? AND is_active = 1
+            """,
+            [supply_id],
+        )
+    conn.commit()
+
+
+def list_spare_parts_for_equipment(
+    conn: DatabaseConnection,
+    equipment_id: int,
+    *,
+    include_inactive: bool = False,
+) -> pd.DataFrame:
+    sql = """
+        SELECT esp.id AS association_id,
+               esp.notes AS association_notes,
+               esp.is_active AS association_active,
+               esp.created_at AS association_created_at,
+               esp.updated_at AS association_updated_at,
+               s.*
+        FROM equipment_spare_parts esp
+        JOIN supplies s ON s.id = esp.supply_id
+        WHERE esp.equipment_id = ?
+          AND COALESCE(s.supply_type, 'Insumo') = 'Peça de reposição'
+    """
+    params: list[Any] = [equipment_id]
+    if not include_inactive:
+        sql += " AND esp.is_active = 1 AND s.active = 1"
+    sql += " ORDER BY s.supply_name"
+    return query_df(conn, sql, params)
+
+
+def list_equipment_for_spare_part(
+    conn: DatabaseConnection,
+    supply_id: int,
+    *,
+    include_inactive: bool = False,
+) -> pd.DataFrame:
+    sql = """
+        SELECT esp.id AS association_id,
+               esp.notes AS association_notes,
+               esp.is_active AS association_active,
+               esp.created_at AS association_created_at,
+               esp.updated_at AS association_updated_at,
+               e.*
+        FROM equipment_spare_parts esp
+        JOIN equipment e ON e.id = esp.equipment_id
+        WHERE esp.supply_id = ?
+    """
+    params: list[Any] = [supply_id]
+    if not include_inactive:
+        sql += " AND esp.is_active = 1"
+    sql += " ORDER BY e.active DESC, e.equipment_code"
+    return query_df(conn, sql, params)
+
+
+def list_spare_part_options(conn: DatabaseConnection, *, active_only: bool = True) -> pd.DataFrame:
+    sql = """
+        SELECT *
+        FROM supplies
+        WHERE COALESCE(supply_type, 'Insumo') = 'Peça de reposição'
+    """
+    params: list[Any] = []
+    if active_only:
+        sql += " AND active = 1"
+    sql += " ORDER BY supply_name"
+    return query_df(conn, sql, params)
 
 
 def create_attachment(
@@ -1589,13 +1775,17 @@ def update_corrective_status(conn: sqlite3.Connection, ticket_id: int, status: s
 def create_supply(
     conn: sqlite3.Connection,
     *,
+    supply_type: str | None,
     supply_name: str,
+    supply_code: str | None,
     commercial_name: str | None,
     manufacturer: str | None,
+    manufacturer_code: str | None,
     category: str | None,
     physical_state: str | None,
     application_function: str | None,
     addition_mode: str | None,
+    compatible_model_family: str | None,
     unit: str,
     current_quantity: float,
     minimum_quantity: float,
@@ -1611,26 +1801,32 @@ def create_supply(
     characterization_summary: str | None,
     notes: str | None,
 ) -> int:
+    supply_type = supply_type.strip() if supply_type and supply_type.strip() else "Insumo"
     return insert_returning_id(
         conn,
         """
         INSERT INTO supplies (
-            supply_name, commercial_name, manufacturer, category, physical_state,
-            application_function, addition_mode, unit, current_quantity, minimum_quantity,
+            supply_type, supply_name, supply_code, commercial_name, manufacturer,
+            manufacturer_code, category, physical_state, application_function,
+            addition_mode, compatible_model_family, unit, current_quantity, minimum_quantity,
             lot, expiration_date, location, responsible_name, safety_doc_path,
             technical_doc_path, density, recommended_concentration,
             recommended_temperature, characterization_summary, active, notes
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
         """,
         [
+            supply_type,
             supply_name,
+            supply_code,
             commercial_name,
             manufacturer,
+            manufacturer_code,
             category,
             physical_state,
             application_function,
             addition_mode,
+            compatible_model_family,
             unit,
             current_quantity,
             minimum_quantity,
@@ -1653,13 +1849,17 @@ def update_supply(
     conn: sqlite3.Connection,
     supply_id: int,
     *,
+    supply_type: str | None,
     supply_name: str,
+    supply_code: str | None,
     commercial_name: str | None,
     manufacturer: str | None,
+    manufacturer_code: str | None,
     category: str | None,
     physical_state: str | None,
     application_function: str | None,
     addition_mode: str | None,
+    compatible_model_family: str | None,
     unit: str,
     minimum_quantity: float,
     lot: str | None,
@@ -1675,16 +1875,21 @@ def update_supply(
     active: int,
     notes: str | None,
 ) -> None:
+    supply_type = supply_type.strip() if supply_type and supply_type.strip() else "Insumo"
     conn.execute(
         """
         UPDATE supplies
-        SET supply_name = ?,
+        SET supply_type = ?,
+            supply_name = ?,
+            supply_code = ?,
             commercial_name = ?,
             manufacturer = ?,
+            manufacturer_code = ?,
             category = ?,
             physical_state = ?,
             application_function = ?,
             addition_mode = ?,
+            compatible_model_family = ?,
             unit = ?,
             minimum_quantity = ?,
             lot = ?,
@@ -1703,13 +1908,17 @@ def update_supply(
         WHERE id = ?
         """,
         [
+            supply_type,
             supply_name,
+            supply_code,
             commercial_name,
             manufacturer,
+            manufacturer_code,
             category,
             physical_state,
             application_function,
             addition_mode,
+            compatible_model_family,
             unit,
             minimum_quantity,
             lot,

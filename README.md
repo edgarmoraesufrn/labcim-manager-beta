@@ -13,6 +13,7 @@ Esta versão inclui:
 - manutenção preventiva/corretiva;
 - POPs/documentos operacionais;
 - módulo de insumos/almoxarifado;
+- peças de reposição como itens de estoque associados a equipamentos;
 - QR Codes;
 - relatórios semestrais/anuais;
 - notificações por e-mail quando equipamento entra em manutenção.
@@ -70,6 +71,12 @@ Para testar persistência em produção:
 3. Cadastre um usuário, uma reserva e um insumo ou movimentação de insumo.
 4. Reinicie ou redeploye o app.
 5. Confirme que os registros continuam aparecendo no sistema.
+
+## Peças de reposição
+
+Peças de reposição são tratadas como itens de estoque no módulo de Insumos/almoxarifado. Elas podem ter código interno, código do fabricante, fabricante, saldo, estoque mínimo, localização e modelo/família compatível.
+
+Uma peça pode ser associada a um ou mais equipamentos. Na tela de Equipamentos, a visão de peças associadas mostra rapidamente o saldo disponível, estoque mínimo, status de estoque e local de armazenamento para o equipamento selecionado.
 
 ## Armazenamento de arquivos
 
