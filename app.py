@@ -44,9 +44,12 @@ from labcim_manager.db import (
     init_db,
     is_operational_database_empty,
     list_attachments,
+    list_equipment_for_spare_part,
+    list_spare_parts_for_equipment,
     log_notification,
     query_df,
     seed_default_pops,
+    set_spare_part_equipment_links,
     table_counts,
     update_booking_status,
     update_corrective_status,
@@ -104,6 +107,7 @@ ROLE_LABELS = {
 ROLE_REVERSE = {v: k for k, v in ROLE_LABELS.items()}
 
 BOOLEAN_LABELS = {0: "Não", 1: "Sim", False: "Não", True: "Sim"}
+SUPPLY_TYPES = ["Insumo", "Peça de reposição"]
 
 PAGE_LABELS = [
     "Painel inicial",
@@ -139,13 +143,17 @@ COLUMN_LABELS = {
     "document_notes": "Observações documentais",
     "responsible_name": "Responsável",
     "responsible_phone": "Telefone do responsável",
+    "supply_type": "Tipo de item",
     "supply_name": "Insumo",
+    "supply_code": "Código interno",
     "commercial_name": "Nome comercial",
     "manufacturer": "Fabricante",
+    "manufacturer_code": "Código do fabricante",
     "category": "Categoria",
     "physical_state": "Estado físico",
     "application_function": "Função/aplicação",
     "addition_mode": "Modo de adição",
+    "compatible_model_family": "Modelo/família compatível",
     "unit": "Unidade",
     "current_quantity": "Saldo atual",
     "minimum_quantity": "Estoque mínimo",
@@ -161,7 +169,11 @@ COLUMN_LABELS = {
     "movement_date": "Data",
     "quantity": "Quantidade",
     "document_path": "Documento",
+    "stock_status": "Status de estoque",
+    "association_notes": "Observação da associação",
     "active": "Ativo?",
+    "is_active": "Ativo?",
+    "association_active": "Associação ativa?",
     "notes": "Observações",
     "created_at": "Criado em",
     "full_name": "Nome completo",
@@ -944,7 +956,7 @@ def _display_df(df: pd.DataFrame) -> pd.DataFrame:
     for c in ["role"]:
         if c in out.columns:
             out[c] = out[c].map(role_badge).fillna(out[c])
-    for c in ["active", "requires_operator", "training_completed", "capacity_enforced", "blocks_booking"]:
+    for c in ["active", "is_active", "association_active", "requires_operator", "training_completed", "capacity_enforced", "blocks_booking"]:
         if c in out.columns:
             out[c] = out[c].map(yes_no)
     for c in [
@@ -1804,7 +1816,7 @@ def page_equipamentos(conn):
         existing_cols = [c for c in display_cols if c in equipment.columns]
         st.dataframe(_display_df(equipment[existing_cols]), use_container_width=True, hide_index=True)
 
-    tab_oper, tab_master = st.tabs(["Atualizar dados operacionais", "Cadastro mestre"])
+    tab_oper, tab_parts, tab_master = st.tabs(["Atualizar dados operacionais", "Peças de reposição", "Cadastro mestre"])
 
     with tab_oper:
         if equipment.empty:
@@ -1894,6 +1906,21 @@ def page_equipamentos(conn):
                         st.info(f"Notificação de manutenção registrada para {total} destinatário(s). Enviadas: {sent}.")
                 st.success("Dados operacionais do equipamento atualizados.")
                 st.rerun()
+
+    with tab_parts:
+        st.markdown("### Peças de reposição associadas")
+        if equipment.empty:
+            st.info("Cadastre um equipamento antes de consultar peças de reposição.")
+        else:
+            eq_label = st.selectbox("Selecionar equipamento", _equipment_options(equipment), key="equipment_spare_parts_select")
+            equipment_id = _equipment_id_from_label(equipment, eq_label)
+            selected = equipment[equipment["id"] == equipment_id].iloc[0]
+            st.caption(
+                f"{clean_value(selected.get('equipment_code'))} — {clean_value(selected.get('equipment_name'))} · "
+                f"Local: {clean_value(selected.get('location'))}"
+            )
+            spare_parts = list_spare_parts_for_equipment(conn, equipment_id)
+            render_equipment_spare_parts(spare_parts)
 
     with tab_master:
         if not can_manage_master_data():
@@ -2100,13 +2127,63 @@ def _save_upload(
 def _supply_options(supplies: pd.DataFrame) -> list[str]:
     def _label(r: pd.Series) -> str:
         qty = 0.0 if is_blank(r.get("current_quantity")) else float(r.get("current_quantity"))
-        return f"{int(r['id'])} — {clean_value(r.get('supply_name'))} · saldo: {qty:g} {clean_value(r.get('unit'), '')}"
+        item_type = clean_value(r.get("supply_type"), "Insumo")
+        code = clean_input(r.get("supply_code"))
+        code_text = f"{code} · " if code else ""
+        return f"{int(r['id'])} — {code_text}{clean_value(r.get('supply_name'))} · {item_type} · saldo: {qty:g} {clean_value(r.get('unit'), '')}"
     return supplies.apply(_label, axis=1).tolist()
 
 
 def _supply_id_from_label(supplies: pd.DataFrame, label: str) -> int:
     labels = _supply_options(supplies)
     return int(supplies.iloc[labels.index(label)]["id"])
+
+
+def _supply_type_value(row: pd.Series | None) -> str:
+    value = clean_input(row.get("supply_type")) if row is not None else ""
+    return value if value in SUPPLY_TYPES else "Insumo"
+
+
+def _is_spare_part(row: pd.Series | None) -> bool:
+    return _supply_type_value(row) == "Peça de reposição"
+
+
+def _spare_part_stock_status(row: pd.Series) -> str:
+    qty = float(row.get("current_quantity") or 0)
+    min_qty = float(row.get("minimum_quantity") or 0)
+    return "Abaixo do mínimo" if qty < min_qty else "OK"
+
+
+def _equipment_ids_from_labels(equipment: pd.DataFrame, labels: list[str]) -> list[int]:
+    if equipment.empty:
+        return []
+    return [_equipment_id_from_label(equipment, label) for label in labels]
+
+
+def render_equipment_spare_parts(spare_parts: pd.DataFrame) -> None:
+    if spare_parts.empty:
+        st.info("Nenhuma peça de reposição associada a este equipamento.")
+        return
+    display = spare_parts.copy()
+    display["stock_status"] = display.apply(_spare_part_stock_status, axis=1)
+    cols = [
+        "supply_name",
+        "supply_code",
+        "manufacturer_code",
+        "manufacturer",
+        "current_quantity",
+        "unit",
+        "minimum_quantity",
+        "stock_status",
+        "location",
+        "compatible_model_family",
+        "association_notes",
+    ]
+    st.dataframe(
+        _display_df(display[[c for c in cols if c in display.columns]]),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
 def _select_index_by_supply_id(supplies: pd.DataFrame, supply_id: str | int | None) -> int:
@@ -2255,10 +2332,18 @@ def render_supply_quick_card(conn, supply_row: pd.Series) -> None:
     alert = _supply_alert_status(supply_row)
     qty = 0.0 if is_blank(supply_row.get("current_quantity")) else float(supply_row.get("current_quantity"))
     min_qty = 0.0 if is_blank(supply_row.get("minimum_quantity")) else float(supply_row.get("minimum_quantity"))
+    type_line = f"Tipo: {clean_value(supply_row.get('supply_type'), 'Insumo')} · "
+    if _is_spare_part(supply_row):
+        type_line += (
+            f"Código interno: {clean_value(supply_row.get('supply_code'))} · "
+            f"Código fabricante: {clean_value(supply_row.get('manufacturer_code'))}<br>"
+            f"Modelo/família compatível: {clean_value(supply_row.get('compatible_model_family'))}<br>"
+        )
     st.markdown(
         f"""
         <div class="soft-card">
         <b>{clean_value(supply_row.get('supply_name'))}</b><br>
+        {type_line}
         Categoria: {clean_value(supply_row.get('category'))} · Estado: {clean_value(supply_row.get('physical_state'))} ·
         Fabricante: {clean_value(supply_row.get('manufacturer'))}<br>
         Saldo: <b>{qty:g} {clean_value(supply_row.get('unit'), '')}</b> · Estoque mínimo: {min_qty:g} {clean_value(supply_row.get('unit'), '')}<br>
@@ -2309,7 +2394,7 @@ def _user_id_from_label(users: pd.DataFrame, label: str) -> int | None:
 def _supply_alert_status(row: pd.Series) -> str:
     qty = float(row.get("current_quantity") or 0)
     min_qty = float(row.get("minimum_quantity") or 0)
-    if min_qty and qty <= min_qty:
+    if min_qty and (qty < min_qty if _is_spare_part(row) else qty <= min_qty):
         return "Estoque baixo"
     exp = row.get("expiration_date")
     if not is_blank(exp):
@@ -2322,7 +2407,7 @@ def _supply_alert_status(row: pd.Series) -> str:
                 return "Vence em até 60 dias"
         except Exception:
             pass
-    if is_blank(row.get("safety_doc_path")):
+    if not _is_spare_part(row) and is_blank(row.get("safety_doc_path")):
         return "Sem FDS/FISPQ"
     return "OK"
 
@@ -2335,6 +2420,7 @@ def page_insumos(conn):
     supplies = query_df(conn, "SELECT * FROM supplies ORDER BY active DESC, supply_name")
     users = query_df(conn, "SELECT * FROM users WHERE active=1 ORDER BY full_name")
     projects = query_df(conn, "SELECT * FROM projects WHERE active=1 ORDER BY project_name")
+    equipment = query_df(conn, "SELECT * FROM equipment ORDER BY active DESC, equipment_code")
 
     qr_supply_id = st.query_params.get("sid", None)
     if qr_supply_id and not supplies.empty:
@@ -2365,7 +2451,7 @@ def page_insumos(conn):
         else:
             active_supplies["alerta"] = active_supplies.apply(_supply_alert_status, axis=1)
             k1, k2, k3, k4 = st.columns(4)
-            k1.metric("Insumos ativos", int((supplies["active"] == 1).sum()))
+            k1.metric("Itens ativos", int((supplies["active"] == 1).sum()))
             k2.metric("Estoque baixo", int((active_supplies["alerta"] == "Estoque baixo").sum()))
             k3.metric("Vencidos", int((active_supplies["alerta"] == "Vencido").sum()))
             k4.metric("Sem FDS/FISPQ", int((active_supplies["alerta"] == "Sem FDS/FISPQ").sum()))
@@ -2375,17 +2461,19 @@ def page_insumos(conn):
                 st.markdown("#### Alertas")
                 st.dataframe(
                     _display_df(alert_df[[
-                        "alerta", "supply_name", "category", "current_quantity", "unit",
-                        "minimum_quantity", "lot", "expiration_date", "location", "responsible_name"
+                        "alerta", "supply_type", "supply_name", "supply_code", "category",
+                        "current_quantity", "unit", "minimum_quantity", "lot",
+                        "expiration_date", "location", "responsible_name"
                     ]]),
                     use_container_width=True,
                     hide_index=True,
                 )
             st.markdown("#### Estoque atual")
             cols = [
-                "supply_name", "commercial_name", "manufacturer", "category", "physical_state",
-                "current_quantity", "unit", "minimum_quantity", "lot", "expiration_date",
-                "location", "responsible_name", "active"
+                "supply_type", "supply_name", "supply_code", "manufacturer_code",
+                "commercial_name", "manufacturer", "category", "physical_state",
+                "compatible_model_family", "current_quantity", "unit", "minimum_quantity",
+                "lot", "expiration_date", "location", "responsible_name", "active"
             ]
             st.dataframe(_display_df(supplies[[c for c in cols if c in supplies.columns]]), use_container_width=True, hide_index=True)
             st.download_button(
@@ -2396,32 +2484,61 @@ def page_insumos(conn):
             )
 
     with tab_cadastro:
-        st.markdown("### Cadastro de insumo")
+        st.markdown("### Cadastro de item de estoque")
         if not can_manage_master_data():
             st.info("Membros podem registrar entrada, saída e descarte na aba **Movimentar estoque**. Cadastro/edição estrutural de insumos fica com Gerente ou Administrador.")
-        mode = st.radio("Modo", ["Novo insumo", "Editar insumo existente"], horizontal=True, key="supply_edit_mode")
+        mode = st.radio("Modo", ["Novo item", "Editar item existente"], horizontal=True, key="supply_edit_mode")
         selected_supply = None
-        if mode == "Editar insumo existente":
+        if mode == "Editar item existente":
             if supplies.empty:
-                st.info("Cadastre um insumo antes de editar.")
+                st.info("Cadastre um item de estoque antes de editar.")
                 return
-            label = st.selectbox("Selecionar insumo", _supply_options(supplies), key="supply_edit_select")
+            label = st.selectbox("Selecionar item", _supply_options(supplies), key="supply_edit_select")
             selected_supply = supplies[supplies["id"] == _supply_id_from_label(supplies, label)].iloc[0]
+
+        current_supply_type = _supply_type_value(selected_supply)
+        supply_type_key = f"supply_type_{mode}_{int(selected_supply['id']) if selected_supply is not None else 'new'}"
+        supply_type = st.radio(
+            "Tipo de item",
+            SUPPLY_TYPES,
+            index=SUPPLY_TYPES.index(current_supply_type),
+            horizontal=True,
+            key=supply_type_key,
+        )
+        is_spare_part = supply_type == "Peça de reposição"
+        selected_equipment_ids: list[int] = []
 
         with st.form("form_supply"):
             c1, c2, c3 = st.columns(3)
             with c1:
-                supply_name = st.text_input("Nome do insumo *", value=clean_input(selected_supply.get("supply_name")) if selected_supply is not None else "", placeholder="Ex.: Cimento Portland Classe G")
+                supply_name = st.text_input(
+                    "Nome da peça *" if is_spare_part else "Nome do insumo *",
+                    value=clean_input(selected_supply.get("supply_name")) if selected_supply is not None else "",
+                    placeholder="Ex.: rotor, vedação, filtro" if is_spare_part else "Ex.: Cimento Portland Classe G",
+                )
+                supply_code = clean_input(selected_supply.get("supply_code")) if selected_supply is not None else ""
+                manufacturer_code = clean_input(selected_supply.get("manufacturer_code")) if selected_supply is not None else ""
+                compatible_model_family = clean_input(selected_supply.get("compatible_model_family")) if selected_supply is not None else ""
+                if is_spare_part:
+                    supply_code = st.text_input("Código interno", value=supply_code, placeholder="Ex.: PR-0001")
                 commercial_name = st.text_input("Nome comercial", value=clean_input(selected_supply.get("commercial_name")) if selected_supply is not None else "")
                 manufacturer = st.text_input("Fabricante", value=clean_input(selected_supply.get("manufacturer")) if selected_supply is not None else "")
-                category = st.selectbox(
-                    "Categoria",
-                    ["Cimento", "Aditivo", "Sal", "Polímero", "Pozolana", "Carga mineral", "Lavador/espaçador", "Reagente", "Consumível", "Outro"],
-                    index=0,
-                    key="supply_category",
-                )
-                if selected_supply is not None and clean_input(selected_supply.get("category")):
-                    category = st.text_input("Categoria cadastrada", value=clean_input(selected_supply.get("category")))
+                if is_spare_part:
+                    manufacturer_code = st.text_input("Código do fabricante", value=manufacturer_code, placeholder="Ex.: part number, SKU ou referência do fabricante")
+                    category = st.text_input(
+                        "Categoria",
+                        value=clean_input(selected_supply.get("category")) if selected_supply is not None else "",
+                        placeholder="Ex.: filtro, vedação, sensor, placa eletrônica",
+                    )
+                else:
+                    category = st.selectbox(
+                        "Categoria",
+                        ["Cimento", "Aditivo", "Sal", "Polímero", "Pozolana", "Carga mineral", "Lavador/espaçador", "Reagente", "Consumível", "Outro"],
+                        index=0,
+                        key="supply_category",
+                    )
+                    if selected_supply is not None and clean_input(selected_supply.get("category")):
+                        category = st.text_input("Categoria cadastrada", value=clean_input(selected_supply.get("category")))
             with c2:
                 physical_state = st.selectbox("Estado físico", ["Sólido", "Líquido", "Gás", "Pasta/suspensão", "Outro"], key="supply_state")
                 if selected_supply is not None and clean_input(selected_supply.get("physical_state")):
@@ -2430,12 +2547,14 @@ def page_insumos(conn):
                 addition_mode = st.selectbox("Modo de adição", ["Não se aplica", "Misturado a seco", "Água de mistura", "Solução", "Outro"], key="supply_addition")
                 if selected_supply is not None and clean_input(selected_supply.get("addition_mode")):
                     addition_mode = st.text_input("Modo de adição cadastrado", value=clean_input(selected_supply.get("addition_mode")))
+                if is_spare_part:
+                    compatible_model_family = st.text_input("Modelo/família compatível", value=compatible_model_family, placeholder="Ex.: Reômetro modelo X, Autoclave série Y")
                 unit = st.selectbox("Unidade de controle", ["kg", "g", "L", "mL", "unidade", "frasco", "saco"], key="supply_unit")
                 if selected_supply is not None and clean_input(selected_supply.get("unit")):
                     unit = st.text_input("Unidade cadastrada", value=clean_input(selected_supply.get("unit")))
             with c3:
                 initial_qty_default = float(selected_supply.get("current_quantity") or 0) if selected_supply is not None else 0.0
-                current_quantity = st.number_input("Saldo inicial/atual", min_value=0.0, value=initial_qty_default, step=1.0, disabled=(mode == "Editar insumo existente"), help="Depois do cadastro, o saldo deve ser alterado por movimentações.")
+                current_quantity = st.number_input("Saldo inicial/atual", min_value=0.0, value=initial_qty_default, step=1.0, disabled=(mode == "Editar item existente"), help="Depois do cadastro, o saldo deve ser alterado por movimentações.")
                 min_qty_default = float(selected_supply.get("minimum_quantity") or 0) if selected_supply is not None else 0.0
                 minimum_quantity = st.number_input("Estoque mínimo", min_value=0.0, value=min_qty_default, step=1.0)
                 lot = st.text_input("Lote", value=clean_input(selected_supply.get("lot")) if selected_supply is not None else "")
@@ -2464,8 +2583,32 @@ def page_insumos(conn):
                 safety_upload = st.file_uploader("Anexar FDS/FISPQ", type=["pdf", "png", "jpg", "jpeg"], key="safety_doc_upload")
                 technical_upload = st.file_uploader("Anexar ficha/caracterização", type=["pdf", "png", "jpg", "jpeg", "xlsx"], key="technical_doc_upload")
 
+            if is_spare_part:
+                st.markdown("#### Equipamentos associados")
+                if equipment.empty:
+                    st.info("Cadastre equipamentos antes de associar peças de reposição.")
+                else:
+                    linked_equipment = (
+                        list_equipment_for_spare_part(conn, int(selected_supply["id"]))
+                        if selected_supply is not None
+                        else pd.DataFrame()
+                    )
+                    linked_ids = set(linked_equipment["id"].astype(int).tolist()) if not linked_equipment.empty else set()
+                    equipment_options = _equipment_options(equipment)
+                    default_equipment_labels = [
+                        label for label in equipment_options
+                        if _equipment_id_from_label(equipment, label) in linked_ids
+                    ]
+                    selected_equipment_labels = st.multiselect(
+                        "Equipamentos associados",
+                        equipment_options,
+                        default=default_equipment_labels,
+                        key=f"spare_equipment_links_{int(selected_supply['id']) if selected_supply is not None else 'new'}",
+                    )
+                    selected_equipment_ids = _equipment_ids_from_labels(equipment, selected_equipment_labels)
+
             notes = st.text_area("Observações", value=clean_input(selected_supply.get("notes")) if selected_supply is not None else "")
-            active = st.checkbox("Insumo ativo", value=True if selected_supply is None else truthy(selected_supply.get("active")))
+            active = st.checkbox("Item ativo", value=True if selected_supply is None else truthy(selected_supply.get("active")))
             submitted = st.form_submit_button("Salvar insumo", type="primary")
 
         if selected_supply is not None:
@@ -2498,20 +2641,24 @@ def page_insumos(conn):
             if not can_manage_master_data():
                 st.error("Cadastro/edição estrutural de insumos exige perfil Gerente ou Administrador.")
             elif not supply_name.strip():
-                st.error("Informe o nome do insumo.")
+                st.error("Informe o nome do item.")
             elif not _ensure_storage_ready_for_upload(safety_upload, technical_upload):
                 pass
             else:
-                if mode == "Novo insumo":
+                if mode == "Novo item":
                     supply_id = create_supply(
                         conn,
+                        supply_type=supply_type,
                         supply_name=supply_name.strip(),
+                        supply_code=supply_code.strip() or None,
                         commercial_name=commercial_name.strip() or None,
                         manufacturer=manufacturer.strip() or None,
+                        manufacturer_code=manufacturer_code.strip() or None,
                         category=category.strip() or None,
                         physical_state=physical_state.strip() or None,
                         application_function=application_function.strip() or None,
                         addition_mode=addition_mode.strip() or None,
+                        compatible_model_family=compatible_model_family.strip() or None,
                         unit=unit.strip() or "kg",
                         current_quantity=0.0,
                         minimum_quantity=float(minimum_quantity),
@@ -2527,6 +2674,12 @@ def page_insumos(conn):
                         characterization_summary=characterization_summary.strip() or None,
                         notes=notes.strip() or None,
                     )
+                    if is_spare_part:
+                        set_spare_part_equipment_links(
+                            conn,
+                            supply_id=supply_id,
+                            equipment_ids=selected_equipment_ids,
+                        )
                     if current_quantity:
                         create_supply_movement(
                             conn,
@@ -2569,7 +2722,7 @@ def page_insumos(conn):
                             column="technical_doc_path",
                             value=technical_ref,
                         )
-                    st.success("Insumo cadastrado com sucesso.")
+                    st.success("Item cadastrado com sucesso.")
                     st.rerun()
                 else:
                     supply_id = int(selected_supply["id"])
@@ -2594,13 +2747,17 @@ def page_insumos(conn):
                     update_supply(
                         conn,
                         supply_id,
+                        supply_type=supply_type,
                         supply_name=supply_name.strip(),
+                        supply_code=supply_code.strip() or None,
                         commercial_name=commercial_name.strip() or None,
                         manufacturer=manufacturer.strip() or None,
+                        manufacturer_code=manufacturer_code.strip() or None,
                         category=category.strip() or None,
                         physical_state=physical_state.strip() or None,
                         application_function=application_function.strip() or None,
                         addition_mode=addition_mode.strip() or None,
+                        compatible_model_family=compatible_model_family.strip() or None,
                         unit=unit.strip() or "kg",
                         minimum_quantity=float(minimum_quantity),
                         lot=lot.strip() or None,
@@ -2616,20 +2773,25 @@ def page_insumos(conn):
                         active=int(active),
                         notes=notes.strip() or None,
                     )
-                    st.success("Insumo atualizado com sucesso.")
+                    set_spare_part_equipment_links(
+                        conn,
+                        supply_id=supply_id,
+                        equipment_ids=selected_equipment_ids if is_spare_part else [],
+                    )
+                    st.success("Item atualizado com sucesso.")
                     st.rerun()
 
     with tab_mov:
         st.markdown("### Movimentar estoque")
         active_supplies = supplies[supplies["active"] == 1].copy() if not supplies.empty else supplies
         if active_supplies.empty:
-            st.info("Cadastre ao menos um insumo ativo para movimentar estoque.")
+            st.info("Cadastre ao menos um item ativo para movimentar estoque.")
         else:
             with st.form("form_supply_movement"):
                 c1, c2, c3 = st.columns(3)
                 with c1:
                     supply_label = st.selectbox(
-                        "Insumo",
+                        "Item de estoque",
                         _supply_options(active_supplies),
                         index=_select_index_by_supply_id(active_supplies, qr_supply_id),
                         key="movement_supply",
@@ -2647,7 +2809,7 @@ def page_insumos(conn):
                 move_submitted = st.form_submit_button("Registrar movimentação", type="primary")
 
             selected_movement_supply = active_supplies[active_supplies["id"].astype(int) == int(supply_id)].iloc[0]
-            st.markdown("#### Documentos do insumo selecionado")
+            st.markdown("#### Documentos do item selecionado")
             d1, d2 = st.columns(2)
             with d1:
                 render_attachment_list(
