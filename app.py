@@ -1421,7 +1421,7 @@ def page_reservas(conn):
         st.markdown("### Calendário semanal")
         c1, c2 = st.columns([1, 2])
         with c1:
-            selected_week_day = st.date_input("Semana de referência", value=date.today(), key="calendar_week_day")
+            selected_week_day = st.date_input("Semana de referência", value=date.today(), format="DD/MM/YYYY", key="calendar_week_day")
         with c2:
             include_cancelled_week = st.checkbox("Mostrar reservas canceladas", value=False, key="calendar_week_cancelled")
         current_week_start = _week_start(selected_week_day)
@@ -1443,7 +1443,7 @@ def page_reservas(conn):
         st.markdown("### Calendário mensal")
         c1, c2 = st.columns([1, 2])
         with c1:
-            selected_month_day = st.date_input("Mês de referência", value=date.today(), key="calendar_month_day")
+            selected_month_day = st.date_input("Mês de referência", value=date.today(), format="DD/MM/YYYY", key="calendar_month_day")
         with c2:
             include_cancelled_month = st.checkbox("Mostrar canceladas no mês", value=False, key="calendar_month_cancelled")
         month_start = date(selected_month_day.year, selected_month_day.month, 1)
@@ -1466,7 +1466,7 @@ def page_reservas(conn):
         st.caption("Visual técnico complementar, útil quando há muitos eventos no mesmo período.")
         c1, c2, c3 = st.columns([1, 1, 1])
         with c1:
-            start_day = st.date_input("Início da visualização", value=date.today(), key="agenda_start")
+            start_day = st.date_input("Início da visualização", value=date.today(), format="DD/MM/YYYY", key="agenda_start")
         with c2:
             days = st.selectbox("Período", [7, 14, 30, 60], index=1, format_func=lambda x: f"{x} dias", key="agenda_days")
         with c3:
@@ -1480,6 +1480,8 @@ def page_reservas(conn):
             graph_df = agenda_df.copy()
             graph_df["Início"] = pd.to_datetime(graph_df["start_datetime"])
             graph_df["Fim"] = pd.to_datetime(graph_df["end_datetime"])
+            graph_df["Início formatado"] = graph_df["start_datetime"].map(_format_datetime)
+            graph_df["Fim formatado"] = graph_df["end_datetime"].map(_format_datetime)
             graph_df["Reserva"] = graph_df.apply(
                 lambda r: f"#{r['id']} · {r['solicitante']} · {status_badge(r['status'])}", axis=1
             )
@@ -1490,9 +1492,11 @@ def page_reservas(conn):
                 x_end="Fim",
                 y="Reserva",
                 color="Status",
-                hover_data={"Início": True, "Fim": True, "Reserva": False},
+                custom_data=["Início formatado", "Fim formatado"],
+                hover_data={"Início": False, "Fim": False, "Reserva": False},
                 color_discrete_sequence=[LAB_BLUE, LAB_CYAN, "#6BAED6", "#9ECAE1"],
             )
+            fig.update_traces(hovertemplate="<b>%{y}</b><br>Início: %{customdata[0]}<br>Fim: %{customdata[1]}<extra></extra>")
             fig.update_yaxes(autorange="reversed")
             fig.update_layout(height=max(300, min(720, 70 + 36 * len(graph_df))), margin=dict(l=20, r=20, t=20, b=20))
             st.plotly_chart(fig, use_container_width=True)
@@ -1503,10 +1507,13 @@ def page_reservas(conn):
             st.markdown("### Criar reserva")
             c1, c2, c3 = st.columns(3)
             with c1:
-                user_labels = _user_options(active_users)
+                user_placeholder = "Selecione o solicitante"
+                user_labels = [user_placeholder] + _user_options(active_users)
                 user_label = st.selectbox("Solicitante", user_labels, key="booking_user")
-                user_id = int(active_users.iloc[user_labels.index(user_label)]["id"])
-                booking_date = st.date_input("Data", value=date.today(), key="booking_date")
+                user_id = None
+                if user_label != user_placeholder:
+                    user_id = int(active_users.iloc[user_labels.index(user_label) - 1]["id"])
+                booking_date = st.date_input("Data", value=date.today(), format="DD/MM/YYYY", key="booking_date")
             with c2:
                 start_t = st.time_input("Horário inicial", value=time(9, 0), step=timedelta(minutes=30), key="booking_start")
                 end_t = st.time_input("Horário final", value=time(10, 0), step=timedelta(minutes=30), key="booking_end")
@@ -1526,21 +1533,18 @@ def page_reservas(conn):
                     st.caption("Este equipamento está marcado como operação assistida/requer operador.")
                 else:
                     st.info("Este equipamento não exige operador obrigatório.")
-                performer_options = ["Mesmo solicitante"] + _user_options(active_users)
-                performer_label = st.selectbox("Executante previsto", performer_options, key="booking_performer")
-                performed_by_id = user_id
-                if performer_label != "Mesmo solicitante":
-                    performed_by_id = int(active_users.iloc[_user_options(active_users).index(performer_label)]["id"])
 
             purpose = st.text_area("Finalidade / observações", placeholder="Ex.: análise MEV com EDS; ensaio mecânico; preparação de amostras...", key="booking_purpose")
-            submitted = st.form_submit_button("Registrar reserva", type="primary")
+            submitted = st.form_submit_button("Nova Reserva", type="primary")
 
         if submitted:
             start_dt = datetime.combine(booking_date, start_t)
             end_dt = datetime.combine(booking_date, end_t)
             max_capacity = None if is_blank(selected_eq.get("max_sample_capacity")) else int(selected_eq.get("max_sample_capacity"))
             capacity_unit = clean_value(selected_eq.get("capacity_unit"), "amostras")
-            if end_dt <= start_dt:
+            if user_id is None:
+                st.error("Selecione o solicitante para criar a reserva.")
+            elif end_dt <= start_dt:
                 st.error("O horário final precisa ser maior que o horário inicial.")
             elif max_capacity and sample_count and int(sample_count) > max_capacity and truthy(selected_eq.get("capacity_enforced")):
                 st.error(f"A quantidade excede a capacidade máxima cadastrada para este equipamento ({max_capacity} {capacity_unit}).")
@@ -1553,7 +1557,7 @@ def page_reservas(conn):
                     user_id=user_id,
                     project_id=project_id,
                     operator_id=operator_id,
-                    performed_by_id=performed_by_id,
+                    performed_by_id=user_id,
                     start_iso=start_dt.isoformat(timespec="minutes"),
                     end_iso=end_dt.isoformat(timespec="minutes"),
                     sample_count=int(sample_count) if sample_count else None,
