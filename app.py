@@ -2175,8 +2175,11 @@ def render_attachment_list(
     attachment_role: str,
     legacy_path=None,
     key_prefix: str,
+    title: str | None = "Anexos cadastrados",
+    empty_message: str = "Nenhum anexo cadastrado.",
 ) -> None:
-    st.markdown("##### Anexos cadastrados")
+    if title:
+        st.markdown(f"##### {title}")
     rows = list_attachments(
         conn,
         entity_type=entity_type,
@@ -2205,7 +2208,7 @@ def render_attachment_list(
         _download_or_link_document(conn, legacy_path, "Baixar anexo legado", f"{key_prefix}_legacy")
 
     if not rendered:
-        st.caption("Nenhum anexo cadastrado.")
+        st.caption(empty_message)
 
 
 def _download_or_link_document(
@@ -2462,6 +2465,7 @@ def page_insumos(conn):
             submitted = st.form_submit_button("Salvar insumo", type="primary")
 
         if selected_supply is not None:
+            st.markdown("#### Documentos cadastrados")
             a1, a2 = st.columns(2)
             with a1:
                 render_attachment_list(
@@ -2471,6 +2475,8 @@ def page_insumos(conn):
                     attachment_role="safety_doc",
                     legacy_path=selected_supply.get("safety_doc_path"),
                     key_prefix=f"supply_{int(selected_supply['id'])}_safety_doc",
+                    title="FDS/FISPQ",
+                    empty_message="Nenhuma FDS/FISPQ cadastrada.",
                 )
             with a2:
                 render_attachment_list(
@@ -2480,6 +2486,8 @@ def page_insumos(conn):
                     attachment_role="technical_doc",
                     legacy_path=selected_supply.get("technical_doc_path"),
                     key_prefix=f"supply_{int(selected_supply['id'])}_technical_doc",
+                    title="Ficha técnica/caracterização",
+                    empty_message="Nenhuma ficha técnica/caracterização cadastrada.",
                 )
 
         if submitted:
@@ -2634,6 +2642,32 @@ def page_insumos(conn):
                     movement_doc = st.file_uploader("Anexo da movimentação", type=["pdf", "png", "jpg", "jpeg", "xlsx"], key="movement_doc")
                 move_submitted = st.form_submit_button("Registrar movimentação", type="primary")
 
+            selected_movement_supply = active_supplies[active_supplies["id"].astype(int) == int(supply_id)].iloc[0]
+            st.markdown("#### Documentos do insumo selecionado")
+            d1, d2 = st.columns(2)
+            with d1:
+                render_attachment_list(
+                    conn,
+                    entity_type="supply",
+                    entity_id=int(supply_id),
+                    attachment_role="safety_doc",
+                    legacy_path=selected_movement_supply.get("safety_doc_path"),
+                    key_prefix=f"movement_supply_{int(supply_id)}_safety_doc",
+                    title="FDS/FISPQ",
+                    empty_message="Nenhuma FDS/FISPQ cadastrada.",
+                )
+            with d2:
+                render_attachment_list(
+                    conn,
+                    entity_type="supply",
+                    entity_id=int(supply_id),
+                    attachment_role="technical_doc",
+                    legacy_path=selected_movement_supply.get("technical_doc_path"),
+                    key_prefix=f"movement_supply_{int(supply_id)}_technical_doc",
+                    title="Ficha técnica/caracterização",
+                    empty_message="Nenhuma ficha técnica/caracterização cadastrada.",
+                )
+
             if move_submitted:
                 if _ensure_storage_ready_for_upload(movement_doc):
                     ok, msg, movement_id = create_supply_movement(
@@ -2705,6 +2739,8 @@ def page_insumos(conn):
                         attachment_role="movement_document",
                         legacy_path=legacy_path,
                         key_prefix=f"supply_movement_{int(movement['id'])}",
+                        title="Documento/anexo",
+                        empty_message="Nenhum documento/anexo cadastrado.",
                     )
             if shown_movements == 0:
                 st.caption("Nenhum anexo cadastrado.")
@@ -2918,6 +2954,8 @@ def page_manutencao(conn):
                             attachment_role="preventive_checklist",
                             legacy_path=preventive.get("checklist_path"),
                             key_prefix=f"preventive_{int(preventive['id'])}_checklist",
+                            title="Checklist",
+                            empty_message="Nenhum checklist cadastrado.",
                         )
                     with p2:
                         render_attachment_list(
@@ -2927,6 +2965,8 @@ def page_manutencao(conn):
                             attachment_role="preventive_certificate",
                             legacy_path=preventive.get("certificate_path"),
                             key_prefix=f"preventive_{int(preventive['id'])}_certificate",
+                            title="Certificado",
+                            empty_message="Nenhum certificado cadastrado.",
                         )
             if shown_preventive == 0:
                 st.caption("Nenhum anexo cadastrado.")
@@ -3074,6 +3114,8 @@ def page_manutencao(conn):
                         attachment_role="corrective_attachment",
                         legacy_path=legacy_path,
                         key_prefix=f"corrective_{int(ticket['id'])}",
+                        title="Anexo",
+                        empty_message="Nenhum anexo cadastrado.",
                     )
             if shown_corrective == 0:
                 st.caption("Nenhum anexo cadastrado.")
