@@ -26,6 +26,7 @@ import qrcode
 import streamlit as st
 
 from labcim_manager.db import (
+    change_maintenance_status,
     connect,
     create_attachment,
     create_booking,
@@ -45,20 +46,24 @@ from labcim_manager.db import (
     is_operational_database_empty,
     list_attachments,
     list_equipment_for_spare_part,
+    list_maintenance_status_history,
     list_spare_parts_for_equipment,
+    list_upcoming_preventive_maintenance,
     log_notification,
     query_df,
     seed_default_pops,
     set_spare_part_equipment_links,
     table_counts,
     update_booking_status,
-    update_corrective_status,
+    update_corrective_ticket,
     update_equipment_master,
     update_equipment_operational_info,
     update_legacy_attachment_path,
+    update_preventive_activity,
     update_project,
     update_supply,
     update_user,
+    inactivate_maintenance_record,
     verify_access_code_record,
 )
 from labcim_manager.storage import (
@@ -108,6 +113,9 @@ ROLE_REVERSE = {v: k for k, v in ROLE_LABELS.items()}
 
 BOOLEAN_LABELS = {0: "Não", 1: "Sim", False: "Não", True: "Sim"}
 SUPPLY_TYPES = ["Insumo", "Peça de reposição"]
+PREVENTIVE_STATUSES = ["pendente", "realizado", "reprovado", "reagendado", "cancelado"]
+CORRECTIVE_STATUSES = ["aberto", "em análise", "aguardando peça", "enviado para fornecedor", "concluído", "cancelado"]
+MAINTENANCE_JUSTIFICATION_STATUSES = {"reprovado", "reagendado", "cancelado"}
 
 PAGE_LABELS = [
     "Painel inicial",
@@ -193,6 +201,16 @@ COLUMN_LABELS = {
     "sample_count": "Amostras",
     "purpose": "Finalidade/observações",
     "status": "Status",
+    "previous_status": "Status anterior",
+    "new_status": "Novo status",
+    "justification": "Justificativa",
+    "changed_by_name": "Usuário",
+    "changed_by_email": "E-mail do usuário",
+    "changed_at": "Alterado em",
+    "inactive_reason": "Motivo de inativação",
+    "inactive_at": "Inativado em",
+    "scheduled_reference": "Referência de agenda",
+    "reference_label": "Próxima data",
     "operator": "Operador",
     "executante": "Executante",
     "solicitante": "Solicitante",
@@ -964,6 +982,8 @@ def _display_df(df: pd.DataFrame) -> pd.DataFrame:
         "end_datetime",
         "created_at",
         "updated_at",
+        "changed_at",
+        "inactive_at",
         "occurrence_datetime",
         "expiration_date",
         "movement_date",
@@ -2186,6 +2206,54 @@ def render_equipment_spare_parts(spare_parts: pd.DataFrame) -> None:
     )
 
 
+def _option_index(options: list[str], value: str | None, default: int = 0) -> int:
+    value = clean_input(value)
+    return options.index(value) if value in options else default
+
+
+def _maintenance_status_requires_justification(previous_status: str | None, new_status: str, *, creating: bool) -> bool:
+    previous = clean_input(previous_status)
+    new = clean_input(new_status)
+    if not creating and previous == new:
+        return False
+    if new in MAINTENANCE_JUSTIFICATION_STATUSES:
+        return True
+    return new == "pendente" and not creating
+
+
+def _datetime_input_defaults(value, fallback: datetime | None = None) -> tuple[date, time]:
+    fallback = fallback or datetime.now().replace(second=0, microsecond=0)
+    if not is_blank(value):
+        try:
+            parsed = datetime.fromisoformat(str(value))
+            return parsed.date(), parsed.time().replace(second=0, microsecond=0)
+        except Exception:
+            try:
+                parsed = pd.to_datetime(value).to_pydatetime()
+                return parsed.date(), parsed.time().replace(second=0, microsecond=0)
+            except Exception:
+                pass
+    return fallback.date(), fallback.time().replace(second=0, microsecond=0)
+
+
+def _maintenance_reference_label(row: pd.Series) -> str:
+    reference = clean_input(row.get("scheduled_reference")) or clean_input(row.get("next_date")) or clean_input(row.get("planned_date"))
+    return _format_datetime(reference) if reference else "sem próxima data"
+
+
+def render_maintenance_status_history(conn, *, entity_type: str, entity_id: int) -> None:
+    history = list_maintenance_status_history(conn, entity_type=entity_type, entity_id=entity_id)
+    if history.empty:
+        st.caption("Nenhuma alteração de status registrada.")
+        return
+    cols = ["previous_status", "new_status", "justification", "changed_by_name", "changed_at"]
+    st.dataframe(
+        _display_df(history[[c for c in cols if c in history.columns]]),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
 def _select_index_by_supply_id(supplies: pd.DataFrame, supply_id: str | int | None) -> int:
     if supply_id is None or supplies.empty:
         return 0
@@ -2939,7 +3007,7 @@ def page_insumos(conn):
 def page_manutencao(conn):
     hero()
     st.subheader("Manutenção e suporte")
-    st.caption("Controle preventivo/calibração e abertura de tickets corretivos. Esta etapa ainda não envia notificações automaticamente; os campos já ficam preparados para essa integração.")
+    st.caption("Controle preventivo/calibração e tickets corretivos com edição, histórico de status e inativação auditável.")
     equipment, users, _, _ = load_reference_data(conn)
     if equipment.empty:
         st.warning("Cadastre/importe equipamentos antes de registrar manutenções.")
@@ -2967,7 +3035,7 @@ def page_manutencao(conn):
                     ["Preventiva", "Calibração interna", "Calibração externa", "Inspeção periódica"],
                     key="prev_activity_type",
                 )
-                status = st.selectbox("Status", ["pendente", "realizado", "reprovado", "reagendado"], key="prev_status")
+                status = st.selectbox("Status", PREVENTIVE_STATUSES, key="prev_status")
             with c2:
                 description = st.text_area(
                     "Descrição da atividade",
@@ -3005,15 +3073,25 @@ def page_manutencao(conn):
             notify_manager = n2.checkbox("Gestor do laboratório", value=True, key="prev_notify_manager")
             notify_supplier = n3.checkbox("Fornecedor", value=False, key="prev_notify_supplier")
             notify_users = n4.checkbox("Usuários do equipamento", value=False, key="prev_notify_users")
+            prev_create_status_reason = ""
+            if _maintenance_status_requires_justification("pendente", status, creating=True):
+                prev_create_status_reason = st.text_area(
+                    "Justificativa do status *",
+                    placeholder="Explique brevemente o motivo do status selecionado.",
+                    key="prev_create_status_reason",
+                )
 
             if st.button("Registrar preventiva/calibração", type="primary"):
                 if not description.strip():
                     st.error("Informe a descrição da atividade.")
                 elif planned_end_date and planned_date and planned_end_date < planned_date:
                     st.error("A data final prevista não pode ser anterior à data inicial.")
+                elif _maintenance_status_requires_justification("pendente", status, creating=True) and not prev_create_status_reason.strip():
+                    st.error("Informe a justificativa para este status.")
                 elif not _ensure_storage_ready_for_upload(checklist, certificate):
                     pass
                 else:
+                    base_status = "pendente" if status != "pendente" else status
                     preventive_id = create_preventive_activity(
                         conn,
                         equipment_id=equipment_id,
@@ -3029,7 +3107,7 @@ def page_manutencao(conn):
                         external_supplier=external_supplier.strip() or None,
                         supplier_contact=supplier_contact.strip() or None,
                         service_order=service_order.strip() or None,
-                        status=status,
+                        status=base_status,
                         certificate_path=None,
                         observations=observations.strip() or None,
                         next_date=next_date.isoformat() if next_date else None,
@@ -3069,6 +3147,15 @@ def page_manutencao(conn):
                             column="certificate_path",
                             value=cert_ref,
                         )
+                    if status != base_status:
+                        change_maintenance_status(
+                            conn,
+                            entity_type="preventive",
+                            entity_id=preventive_id,
+                            new_status=status,
+                            justification=prev_create_status_reason.strip() or None,
+                            changed_by_id=_current_user_id(),
+                        )
                     if blocks_booking and status not in {"realizado", "cancelado"}:
                         sent, total = notify_equipment_maintenance(
                             conn,
@@ -3090,23 +3177,19 @@ def page_manutencao(conn):
                     st.rerun()
 
         st.markdown("### Próximas preventivas/calibrações")
-        prev_df = query_df(
-            conn,
-            """
-            SELECT mp.id, e.equipment_code, e.equipment_name, e.location, mp.activity_type,
-                   mp.periodicity, mp.planned_date, mp.performed_date, mp.status,
-                   mp.planned_end_date, mp.blocks_booking,
-                   mp.internal_responsible, mp.external_supplier, mp.service_order, mp.next_date,
-                   mp.observations, mp.checklist_path, mp.certificate_path
-            FROM maintenance_preventive mp
-            JOIN equipment e ON e.id = mp.equipment_id
-            ORDER BY COALESCE(mp.planned_date, mp.created_at) DESC
-            """,
-        )
+        prev_df = list_upcoming_preventive_maintenance(conn)
         if prev_df.empty:
-            st.info("Ainda não há registros preventivos/calibrações.")
+            st.info("Nenhuma preventiva/calibração ativa pendente.")
         else:
-            st.dataframe(prev_df, use_container_width=True, hide_index=True)
+            prev_display = prev_df.copy()
+            prev_display["reference_label"] = prev_display.apply(_maintenance_reference_label, axis=1)
+            prev_cols = [
+                "id", "equipment_code", "equipment_name", "activity_type", "status",
+                "reference_label", "planned_date", "planned_end_date", "next_date",
+                "periodicity", "blocks_booking", "internal_responsible",
+                "external_supplier", "service_order",
+            ]
+            st.dataframe(_display_df(prev_display[[c for c in prev_cols if c in prev_display.columns]]), use_container_width=True, hide_index=True)
             st.markdown("#### Anexos cadastrados")
             shown_preventive = 0
             for _, preventive in prev_df.iterrows():
@@ -3155,6 +3238,228 @@ def page_manutencao(conn):
             if shown_preventive == 0:
                 st.caption("Nenhum anexo cadastrado.")
 
+        st.markdown("### Editar ou inativar preventiva/calibração")
+        prev_edit_df = query_df(
+            conn,
+            """
+            SELECT mp.*, e.equipment_code, e.equipment_name, e.location
+            FROM maintenance_preventive mp
+            JOIN equipment e ON e.id = mp.equipment_id
+            WHERE COALESCE(mp.is_active, 1) = 1
+            ORDER BY COALESCE(NULLIF(mp.next_date, ''), NULLIF(mp.planned_date, ''), mp.created_at) DESC,
+                     mp.id DESC
+            """,
+        )
+        if prev_edit_df.empty:
+            st.info("Nenhuma preventiva/calibração ativa para editar.")
+        else:
+            prev_options = prev_edit_df.apply(
+                lambda r: (
+                    f"#{int(r['id'])} · {clean_value(r.get('equipment_code'))} · "
+                    f"{clean_value(r.get('activity_type'))} · {_maintenance_reference_label(r)} · "
+                    f"{clean_value(r.get('status'), 'pendente')}"
+                ),
+                axis=1,
+            ).tolist()
+            prev_label = st.selectbox("Selecionar preventiva/calibração", prev_options, key="prev_edit_select")
+            selected_prev = prev_edit_df.iloc[prev_options.index(prev_label)]
+            prev_token = f"prev_edit_{int(selected_prev['id'])}"
+            with st.container(border=True):
+                c1, c2, c3 = st.columns([1.2, 1, 1])
+                equipment_ids = equipment["id"].astype(int).tolist()
+                selected_equipment_id = int(selected_prev["equipment_id"])
+                equipment_index = equipment_ids.index(selected_equipment_id) if selected_equipment_id in equipment_ids else 0
+                with c1:
+                    eq_label = st.selectbox("Equipamento", _equipment_options(equipment), index=equipment_index, key=f"{prev_token}_eq")
+                    edit_equipment_id = _equipment_id_from_label(equipment, eq_label)
+                    edit_selected_eq = equipment[equipment["id"] == edit_equipment_id].iloc[0]
+                    st.info(f"**Local:** {clean_value(edit_selected_eq.get('location'))}  \n**Responsável:** {clean_value(edit_selected_eq.get('responsible_name'))}")
+                    prev_activity_options = ["Preventiva", "Calibração interna", "Calibração externa", "Inspeção periódica"]
+                    edit_activity_type = st.selectbox(
+                        "Tipo da atividade",
+                        prev_activity_options,
+                        index=_option_index(prev_activity_options, selected_prev.get("activity_type")),
+                        key=f"{prev_token}_activity_type",
+                    )
+                    previous_status = clean_input(selected_prev.get("status")) or "pendente"
+                    edit_status = st.selectbox(
+                        "Status",
+                        PREVENTIVE_STATUSES,
+                        index=_option_index(PREVENTIVE_STATUSES, previous_status),
+                        key=f"{prev_token}_status",
+                    )
+                with c2:
+                    edit_description = st.text_area(
+                        "Descrição da atividade",
+                        value=clean_input(selected_prev.get("description")),
+                        key=f"{prev_token}_desc",
+                    )
+                    prev_periodicity_options = ["mensal", "trimestral", "semestral", "anual", "por horas de uso", "sob demanda"]
+                    edit_periodicity = st.selectbox(
+                        "Periodicidade",
+                        prev_periodicity_options,
+                        index=_option_index(prev_periodicity_options, selected_prev.get("periodicity")),
+                        key=f"{prev_token}_periodicity",
+                    )
+                    edit_planned_date = st.date_input("Data inicial prevista", value=_date_input_value(selected_prev.get("planned_date"), date.today()), key=f"{prev_token}_planned")
+                    edit_planned_end_date = st.date_input("Data final prevista", value=_date_input_value(selected_prev.get("planned_end_date"), edit_planned_date), key=f"{prev_token}_planned_end")
+                    edit_performed_date = st.date_input("Data realizada", value=_date_input_value(selected_prev.get("performed_date")), key=f"{prev_token}_done")
+                    edit_execution_time = st.text_input("Tempo de execução", value=clean_input(selected_prev.get("execution_time")), key=f"{prev_token}_execution_time")
+                with c3:
+                    edit_internal_responsible = st.text_input("Responsável interno", value=clean_input(selected_prev.get("internal_responsible")), key=f"{prev_token}_internal_responsible")
+                    edit_external_supplier = st.text_input("Fornecedor externo", value=clean_input(selected_prev.get("external_supplier")), key=f"{prev_token}_external_supplier")
+                    edit_supplier_contact = st.text_input("Contato do fornecedor", value=clean_input(selected_prev.get("supplier_contact")), key=f"{prev_token}_supplier_contact")
+                    edit_service_order = st.text_input("OS / protocolo externo", value=clean_input(selected_prev.get("service_order")), key=f"{prev_token}_service_order")
+                    edit_next_date = st.date_input("Próxima data", value=_date_input_value(selected_prev.get("next_date")), key=f"{prev_token}_next")
+
+                edit_status_reason = ""
+                edit_requires_reason = _maintenance_status_requires_justification(previous_status, edit_status, creating=False)
+                if edit_requires_reason:
+                    edit_status_reason = st.text_area(
+                        "Justificativa da alteração de status *",
+                        placeholder="Explique brevemente o motivo do status selecionado.",
+                        key=f"{prev_token}_status_reason",
+                    )
+
+                u1, u2 = st.columns(2)
+                with u1:
+                    edit_checklist = st.file_uploader("Novo checklist anexado", type=["pdf", "png", "jpg", "jpeg"], key=f"{prev_token}_check")
+                with u2:
+                    edit_certificate = st.file_uploader("Novo certificado de calibração", type=["pdf", "png", "jpg", "jpeg"], key=f"{prev_token}_cert")
+
+                edit_observations = st.text_area("Observações", value=clean_input(selected_prev.get("observations")), key=f"{prev_token}_obs")
+                edit_blocks_booking = st.checkbox(
+                    "Bloquear novas reservas neste período",
+                    value=truthy(selected_prev.get("blocks_booking")),
+                    key=f"{prev_token}_blocks_booking",
+                )
+                n1, n2, n3, n4 = st.columns(4)
+                edit_notify_internal = n1.checkbox("Responsável interno", value=truthy(selected_prev.get("notify_internal")), key=f"{prev_token}_notify_internal")
+                edit_notify_manager = n2.checkbox("Gestor do laboratório", value=truthy(selected_prev.get("notify_manager")), key=f"{prev_token}_notify_manager")
+                edit_notify_supplier = n3.checkbox("Fornecedor", value=truthy(selected_prev.get("notify_supplier")), key=f"{prev_token}_notify_supplier")
+                edit_notify_users = n4.checkbox("Usuários do equipamento", value=truthy(selected_prev.get("notify_users")), key=f"{prev_token}_notify_users")
+
+                if st.button("Atualizar preventiva/calibração", type="primary", key=f"{prev_token}_save"):
+                    if not edit_description.strip():
+                        st.error("Informe a descrição da atividade.")
+                    elif edit_planned_end_date and edit_planned_date and edit_planned_end_date < edit_planned_date:
+                        st.error("A data final prevista não pode ser anterior à data inicial.")
+                    elif edit_requires_reason and not edit_status_reason.strip():
+                        st.error("Informe a justificativa para este status.")
+                    elif not _ensure_storage_ready_for_upload(edit_checklist, edit_certificate):
+                        pass
+                    else:
+                        checklist_final = clean_input(selected_prev.get("checklist_path")) or None
+                        certificate_final = clean_input(selected_prev.get("certificate_path")) or None
+                        if edit_checklist is not None:
+                            checklist_final = _save_upload(
+                                conn,
+                                edit_checklist,
+                                entity_type="maintenance_preventive",
+                                entity_id=int(selected_prev["id"]),
+                                attachment_role="preventive_checklist",
+                            )
+                        if edit_certificate is not None:
+                            certificate_final = _save_upload(
+                                conn,
+                                edit_certificate,
+                                entity_type="maintenance_preventive",
+                                entity_id=int(selected_prev["id"]),
+                                attachment_role="preventive_certificate",
+                            )
+                        ok, msg = update_preventive_activity(
+                            conn,
+                            int(selected_prev["id"]),
+                            equipment_id=edit_equipment_id,
+                            activity_type=edit_activity_type,
+                            description=edit_description.strip(),
+                            periodicity=edit_periodicity,
+                            planned_date=edit_planned_date.isoformat() if edit_planned_date else None,
+                            planned_end_date=edit_planned_end_date.isoformat() if edit_planned_end_date else None,
+                            performed_date=edit_performed_date.isoformat() if edit_performed_date else None,
+                            execution_time=edit_execution_time.strip() or None,
+                            checklist_path=checklist_final,
+                            internal_responsible=edit_internal_responsible.strip() or None,
+                            external_supplier=edit_external_supplier.strip() or None,
+                            supplier_contact=edit_supplier_contact.strip() or None,
+                            service_order=edit_service_order.strip() or None,
+                            status=edit_status,
+                            certificate_path=certificate_final,
+                            observations=edit_observations.strip() or None,
+                            next_date=edit_next_date.isoformat() if edit_next_date else None,
+                            blocks_booking=int(edit_blocks_booking),
+                            notify_internal=int(edit_notify_internal),
+                            notify_manager=int(edit_notify_manager),
+                            notify_supplier=int(edit_notify_supplier),
+                            notify_users=int(edit_notify_users),
+                            status_justification=edit_status_reason.strip() or None,
+                            changed_by_id=_current_user_id(),
+                        )
+                        if ok:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
+            with st.expander("Anexos e histórico da preventiva/calibração", expanded=False):
+                p1, p2 = st.columns(2)
+                with p1:
+                    render_attachment_list(
+                        conn,
+                        entity_type="maintenance_preventive",
+                        entity_id=int(selected_prev["id"]),
+                        attachment_role="preventive_checklist",
+                        legacy_path=selected_prev.get("checklist_path"),
+                        key_prefix=f"{prev_token}_current_checklist",
+                        title="Checklist",
+                        empty_message="Nenhum checklist cadastrado.",
+                    )
+                with p2:
+                    render_attachment_list(
+                        conn,
+                        entity_type="maintenance_preventive",
+                        entity_id=int(selected_prev["id"]),
+                        attachment_role="preventive_certificate",
+                        legacy_path=selected_prev.get("certificate_path"),
+                        key_prefix=f"{prev_token}_current_certificate",
+                        title="Certificado",
+                        empty_message="Nenhum certificado cadastrado.",
+                    )
+                st.markdown("##### Histórico de status")
+                render_maintenance_status_history(conn, entity_type="preventive", entity_id=int(selected_prev["id"]))
+
+            with st.expander("Inativar lançamento incorreto", expanded=False):
+                inactive_reason = st.text_area("Motivo da inativação *", key=f"{prev_token}_inactive_reason")
+                if st.button("Inativar preventiva/calibração", key=f"{prev_token}_inactivate"):
+                    ok, msg = inactivate_maintenance_record(
+                        conn,
+                        entity_type="preventive",
+                        entity_id=int(selected_prev["id"]),
+                        inactive_reason=inactive_reason,
+                        inactive_by_id=_current_user_id(),
+                    )
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+        inactive_prev_df = query_df(
+            conn,
+            """
+            SELECT mp.id, e.equipment_code, e.equipment_name, mp.activity_type,
+                   mp.status, mp.inactive_reason, mp.inactive_at, u.full_name AS inactive_by_name
+            FROM maintenance_preventive mp
+            JOIN equipment e ON e.id = mp.equipment_id
+            LEFT JOIN users u ON u.id = mp.inactive_by_id
+            WHERE COALESCE(mp.is_active, 1) = 0
+            ORDER BY mp.inactive_at DESC, mp.id DESC
+            """,
+        )
+        if not inactive_prev_df.empty:
+            with st.expander("Preventivas/calibrações inativas para auditoria", expanded=False):
+                st.dataframe(_display_df(inactive_prev_df), use_container_width=True, hide_index=True)
+
     with tab_corr:
         st.markdown("### Manutenção corretiva e suporte")
         st.write("Tickets abertos por usuários quando há falha, quebra, ruído, anomalia operacional ou necessidade de suporte.")
@@ -3181,6 +3486,9 @@ def page_manutencao(conn):
                 priority = st.selectbox("Prioridade sugerida", ["alta", "média", "baixa"], index=2, key="corr_priority")
                 attachment = st.file_uploader("Anexos (foto, vídeo, print)", type=["png", "jpg", "jpeg", "pdf", "mp4", "mov"], key="corr_attach")
 
+            st.markdown("#### Peças de reposição associadas ao equipamento")
+            render_equipment_spare_parts(list_spare_parts_for_equipment(conn, equipment_id))
+
             st.markdown("#### Diagnóstico e ações")
             d1, d2, d3 = st.columns(3)
             with d1:
@@ -3196,7 +3504,14 @@ def page_manutencao(conn):
                 costs = st.number_input("Custos envolvidos (R$)", min_value=0.0, value=0.0, step=50.0, key="corr_costs")
                 downtime_hours = st.number_input("Downtime (h)", min_value=0.0, value=0.0, step=0.5, key="corr_downtime_hours")
 
-            status = st.selectbox("Status do ticket", ["aberto", "em análise", "aguardando peça", "enviado para fornecedor", "concluído", "cancelado"], key="corr_status")
+            status = st.selectbox("Status do ticket", CORRECTIVE_STATUSES, key="corr_status")
+            corr_create_status_reason = ""
+            if _maintenance_status_requires_justification("aberto", status, creating=True):
+                corr_create_status_reason = st.text_area(
+                    "Justificativa do status *",
+                    placeholder="Explique brevemente o motivo do status selecionado.",
+                    key="corr_create_status_reason",
+                )
             conclusion_date = st.date_input("Data de conclusão", value=None, key="corr_conclusion")
 
             st.markdown("#### Notificações futuras")
@@ -3209,10 +3524,13 @@ def page_manutencao(conn):
             if st.button("Abrir ticket corretivo", type="primary"):
                 if not title.strip() or not description.strip():
                     st.error("Informe o título e a descrição do ticket.")
+                elif _maintenance_status_requires_justification("aberto", status, creating=True) and not corr_create_status_reason.strip():
+                    st.error("Informe a justificativa para este status.")
                 elif not _ensure_storage_ready_for_upload(attachment):
                     pass
                 else:
                     occurrence_dt = datetime.combine(occurrence_date, occurrence_time).isoformat(timespec="minutes")
+                    base_status = "aberto" if status != "aberto" else status
                     ticket_id = create_corrective_ticket(
                         conn,
                         equipment_id=equipment_id,
@@ -3233,7 +3551,7 @@ def page_manutencao(conn):
                         costs=float(costs) if costs else None,
                         downtime_hours=float(downtime_hours) if downtime_hours else None,
                         conclusion_date=conclusion_date.isoformat() if conclusion_date else None,
-                        status=status,
+                        status=base_status,
                         notify_technical=int(notify_technical),
                         notify_manager=int(notify_manager),
                         notify_supplier=int(notify_supplier),
@@ -3254,41 +3572,44 @@ def page_manutencao(conn):
                             column="attachment_path",
                             value=attachment_ref,
                         )
+                    if status != base_status:
+                        change_maintenance_status(
+                            conn,
+                            entity_type="corrective",
+                            entity_id=ticket_id,
+                            new_status=status,
+                            justification=corr_create_status_reason.strip() or None,
+                            changed_by_id=_current_user_id(),
+                        )
                     st.success("Ticket corretivo registrado.")
                     st.rerun()
 
         st.markdown("### Tickets corretivos")
+        show_inactive_corr = st.checkbox("Mostrar tickets inativos para auditoria", value=False, key="corr_show_inactive")
         corr_df = query_df(
             conn,
             """
-            SELECT mc.id, e.equipment_code, e.equipment_name, e.location,
+            SELECT mc.id, mc.equipment_id, e.equipment_code, e.equipment_name, e.location,
                    u.full_name AS reporter, mc.title, mc.impact, mc.priority,
                    mc.status, mc.occurrence_datetime, mc.assigned_to,
-                   mc.downtime_hours, mc.costs, mc.created_at, mc.attachment_path
+                   mc.downtime_hours, mc.costs, mc.created_at, mc.attachment_path,
+                   mc.is_active, mc.inactive_reason, mc.inactive_at
             FROM maintenance_corrective mc
             JOIN equipment e ON e.id = mc.equipment_id
             LEFT JOIN users u ON u.id = mc.reporter_id
+            WHERE (? = 1 OR COALESCE(mc.is_active, 1) = 1)
             ORDER BY CASE mc.status WHEN 'aberto' THEN 0 WHEN 'em análise' THEN 1 WHEN 'aguardando peça' THEN 2 ELSE 3 END,
                      mc.created_at DESC
             """,
+            [int(show_inactive_corr)],
         )
         if corr_df.empty:
             st.info("Nenhum ticket corretivo registrado.")
         else:
-            st.dataframe(corr_df, use_container_width=True, hide_index=True)
-            st.markdown("#### Anexos cadastrados")
-            shown_corrective = 0
+            st.dataframe(_display_df(corr_df), use_container_width=True, hide_index=True)
+            st.markdown("#### Detalhes, anexos e peças")
             for _, ticket in corr_df.iterrows():
-                attachment_rows = list_attachments(
-                    conn,
-                    entity_type="maintenance_corrective",
-                    entity_id=int(ticket["id"]),
-                    attachment_role="corrective_attachment",
-                )
                 legacy_path = ticket.get("attachment_path")
-                if not attachment_rows and is_blank(legacy_path):
-                    continue
-                shown_corrective += 1
                 title = f"Ticket #{int(ticket['id'])} · {clean_value(ticket.get('equipment_code'))} · {clean_value(ticket.get('title'))}"
                 with st.expander(title, expanded=False):
                     render_attachment_list(
@@ -3301,23 +3622,238 @@ def page_manutencao(conn):
                         title="Anexo",
                         empty_message="Nenhum anexo cadastrado.",
                     )
-            if shown_corrective == 0:
-                st.caption("Nenhum anexo cadastrado.")
-            active_ids = corr_df[~corr_df["status"].isin(["concluído", "cancelado"])] ["id"].tolist()
+                    st.markdown("##### Peças de reposição associadas ao equipamento")
+                    render_equipment_spare_parts(list_spare_parts_for_equipment(conn, int(ticket["equipment_id"])))
+                    st.markdown("##### Histórico de status")
+                    render_maintenance_status_history(conn, entity_type="corrective", entity_id=int(ticket["id"]))
+            active_corr = corr_df[corr_df["is_active"].map(lambda value: True if is_blank(value) else truthy(value))]
+            active_ids = active_corr[~active_corr["status"].isin(["concluído", "cancelado"])] ["id"].tolist()
             if active_ids:
                 c1, c2 = st.columns([1, 1])
                 with c1:
                     ticket_id = st.selectbox("Atualizar status do ticket", active_ids, format_func=lambda x: f"Ticket #{x}", key="corr_update_ticket_id")
                 with c2:
                     new_status = st.selectbox("Novo status", ["em análise", "aguardando peça", "enviado para fornecedor", "concluído", "cancelado"], key="corr_update_new_status")
-                if st.button("Atualizar status"):
-                    update_corrective_status(conn, int(ticket_id), new_status)
-                    st.rerun()
+                current_ticket = active_corr[active_corr["id"] == ticket_id].iloc[0]
+                current_status = clean_input(current_ticket.get("status"))
+                quick_requires_reason = _maintenance_status_requires_justification(current_status, new_status, creating=False)
+                quick_reason = ""
+                if quick_requires_reason:
+                    quick_reason = st.text_area("Justificativa da alteração de status *", key="corr_quick_status_reason")
+                if st.button("Atualizar status com histórico"):
+                    if quick_requires_reason and not quick_reason.strip():
+                        st.error("Informe a justificativa para este status.")
+                    else:
+                        ok, msg = change_maintenance_status(
+                            conn,
+                            entity_type="corrective",
+                            entity_id=int(ticket_id),
+                            new_status=new_status,
+                            justification=quick_reason.strip() or None,
+                            changed_by_id=_current_user_id(),
+                        )
+                        if ok:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
+        st.markdown("### Editar ou inativar ticket corretivo")
+        corr_edit_df = query_df(
+            conn,
+            """
+            SELECT mc.*, e.equipment_code, e.equipment_name, e.location,
+                   u.full_name AS reporter
+            FROM maintenance_corrective mc
+            JOIN equipment e ON e.id = mc.equipment_id
+            LEFT JOIN users u ON u.id = mc.reporter_id
+            WHERE COALESCE(mc.is_active, 1) = 1
+            ORDER BY CASE mc.status
+                       WHEN 'aberto' THEN 0
+                       WHEN 'em análise' THEN 1
+                       WHEN 'aguardando peça' THEN 2
+                       WHEN 'enviado para fornecedor' THEN 3
+                       WHEN 'concluído' THEN 4
+                       WHEN 'cancelado' THEN 5
+                       ELSE 6
+                     END,
+                     mc.created_at DESC
+            """,
+        )
+        if corr_edit_df.empty:
+            st.info("Nenhum ticket corretivo ativo para editar.")
+        else:
+            corr_options = corr_edit_df.apply(
+                lambda r: (
+                    f"#{int(r['id'])} · {clean_value(r.get('equipment_code'))} · "
+                    f"{clean_value(r.get('title'))} · {clean_value(r.get('status'), 'aberto')}"
+                ),
+                axis=1,
+            ).tolist()
+            corr_label = st.selectbox("Selecionar ticket corretivo", corr_options, key="corr_edit_select")
+            selected_corr = corr_edit_df.iloc[corr_options.index(corr_label)]
+            corr_token = f"corr_edit_{int(selected_corr['id'])}"
+
+            with st.container(border=True):
+                c1, c2 = st.columns(2)
+                equipment_ids = equipment["id"].astype(int).tolist()
+                selected_equipment_id = int(selected_corr["equipment_id"])
+                equipment_index = equipment_ids.index(selected_equipment_id) if selected_equipment_id in equipment_ids else 0
+                with c1:
+                    eq_label = st.selectbox("Equipamento", _equipment_options(equipment), index=equipment_index, key=f"{corr_token}_eq")
+                    edit_equipment_id = _equipment_id_from_label(equipment, eq_label)
+                    selected_eq = equipment[equipment["id"] == edit_equipment_id].iloc[0]
+                    st.info(f"**Local:** {clean_value(selected_eq.get('location'))}  \n**Patrimônio/código:** {clean_value(selected_eq.get('equipment_code'))}")
+                    reporter_id = None
+                    if not users.empty:
+                        user_labels = ["Não informado"] + _user_options(users)
+                        reporter_index = 0
+                        if not is_blank(selected_corr.get("reporter_id")):
+                            reporter_ids = users["id"].astype(int).tolist()
+                            selected_reporter_id = int(selected_corr.get("reporter_id"))
+                            if selected_reporter_id in reporter_ids:
+                                reporter_index = reporter_ids.index(selected_reporter_id) + 1
+                        reporter_label = st.selectbox("Usuário que abriu o ticket", user_labels, index=reporter_index, key=f"{corr_token}_reporter")
+                        reporter_id = _user_id_from_label(users, reporter_label)
+                    edit_title = st.text_input("Título do ticket", value=clean_input(selected_corr.get("title")), key=f"{corr_token}_title")
+                    occurrence_date_default, occurrence_time_default = _datetime_input_defaults(selected_corr.get("occurrence_datetime"))
+                    edit_occurrence_date = st.date_input("Data da ocorrência", value=occurrence_date_default, key=f"{corr_token}_occurrence_date")
+                    edit_occurrence_time = st.time_input("Hora da ocorrência", value=occurrence_time_default, step=timedelta(minutes=15), key=f"{corr_token}_occurrence_time")
+                with c2:
+                    edit_description = st.text_area("Descrição detalhada", value=clean_input(selected_corr.get("description")), key=f"{corr_token}_desc")
+                    edit_impact = st.selectbox("Impacto", ["crítico", "moderado", "baixo"], index=_option_index(["crítico", "moderado", "baixo"], selected_corr.get("impact"), default=2), key=f"{corr_token}_impact")
+                    edit_priority = st.selectbox("Prioridade sugerida", ["alta", "média", "baixa"], index=_option_index(["alta", "média", "baixa"], selected_corr.get("priority"), default=2), key=f"{corr_token}_priority")
+                    edit_attachment = st.file_uploader("Novo anexo (foto, vídeo, print)", type=["png", "jpg", "jpeg", "pdf", "mp4", "mov"], key=f"{corr_token}_attach")
+
+                st.markdown("#### Peças de reposição associadas ao equipamento")
+                render_equipment_spare_parts(list_spare_parts_for_equipment(conn, edit_equipment_id))
+
+                st.markdown("#### Diagnóstico e ações")
+                d1, d2, d3 = st.columns(3)
+                with d1:
+                    edit_assigned_to = st.text_input("Responsável pelo atendimento", value=clean_input(selected_corr.get("assigned_to")), key=f"{corr_token}_assigned_to")
+                    trained_options = ["não informado", "sim", "não"]
+                    edit_operator_trained = st.selectbox("Operador era treinado?", trained_options, index=_option_index(trained_options, selected_corr.get("operator_trained")), key=f"{corr_token}_operator_trained")
+                    edit_external_supplier_needed = st.checkbox("Necessita fornecedor externo", value=truthy(selected_corr.get("external_supplier_needed")), key=f"{corr_token}_external_supplier_needed")
+                with d2:
+                    edit_initial_diagnosis = st.text_area("Diagnóstico inicial", value=clean_input(selected_corr.get("initial_diagnosis")), key=f"{corr_token}_diag")
+                    edit_probable_cause = st.text_area("Causa provável", value=clean_input(selected_corr.get("probable_cause")), key=f"{corr_token}_cause")
+                with d3:
+                    edit_corrective_action = st.text_area("Ação corretiva realizada", value=clean_input(selected_corr.get("corrective_action")), key=f"{corr_token}_action")
+                    edit_replaced_parts = st.text_input("Peças substituídas", value=clean_input(selected_corr.get("replaced_parts")), key=f"{corr_token}_replaced_parts")
+                    edit_costs = st.number_input("Custos envolvidos (R$)", min_value=0.0, value=float(selected_corr.get("costs") or 0), step=50.0, key=f"{corr_token}_costs")
+                    edit_downtime_hours = st.number_input("Downtime (h)", min_value=0.0, value=float(selected_corr.get("downtime_hours") or 0), step=0.5, key=f"{corr_token}_downtime_hours")
+
+                previous_corr_status = clean_input(selected_corr.get("status")) or "aberto"
+                edit_status = st.selectbox(
+                    "Status do ticket",
+                    CORRECTIVE_STATUSES,
+                    index=_option_index(CORRECTIVE_STATUSES, previous_corr_status),
+                    key=f"{corr_token}_status",
+                )
+                edit_status_reason = ""
+                edit_requires_reason = _maintenance_status_requires_justification(previous_corr_status, edit_status, creating=False)
+                if edit_requires_reason:
+                    edit_status_reason = st.text_area(
+                        "Justificativa da alteração de status *",
+                        placeholder="Explique brevemente o motivo do status selecionado.",
+                        key=f"{corr_token}_status_reason",
+                    )
+                edit_conclusion_date = st.date_input("Data de conclusão", value=_date_input_value(selected_corr.get("conclusion_date")), key=f"{corr_token}_conclusion")
+
+                n1, n2, n3, n4 = st.columns(4)
+                edit_notify_technical = n1.checkbox("Responsável técnico", value=truthy(selected_corr.get("notify_technical")), key=f"{corr_token}_notify_technical")
+                edit_notify_manager = n2.checkbox("Gestor do laboratório", value=truthy(selected_corr.get("notify_manager")), key=f"{corr_token}_notify_manager")
+                edit_notify_supplier = n3.checkbox("Fornecedor", value=truthy(selected_corr.get("notify_supplier")), key=f"{corr_token}_notify_supplier")
+                edit_notify_reporter = n4.checkbox("Usuário que abriu", value=truthy(selected_corr.get("notify_reporter")), key=f"{corr_token}_notify_reporter")
+
+                if st.button("Atualizar ticket corretivo", type="primary", key=f"{corr_token}_save"):
+                    if not edit_title.strip() or not edit_description.strip():
+                        st.error("Informe o título e a descrição do ticket.")
+                    elif edit_requires_reason and not edit_status_reason.strip():
+                        st.error("Informe a justificativa para este status.")
+                    elif not _ensure_storage_ready_for_upload(edit_attachment):
+                        pass
+                    else:
+                        attachment_final = clean_input(selected_corr.get("attachment_path")) or None
+                        if edit_attachment is not None:
+                            attachment_final = _save_upload(
+                                conn,
+                                edit_attachment,
+                                entity_type="maintenance_corrective",
+                                entity_id=int(selected_corr["id"]),
+                                attachment_role="corrective_attachment",
+                            )
+                        edit_occurrence_dt = datetime.combine(edit_occurrence_date, edit_occurrence_time).isoformat(timespec="minutes")
+                        ok, msg = update_corrective_ticket(
+                            conn,
+                            int(selected_corr["id"]),
+                            equipment_id=edit_equipment_id,
+                            reporter_id=reporter_id,
+                            title=edit_title.strip(),
+                            description=edit_description.strip(),
+                            occurrence_datetime=edit_occurrence_dt,
+                            impact=edit_impact,
+                            priority=edit_priority,
+                            attachment_path=attachment_final,
+                            assigned_to=edit_assigned_to.strip() or None,
+                            initial_diagnosis=edit_initial_diagnosis.strip() or None,
+                            probable_cause=edit_probable_cause.strip() or None,
+                            operator_trained=edit_operator_trained,
+                            external_supplier_needed=int(edit_external_supplier_needed),
+                            corrective_action=edit_corrective_action.strip() or None,
+                            replaced_parts=edit_replaced_parts.strip() or None,
+                            costs=float(edit_costs) if edit_costs else None,
+                            downtime_hours=float(edit_downtime_hours) if edit_downtime_hours else None,
+                            conclusion_date=edit_conclusion_date.isoformat() if edit_conclusion_date else None,
+                            status=edit_status,
+                            notify_technical=int(edit_notify_technical),
+                            notify_manager=int(edit_notify_manager),
+                            notify_supplier=int(edit_notify_supplier),
+                            notify_reporter=int(edit_notify_reporter),
+                            status_justification=edit_status_reason.strip() or None,
+                            changed_by_id=_current_user_id(),
+                        )
+                        if ok:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
+            with st.expander("Anexo e histórico do ticket", expanded=False):
+                render_attachment_list(
+                    conn,
+                    entity_type="maintenance_corrective",
+                    entity_id=int(selected_corr["id"]),
+                    attachment_role="corrective_attachment",
+                    legacy_path=selected_corr.get("attachment_path"),
+                    key_prefix=f"{corr_token}_current_attachment",
+                    title="Anexo",
+                    empty_message="Nenhum anexo cadastrado.",
+                )
+                st.markdown("##### Histórico de status")
+                render_maintenance_status_history(conn, entity_type="corrective", entity_id=int(selected_corr["id"]))
+
+            with st.expander("Inativar lançamento incorreto", expanded=False):
+                inactive_reason = st.text_area("Motivo da inativação *", key=f"{corr_token}_inactive_reason")
+                if st.button("Inativar ticket corretivo", key=f"{corr_token}_inactivate"):
+                    ok, msg = inactivate_maintenance_record(
+                        conn,
+                        entity_type="corrective",
+                        entity_id=int(selected_corr["id"]),
+                        inactive_reason=inactive_reason,
+                        inactive_by_id=_current_user_id(),
+                    )
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
 
     with tab_dash:
         st.markdown("### Indicadores de manutenção")
-        corr = query_df(conn, "SELECT * FROM maintenance_corrective")
-        prev = query_df(conn, "SELECT * FROM maintenance_preventive")
+        corr = query_df(conn, "SELECT * FROM maintenance_corrective WHERE COALESCE(is_active, 1) = 1")
+        prev = query_df(conn, "SELECT * FROM maintenance_preventive WHERE COALESCE(is_active, 1) = 1")
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Preventivas/calibrações", len(prev))
         k2.metric("Tickets corretivos", len(corr))
@@ -3399,7 +3935,8 @@ def _filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, 
                mp.created_at, mp.updated_at
         FROM maintenance_preventive mp
         JOIN equipment e ON e.id=mp.equipment_id
-        WHERE SUBSTR(COALESCE(mp.performed_date, mp.planned_date, mp.created_at), 1, 10) BETWEEN ? AND ?
+        WHERE COALESCE(mp.is_active, 1) = 1
+          AND SUBSTR(COALESCE(mp.performed_date, mp.planned_date, mp.created_at), 1, 10) BETWEEN ? AND ?
         ORDER BY COALESCE(mp.performed_date, mp.planned_date, mp.created_at)
         """,
         [start_date.isoformat(), end_date.isoformat()],
@@ -3417,7 +3954,8 @@ def _filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, 
         FROM maintenance_corrective mc
         JOIN equipment e ON e.id=mc.equipment_id
         LEFT JOIN users u ON u.id=mc.reporter_id
-        WHERE SUBSTR(COALESCE(mc.conclusion_date, mc.occurrence_datetime, mc.created_at), 1, 10) BETWEEN ? AND ?
+        WHERE COALESCE(mc.is_active, 1) = 1
+          AND SUBSTR(COALESCE(mc.conclusion_date, mc.occurrence_datetime, mc.created_at), 1, 10) BETWEEN ? AND ?
         ORDER BY COALESCE(mc.conclusion_date, mc.occurrence_datetime, mc.created_at)
         """,
         [start_date.isoformat(), end_date.isoformat()],

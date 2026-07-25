@@ -215,9 +215,14 @@ def init_db(conn: DatabaseConnection) -> None:
             notify_manager INTEGER DEFAULT 1,
             notify_supplier INTEGER DEFAULT 0,
             notify_users INTEGER DEFAULT 0,
+            is_active INTEGER DEFAULT 1,
+            inactive_reason TEXT,
+            inactive_by_id INTEGER,
+            inactive_at TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(equipment_id) REFERENCES equipment(id)
+            FOREIGN KEY(equipment_id) REFERENCES equipment(id),
+            FOREIGN KEY(inactive_by_id) REFERENCES users(id)
         );
 
         CREATE TABLE IF NOT EXISTS maintenance_corrective (
@@ -245,11 +250,31 @@ def init_db(conn: DatabaseConnection) -> None:
             notify_manager INTEGER DEFAULT 1,
             notify_supplier INTEGER DEFAULT 0,
             notify_reporter INTEGER DEFAULT 1,
+            is_active INTEGER DEFAULT 1,
+            inactive_reason TEXT,
+            inactive_by_id INTEGER,
+            inactive_at TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(equipment_id) REFERENCES equipment(id),
-            FOREIGN KEY(reporter_id) REFERENCES users(id)
+            FOREIGN KEY(reporter_id) REFERENCES users(id),
+            FOREIGN KEY(inactive_by_id) REFERENCES users(id)
         );
+
+        CREATE TABLE IF NOT EXISTS maintenance_status_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_type TEXT NOT NULL,
+            entity_id INTEGER NOT NULL,
+            previous_status TEXT,
+            new_status TEXT NOT NULL,
+            justification TEXT,
+            changed_by_id INTEGER,
+            changed_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(changed_by_id) REFERENCES users(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_maintenance_status_history_entity
+            ON maintenance_status_history (entity_type, entity_id, changed_at);
 
         CREATE TABLE IF NOT EXISTS supplies (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -397,11 +422,21 @@ def init_db(conn: DatabaseConnection) -> None:
     _add_column(conn, "maintenance_preventive", "planned_end_date", "TEXT")
     _add_column(conn, "maintenance_preventive", "blocks_booking", "INTEGER DEFAULT 1")
     _add_column(conn, "maintenance_preventive", "updated_at", "TEXT")
+    _add_column(conn, "maintenance_preventive", "is_active", "INTEGER DEFAULT 1")
+    _add_column(conn, "maintenance_preventive", "inactive_reason", "TEXT")
+    _add_column(conn, "maintenance_preventive", "inactive_by_id", "INTEGER")
+    _add_column(conn, "maintenance_preventive", "inactive_at", "TEXT")
     _add_column(conn, "maintenance_corrective", "updated_at", "TEXT")
+    _add_column(conn, "maintenance_corrective", "is_active", "INTEGER DEFAULT 1")
+    _add_column(conn, "maintenance_corrective", "inactive_reason", "TEXT")
+    _add_column(conn, "maintenance_corrective", "inactive_by_id", "INTEGER")
+    _add_column(conn, "maintenance_corrective", "inactive_at", "TEXT")
     _add_column(conn, "supplies", "supply_type", "TEXT DEFAULT 'Insumo'")
     _add_column(conn, "supplies", "supply_code", "TEXT")
     _add_column(conn, "supplies", "manufacturer_code", "TEXT")
     _add_column(conn, "supplies", "compatible_model_family", "TEXT")
+    conn.execute("UPDATE maintenance_preventive SET is_active = 1 WHERE is_active IS NULL")
+    conn.execute("UPDATE maintenance_corrective SET is_active = 1 WHERE is_active IS NULL")
     conn.execute("UPDATE supplies SET supply_type = 'Insumo' WHERE supply_type IS NULL OR TRIM(supply_type) = ''")
     conn.execute("UPDATE users SET role = 'manager' WHERE LOWER(COALESCE(role, '')) IN ('operator', 'operador', 'gerente')")
     conn.commit()
@@ -437,6 +472,7 @@ OPERATIONAL_TABLES = [
 
 ALL_TABLES = [
     *OPERATIONAL_TABLES,
+    "maintenance_status_history",
     "attachments",
     "access_codes",
     "notification_log",
@@ -1207,6 +1243,7 @@ def _preventive_conflict(conn: sqlite3.Connection, equipment_id: int, start_iso:
         SELECT id, activity_type, description, planned_date, planned_end_date, status
         FROM maintenance_preventive
         WHERE equipment_id = ?
+          AND COALESCE(is_active, 1) = 1
           AND COALESCE(blocks_booking, 1) = 1
           AND LOWER(COALESCE(status, 'pendente')) NOT IN ('realizado', 'concluído', 'concluido', 'cancelado')
           AND planned_date IS NOT NULL
@@ -1767,9 +1804,408 @@ def create_corrective_ticket(
     )
 
 
-def update_corrective_status(conn: sqlite3.Connection, ticket_id: int, status: str) -> None:
-    conn.execute("UPDATE maintenance_corrective SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [status, ticket_id])
+_MAINTENANCE_ENTITY_TABLES = {
+    "preventive": "maintenance_preventive",
+    "corrective": "maintenance_corrective",
+}
+
+
+def _maintenance_table(entity_type: str) -> str:
+    table = _MAINTENANCE_ENTITY_TABLES.get(str(entity_type).strip().lower())
+    if not table:
+        raise ValueError("Tipo de manutenção inválido.")
+    return table
+
+
+def _clean_status(value: Any) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def _maintenance_status_requires_justification(previous_status: Any, new_status: Any) -> bool:
+    previous = _clean_status(previous_status)
+    new = _clean_status(new_status)
+    if previous == new:
+        return False
+    if new in {"reprovado", "reagendado", "cancelado"}:
+        return True
+    return new == "pendente"
+
+
+def _record_maintenance_status_history(
+    conn: DatabaseConnection,
+    *,
+    entity_type: str,
+    entity_id: int,
+    previous_status: str | None,
+    new_status: str,
+    justification: str | None,
+    changed_by_id: int | None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO maintenance_status_history (
+            entity_type, entity_id, previous_status, new_status,
+            justification, changed_by_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [
+            entity_type,
+            entity_id,
+            previous_status,
+            new_status,
+            justification,
+            changed_by_id,
+        ],
+    )
+
+
+def change_maintenance_status(
+    conn: DatabaseConnection,
+    *,
+    entity_type: str,
+    entity_id: int,
+    new_status: str,
+    justification: str | None = None,
+    changed_by_id: int | None = None,
+) -> tuple[bool, str]:
+    entity_type = str(entity_type).strip().lower()
+    table = _maintenance_table(entity_type)
+    row = conn.execute(
+        f"SELECT status FROM {table} WHERE id = ? AND COALESCE(is_active, 1) = 1",
+        [entity_id],
+    ).fetchone()
+    if not row:
+        return False, "Registro de manutenção não encontrado ou inativo."
+
+    previous_status = row["status"]
+    if _clean_status(previous_status) == _clean_status(new_status):
+        return True, "Status mantido sem alterações."
+    if _maintenance_status_requires_justification(previous_status, new_status) and not _clean_status(justification):
+        return False, "Informe a justificativa para este status."
+
+    conn.execute(
+        f"UPDATE {table} SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        [new_status, entity_id],
+    )
+    _record_maintenance_status_history(
+        conn,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        previous_status=previous_status,
+        new_status=new_status,
+        justification=justification,
+        changed_by_id=changed_by_id,
+    )
     conn.commit()
+    return True, "Status atualizado com histórico."
+
+
+def update_corrective_status(conn: sqlite3.Connection, ticket_id: int, status: str) -> None:
+    change_maintenance_status(
+        conn,
+        entity_type="corrective",
+        entity_id=ticket_id,
+        new_status=status,
+    )
+
+
+def update_preventive_activity(
+    conn: DatabaseConnection,
+    preventive_id: int,
+    *,
+    equipment_id: int,
+    activity_type: str,
+    description: str,
+    periodicity: str,
+    planned_date: str | None,
+    planned_end_date: str | None,
+    performed_date: str | None,
+    execution_time: str | None,
+    checklist_path: str | None,
+    internal_responsible: str | None,
+    external_supplier: str | None,
+    supplier_contact: str | None,
+    service_order: str | None,
+    status: str,
+    certificate_path: str | None,
+    observations: str | None,
+    next_date: str | None,
+    blocks_booking: int,
+    notify_internal: int,
+    notify_manager: int,
+    notify_supplier: int,
+    notify_users: int,
+    status_justification: str | None = None,
+    changed_by_id: int | None = None,
+) -> tuple[bool, str]:
+    row = conn.execute(
+        "SELECT status FROM maintenance_preventive WHERE id = ? AND COALESCE(is_active, 1) = 1",
+        [preventive_id],
+    ).fetchone()
+    if not row:
+        return False, "Manutenção preventiva não encontrada ou inativa."
+
+    previous_status = row["status"]
+    if _maintenance_status_requires_justification(previous_status, status) and not _clean_status(status_justification):
+        return False, "Informe a justificativa para este status."
+    conn.execute(
+        """
+        UPDATE maintenance_preventive
+        SET equipment_id = ?,
+            activity_type = ?,
+            description = ?,
+            periodicity = ?,
+            planned_date = ?,
+            planned_end_date = ?,
+            performed_date = ?,
+            execution_time = ?,
+            checklist_path = ?,
+            internal_responsible = ?,
+            external_supplier = ?,
+            supplier_contact = ?,
+            service_order = ?,
+            status = ?,
+            certificate_path = ?,
+            observations = ?,
+            next_date = ?,
+            blocks_booking = ?,
+            notify_internal = ?,
+            notify_manager = ?,
+            notify_supplier = ?,
+            notify_users = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        [
+            equipment_id,
+            activity_type,
+            description,
+            periodicity,
+            planned_date,
+            planned_end_date,
+            performed_date,
+            execution_time,
+            checklist_path,
+            internal_responsible,
+            external_supplier,
+            supplier_contact,
+            service_order,
+            status,
+            certificate_path,
+            observations,
+            next_date,
+            blocks_booking,
+            notify_internal,
+            notify_manager,
+            notify_supplier,
+            notify_users,
+            preventive_id,
+        ],
+    )
+    if _clean_status(previous_status) != _clean_status(status):
+        _record_maintenance_status_history(
+            conn,
+            entity_type="preventive",
+            entity_id=preventive_id,
+            previous_status=previous_status,
+            new_status=status,
+            justification=status_justification,
+            changed_by_id=changed_by_id,
+        )
+    conn.commit()
+    return True, "Manutenção preventiva atualizada."
+
+
+def update_corrective_ticket(
+    conn: DatabaseConnection,
+    ticket_id: int,
+    *,
+    equipment_id: int,
+    reporter_id: int | None,
+    title: str,
+    description: str,
+    occurrence_datetime: str,
+    impact: str,
+    priority: str,
+    attachment_path: str | None,
+    assigned_to: str | None,
+    initial_diagnosis: str | None,
+    probable_cause: str | None,
+    operator_trained: str,
+    external_supplier_needed: int,
+    corrective_action: str | None,
+    replaced_parts: str | None,
+    costs: float | None,
+    downtime_hours: float | None,
+    conclusion_date: str | None,
+    status: str,
+    notify_technical: int,
+    notify_manager: int,
+    notify_supplier: int,
+    notify_reporter: int,
+    status_justification: str | None = None,
+    changed_by_id: int | None = None,
+) -> tuple[bool, str]:
+    row = conn.execute(
+        "SELECT status FROM maintenance_corrective WHERE id = ? AND COALESCE(is_active, 1) = 1",
+        [ticket_id],
+    ).fetchone()
+    if not row:
+        return False, "Ticket corretivo não encontrado ou inativo."
+
+    previous_status = row["status"]
+    if _maintenance_status_requires_justification(previous_status, status) and not _clean_status(status_justification):
+        return False, "Informe a justificativa para este status."
+    conn.execute(
+        """
+        UPDATE maintenance_corrective
+        SET equipment_id = ?,
+            reporter_id = ?,
+            title = ?,
+            description = ?,
+            occurrence_datetime = ?,
+            impact = ?,
+            priority = ?,
+            attachment_path = ?,
+            assigned_to = ?,
+            initial_diagnosis = ?,
+            probable_cause = ?,
+            operator_trained = ?,
+            external_supplier_needed = ?,
+            corrective_action = ?,
+            replaced_parts = ?,
+            costs = ?,
+            downtime_hours = ?,
+            conclusion_date = ?,
+            status = ?,
+            notify_technical = ?,
+            notify_manager = ?,
+            notify_supplier = ?,
+            notify_reporter = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        [
+            equipment_id,
+            reporter_id,
+            title,
+            description,
+            occurrence_datetime,
+            impact,
+            priority,
+            attachment_path,
+            assigned_to,
+            initial_diagnosis,
+            probable_cause,
+            operator_trained,
+            external_supplier_needed,
+            corrective_action,
+            replaced_parts,
+            costs,
+            downtime_hours,
+            conclusion_date,
+            status,
+            notify_technical,
+            notify_manager,
+            notify_supplier,
+            notify_reporter,
+            ticket_id,
+        ],
+    )
+    if _clean_status(previous_status) != _clean_status(status):
+        _record_maintenance_status_history(
+            conn,
+            entity_type="corrective",
+            entity_id=ticket_id,
+            previous_status=previous_status,
+            new_status=status,
+            justification=status_justification,
+            changed_by_id=changed_by_id,
+        )
+    conn.commit()
+    return True, "Ticket corretivo atualizado."
+
+
+def inactivate_maintenance_record(
+    conn: DatabaseConnection,
+    *,
+    entity_type: str,
+    entity_id: int,
+    inactive_reason: str,
+    inactive_by_id: int | None = None,
+) -> tuple[bool, str]:
+    entity_type = str(entity_type).strip().lower()
+    table = _maintenance_table(entity_type)
+    if not inactive_reason or not inactive_reason.strip():
+        return False, "Informe o motivo da inativação."
+
+    row = conn.execute(
+        f"SELECT id FROM {table} WHERE id = ? AND COALESCE(is_active, 1) = 1",
+        [entity_id],
+    ).fetchone()
+    if not row:
+        return False, "Registro de manutenção não encontrado ou já inativo."
+
+    conn.execute(
+        f"""
+        UPDATE {table}
+        SET is_active = 0,
+            inactive_reason = ?,
+            inactive_by_id = ?,
+            inactive_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        [inactive_reason.strip(), inactive_by_id, entity_id],
+    )
+    conn.commit()
+    return True, "Registro inativado sem exclusão definitiva."
+
+
+def list_maintenance_status_history(
+    conn: DatabaseConnection,
+    *,
+    entity_type: str,
+    entity_id: int,
+) -> pd.DataFrame:
+    return query_df(
+        conn,
+        """
+        SELECT msh.id, msh.entity_type, msh.entity_id, msh.previous_status,
+               msh.new_status, msh.justification, msh.changed_at,
+               u.full_name AS changed_by_name, u.email AS changed_by_email
+        FROM maintenance_status_history msh
+        LEFT JOIN users u ON u.id = msh.changed_by_id
+        WHERE msh.entity_type = ?
+          AND msh.entity_id = ?
+        ORDER BY msh.changed_at DESC, msh.id DESC
+        """,
+        [entity_type, entity_id],
+    )
+
+
+def list_upcoming_preventive_maintenance(conn: DatabaseConnection) -> pd.DataFrame:
+    return query_df(
+        conn,
+        """
+        SELECT mp.id, e.equipment_code, e.equipment_name, e.location,
+               mp.activity_type, mp.description, mp.periodicity,
+               mp.planned_date, mp.planned_end_date, mp.performed_date,
+               mp.status, mp.next_date,
+               COALESCE(NULLIF(mp.next_date, ''), NULLIF(mp.planned_date, '')) AS scheduled_reference,
+               mp.blocks_booking, mp.internal_responsible, mp.external_supplier,
+               mp.service_order, mp.observations, mp.checklist_path, mp.certificate_path
+        FROM maintenance_preventive mp
+        JOIN equipment e ON e.id = mp.equipment_id
+        WHERE COALESCE(mp.is_active, 1) = 1
+          AND LOWER(COALESCE(mp.status, 'pendente')) NOT IN ('realizado', 'concluído', 'concluido', 'cancelado')
+        ORDER BY
+            CASE WHEN COALESCE(NULLIF(mp.next_date, ''), NULLIF(mp.planned_date, '')) IS NULL THEN 1 ELSE 0 END,
+            COALESCE(NULLIF(mp.next_date, ''), NULLIF(mp.planned_date, '')) ASC,
+            mp.id DESC
+        """,
+    )
 
 
 def create_supply(
