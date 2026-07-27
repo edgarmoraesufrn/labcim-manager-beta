@@ -16,6 +16,7 @@ from numbers import Integral, Real
 import os
 import secrets as py_secrets
 import smtplib
+from time import perf_counter
 import zipfile
 from pathlib import Path
 import re
@@ -69,9 +70,11 @@ from labcim_manager.db import (
 from labcim_manager.storage import (
     LocalStorageBackend,
     R2StorageBackend,
+    R2_REQUIRED_KEYS,
     StorageConfigurationError,
     get_active_storage_backend,
     get_storage_backend_for_name,
+    resolve_config_value,
 )
 
 APP_TITLE = "LabCim Manager"
@@ -81,6 +84,10 @@ BASE_XLSX = Path("data/LabCim_Base.xlsx")
 LOGO_PATH = Path("assets/logo_labcim.png")
 POP_DIR = Path("assets/pops")
 ACCESS_CODE_TTL_MINUTES = 10
+CACHE_TTL_SECONDS = 120
+DB_CONNECTION_KEY = "labcim_db_connection"
+DB_CONNECTION_FINGERPRINT_KEY = "labcim_db_connection_fingerprint"
+PERF_EVENTS_KEY = "labcim_perf_events"
 
 LAB_BLUE = "#0033A0"
 LAB_CYAN = "#00AEEF"
@@ -442,13 +449,219 @@ def _database_url() -> str | None:
     return os.environ.get("DATABASE_URL") or None
 
 
+def _database_fingerprint(database_url: str | None) -> str:
+    if database_url:
+        digest = hashlib.sha256(database_url.encode("utf-8")).hexdigest()[:16]
+        return f"postgres:{digest}"
+    return f"sqlite:{DB_PATH.as_posix()}"
+
+
+def _base_xlsx_marker() -> str:
+    if not BASE_XLSX.exists():
+        return "missing"
+    stat = BASE_XLSX.stat()
+    return f"{stat.st_mtime_ns}:{stat.st_size}"
+
+
+def _debug_perf_enabled() -> bool:
+    value = os.environ.get("LABCIM_DEBUG_PERF")
+    try:
+        if hasattr(st, "secrets") and "LABCIM_DEBUG_PERF" in st.secrets:
+            value = st.secrets["LABCIM_DEBUG_PERF"]
+    except Exception:
+        pass
+    try:
+        if hasattr(st, "secrets") and "debug" in st.secrets and "LABCIM_DEBUG_PERF" in st.secrets["debug"]:
+            value = st.secrets["debug"]["LABCIM_DEBUG_PERF"]
+    except Exception:
+        pass
+    return str(value or "").strip().lower() in {"1", "true", "yes", "sim", "on"}
+
+
+class _PerfTimer:
+    def __init__(self, label: str):
+        self.label = label
+        self.enabled = _debug_perf_enabled()
+        self.start = 0.0
+
+    def __enter__(self):
+        if self.enabled:
+            self.start = perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.enabled:
+            elapsed_ms = (perf_counter() - self.start) * 1000
+            st.session_state.setdefault(PERF_EVENTS_KEY, []).append((self.label, elapsed_ms))
+        return False
+
+
+def perf_timer(label: str) -> _PerfTimer:
+    return _PerfTimer(label)
+
+
+def _reset_perf_events() -> None:
+    if _debug_perf_enabled():
+        st.session_state[PERF_EVENTS_KEY] = []
+
+
+def _render_perf_debug() -> None:
+    if not _debug_perf_enabled():
+        return
+    events = st.session_state.get(PERF_EVENTS_KEY, [])
+    if not events:
+        return
+    with st.sidebar.expander("Performance debug", expanded=False):
+        for label, elapsed_ms in events:
+            st.caption(f"{label}: {elapsed_ms:.1f} ms")
+
+
+@st.cache_resource(show_spinner=False)
+def ensure_database_initialized(
+    db_path: str,
+    database_fingerprint: str,
+    base_xlsx_marker: str,
+    _database_url_value: str | None = None,
+) -> dict[str, str]:
+    conn = connect(Path(db_path), database_url=_database_url_value)
+    try:
+        init_db(conn)
+        if BASE_XLSX.exists() and is_operational_database_empty(conn):
+            import_base_xlsx(conn, BASE_XLSX)
+        seed_default_pops(conn)
+        return {
+            "database": database_fingerprint,
+            "base_xlsx": base_xlsx_marker,
+            "initialized_at": datetime.now().isoformat(timespec="seconds"),
+        }
+    finally:
+        conn.close()
+
+
+def _connection_is_healthy(conn) -> bool:
+    try:
+        conn.execute("SELECT 1").fetchone()
+        return True
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+
+
+def _close_connection(conn) -> None:
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
 def get_conn():
-    conn = connect(DB_PATH, database_url=_database_url())
-    init_db(conn)
-    if BASE_XLSX.exists() and is_operational_database_empty(conn):
-        import_base_xlsx(conn, BASE_XLSX)
-    seed_default_pops(conn)
+    database_url = _database_url()
+    fingerprint = _database_fingerprint(database_url)
+    with perf_timer("Inicialização do banco"):
+        ensure_database_initialized(
+            str(DB_PATH),
+            fingerprint,
+            _base_xlsx_marker(),
+            _database_url_value=database_url,
+        )
+
+    conn = st.session_state.get(DB_CONNECTION_KEY)
+    cached_fingerprint = st.session_state.get(DB_CONNECTION_FINGERPRINT_KEY)
+    if conn is None or cached_fingerprint != fingerprint or not _connection_is_healthy(conn):
+        if conn is not None:
+            _close_connection(conn)
+        with perf_timer("Conexão com banco"):
+            conn = connect(DB_PATH, database_url=database_url)
+        st.session_state[DB_CONNECTION_KEY] = conn
+        st.session_state[DB_CONNECTION_FINGERPRINT_KEY] = fingerprint
     return conn
+
+
+def clear_app_caches() -> None:
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def _cached_table_counts(database_fingerprint: str, _database_url_value: str | None = None) -> dict[str, int]:
+    conn = connect(DB_PATH, database_url=_database_url_value)
+    try:
+        return table_counts(conn)
+    finally:
+        conn.close()
+
+
+def cached_table_counts(conn) -> dict[str, int]:
+    database_url = _database_url()
+    with perf_timer("table_counts"):
+        return _cached_table_counts(
+            _database_fingerprint(database_url),
+            _database_url_value=database_url,
+        )
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def _cached_reference_data(database_fingerprint: str, _database_url_value: str | None = None):
+    conn = connect(DB_PATH, database_url=_database_url_value)
+    try:
+        equipment = query_df(conn, "SELECT * FROM equipment ORDER BY active DESC, equipment_code")
+        users = query_df(conn, "SELECT * FROM users ORDER BY active DESC, full_name")
+        projects = query_df(conn, "SELECT * FROM projects ORDER BY active DESC, project_name")
+        return equipment, users, projects
+    finally:
+        conn.close()
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def _cached_supply_page_data(database_fingerprint: str, _database_url_value: str | None = None):
+    conn = connect(DB_PATH, database_url=_database_url_value)
+    try:
+        supplies = query_df(conn, "SELECT * FROM supplies ORDER BY active DESC, supply_name")
+        users = query_df(conn, "SELECT * FROM users WHERE active=1 ORDER BY full_name")
+        projects = query_df(conn, "SELECT * FROM projects WHERE active=1 ORDER BY project_name")
+        equipment = query_df(conn, "SELECT * FROM equipment ORDER BY active DESC, equipment_code")
+        return supplies, users, projects, equipment
+    finally:
+        conn.close()
+
+
+def _storage_config_fingerprint() -> str:
+    keys = (*R2_REQUIRED_KEYS, "R2_ACCOUNT_ID")
+    values = [resolve_config_value(key) or "" for key in keys]
+    digest = hashlib.sha256("\0".join(values).encode("utf-8")).hexdigest()[:16]
+    return f"storage:{digest}"
+
+
+@st.cache_resource(show_spinner=False)
+def _cached_active_storage_backend(
+    database_fingerprint: str,
+    storage_fingerprint: str,
+    _database_url_value: str | None = None,
+):
+    return get_active_storage_backend(database_url=_database_url_value)
+
+
+def active_storage_backend():
+    database_url = _database_url()
+    return _cached_active_storage_backend(
+        _database_fingerprint(database_url),
+        _storage_config_fingerprint(),
+        _database_url_value=database_url,
+    )
+
+
+@st.cache_resource(show_spinner=False)
+def _cached_storage_backend_for_name(storage_backend: str, storage_fingerprint: str):
+    return get_storage_backend_for_name(storage_backend)
+
+
+def storage_backend_for_name(storage_backend: str):
+    return _cached_storage_backend_for_name(storage_backend, _storage_config_fingerprint())
 
 
 def _secret_value(*keys: str, default: str | None = None) -> str | None:
@@ -1001,9 +1214,12 @@ def _display_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_reference_data(conn):
-    equipment = query_df(conn, "SELECT * FROM equipment ORDER BY active DESC, equipment_code")
-    users = query_df(conn, "SELECT * FROM users ORDER BY active DESC, full_name")
-    projects = query_df(conn, "SELECT * FROM projects ORDER BY active DESC, project_name")
+    database_url = _database_url()
+    with perf_timer("Listas de referência"):
+        equipment, users, projects = _cached_reference_data(
+            _database_fingerprint(database_url),
+            _database_url_value=database_url,
+        )
     operators = users[users["role"].isin(["manager", "operator", "admin"])] if not users.empty else users
     return equipment, users, projects, operators
 
@@ -1011,7 +1227,7 @@ def load_reference_data(conn):
 def page_dashboard(conn):
     hero()
     st.subheader("Visão geral da base LabCim")
-    counts = table_counts(conn)
+    counts = cached_table_counts(conn)
     metrics = [
         ("Equipamentos", counts["equipment"]),
         ("Usuários", counts["users"]),
@@ -1603,6 +1819,7 @@ def page_reservas(conn):
                         "period": f"{start_dt.strftime('%d/%m/%Y %H:%M')} a {end_dt.strftime('%H:%M')}",
                         "samples": str(int(sample_count)) if sample_count else "-",
                     }
+                    clear_app_caches()
                     st.rerun()
                 else:
                     st.error(msg)
@@ -1634,14 +1851,17 @@ def page_reservas(conn):
             with a1:
                 if st.button("Marcar como concluída", key="booking_mark_done"):
                     update_booking_status(conn, int(booking_id), "done")
+                    clear_app_caches()
                     st.rerun()
             with a2:
                 if st.button("Cancelar reserva", key="booking_cancel"):
                     update_booking_status(conn, int(booking_id), "cancelled")
+                    clear_app_caches()
                     st.rerun()
             with a3:
                 if st.button("Marcar como não compareceu", key="booking_no_show"):
                     update_booking_status(conn, int(booking_id), "no_show")
+                    clear_app_caches()
                     st.rerun()
 
 
@@ -1667,7 +1887,7 @@ def page_usuarios(conn):
     st.subheader("Usuários")
     st.caption("Cadastro simples de usuários, perfil de acesso, vínculo e treinamento. A autenticação real virá na etapa da senha volátil.")
 
-    users = query_df(conn, "SELECT * FROM users ORDER BY active DESC, full_name")
+    _, users, _, _ = load_reference_data(conn)
     display_cols = ["full_name", "email", "phone_e164", "role", "lab_unit", "department", "advisor_name", "training_completed", "active", "notes"]
     if users.empty:
         st.info("Nenhum usuário cadastrado.")
@@ -1734,6 +1954,7 @@ def page_usuarios(conn):
             ok, msg = update_user(conn, int(user_id), **payload)
         if ok:
             st.success(msg)
+            clear_app_caches()
             st.rerun()
         else:
             st.error(msg)
@@ -1744,7 +1965,7 @@ def page_projetos(conn):
     st.subheader("Projetos")
     st.caption("Cadastro de projetos usado nas reservas, movimentações de insumos e relatórios semestrais/anuais.")
 
-    projects = query_df(conn, "SELECT * FROM projects ORDER BY active DESC, project_name")
+    _, _, projects, _ = load_reference_data(conn)
     display_cols = ["project_code", "project_name", "funding_source", "start_date", "end_date", "active", "notes"]
     if projects.empty:
         st.info("Nenhum projeto cadastrado.")
@@ -1802,6 +2023,7 @@ def page_projetos(conn):
             ok, msg = update_project(conn, int(project_id), **payload)
         if ok:
             st.success(msg)
+            clear_app_caches()
             st.rerun()
         else:
             st.error(msg)
@@ -1812,7 +2034,7 @@ def page_equipamentos(conn):
     st.subheader("Equipamentos")
     st.caption("Cadastro operacional simples: status, capacidade, funcionalidades indisponíveis, documentação e localização. O cadastro mestre fica restrito ao administrador.")
 
-    equipment = query_df(conn, "SELECT * FROM equipment ORDER BY active DESC, equipment_code")
+    equipment, _, _, _ = load_reference_data(conn)
     display_cols = [
         "equipment_code",
         "equipment_name",
@@ -1925,6 +2147,7 @@ def page_equipamentos(conn):
                     if total:
                         st.info(f"Notificação de manutenção registrada para {total} destinatário(s). Enviadas: {sent}.")
                 st.success("Dados operacionais do equipamento atualizados.")
+                clear_app_caches()
                 st.rerun()
 
     with tab_parts:
@@ -2045,6 +2268,7 @@ def page_equipamentos(conn):
                             st.info(f"Notificação de manutenção registrada para {total} destinatário(s). Enviadas: {sent}.")
                 if ok:
                     st.success(msg)
+                    clear_app_caches()
                     st.rerun()
                 else:
                     st.error(msg)
@@ -2100,7 +2324,7 @@ def _ensure_storage_ready_for_upload(*uploaded_files) -> bool:
     if not any(uploaded_file is not None for uploaded_file in uploaded_files):
         return True
     try:
-        get_active_storage_backend(database_url=_database_url())
+        active_storage_backend()
         return True
     except StorageConfigurationError as exc:
         st.error(str(exc))
@@ -2118,7 +2342,7 @@ def _save_upload(
 ) -> str | None:
     if uploaded_file is None:
         return None
-    backend = get_active_storage_backend(database_url=_database_url())
+    backend = active_storage_backend()
     content = uploaded_file.getvalue()
     stored = backend.save_file(
         entity_type=entity_type,
@@ -2269,7 +2493,7 @@ def _render_attachment_download(attachment_row, label: str, key: str) -> bool:
     if not attachment_row:
         return False
     try:
-        backend = get_storage_backend_for_name(attachment_row["storage_backend"])
+        backend = storage_backend_for_name(attachment_row["storage_backend"])
         filename = clean_value(attachment_row["original_filename"], "arquivo")
         mime = clean_value(attachment_row["mime_type"], "application/octet-stream")
         if isinstance(backend, R2StorageBackend):
@@ -2485,10 +2709,12 @@ def page_insumos(conn):
     st.subheader("Insumos e almoxarifado")
     st.caption("Controle simples de estoque: cadastro mínimo, saldo atual, lote, validade, localização, documentos e histórico de movimentações.")
 
-    supplies = query_df(conn, "SELECT * FROM supplies ORDER BY active DESC, supply_name")
-    users = query_df(conn, "SELECT * FROM users WHERE active=1 ORDER BY full_name")
-    projects = query_df(conn, "SELECT * FROM projects WHERE active=1 ORDER BY project_name")
-    equipment = query_df(conn, "SELECT * FROM equipment ORDER BY active DESC, equipment_code")
+    database_url = _database_url()
+    with perf_timer("Dados de insumos"):
+        supplies, users, projects, equipment = _cached_supply_page_data(
+            _database_fingerprint(database_url),
+            _database_url_value=database_url,
+        )
 
     qr_supply_id = st.query_params.get("sid", None)
     if qr_supply_id and not supplies.empty:
@@ -2809,6 +3035,7 @@ def page_insumos(conn):
                             value=technical_ref,
                         )
                     st.success("Item cadastrado com sucesso.")
+                    clear_app_caches()
                     st.rerun()
                 else:
                     supply_id = int(selected_supply["id"])
@@ -2865,6 +3092,7 @@ def page_insumos(conn):
                         equipment_ids=selected_equipment_ids if is_spare_part else [],
                     )
                     st.success("Item atualizado com sucesso.")
+                    clear_app_caches()
                     st.rerun()
 
     with tab_mov:
@@ -2950,6 +3178,7 @@ def page_insumos(conn):
                         )
                     (st.success if ok else st.error)(msg)
                     if ok:
+                        clear_app_caches()
                         st.rerun()
 
     with tab_hist:
@@ -3174,6 +3403,7 @@ def page_manutencao(conn):
                         if total:
                             st.info(f"Notificação de manutenção registrada para {total} destinatário(s). Enviadas: {sent}.")
                     st.success("Atividade preventiva/calibração registrada.")
+                    clear_app_caches()
                     st.rerun()
 
         st.markdown("### Próximas preventivas/calibrações")
@@ -3397,6 +3627,7 @@ def page_manutencao(conn):
                         )
                         if ok:
                             st.success(msg)
+                            clear_app_caches()
                             st.rerun()
                         else:
                             st.error(msg)
@@ -3440,6 +3671,7 @@ def page_manutencao(conn):
                     )
                     if ok:
                         st.success(msg)
+                        clear_app_caches()
                         st.rerun()
                     else:
                         st.error(msg)
@@ -3582,6 +3814,7 @@ def page_manutencao(conn):
                             changed_by_id=_current_user_id(),
                         )
                     st.success("Ticket corretivo registrado.")
+                    clear_app_caches()
                     st.rerun()
 
         st.markdown("### Tickets corretivos")
@@ -3654,6 +3887,7 @@ def page_manutencao(conn):
                         )
                         if ok:
                             st.success(msg)
+                            clear_app_caches()
                             st.rerun()
                         else:
                             st.error(msg)
@@ -3816,6 +4050,7 @@ def page_manutencao(conn):
                         )
                         if ok:
                             st.success(msg)
+                            clear_app_caches()
                             st.rerun()
                         else:
                             st.error(msg)
@@ -3846,6 +4081,7 @@ def page_manutencao(conn):
                     )
                     if ok:
                         st.success(msg)
+                        clear_app_caches()
                         st.rerun()
                     else:
                         st.error(msg)
@@ -4482,6 +4718,7 @@ def page_importar(conn):
             try:
                 counts = import_base_xlsx(conn, tmp)
                 st.success(f"Importação concluída: {counts}")
+                clear_app_caches()
                 st.rerun()
             except Exception as exc:
                 st.error(f"Erro na importação: {exc}")
@@ -4490,10 +4727,11 @@ def page_importar(conn):
         if st.button("Reimportar arquivo local data/LabCim_Base.xlsx"):
             counts = import_base_xlsx(conn, BASE_XLSX)
             st.success(f"Importação concluída: {counts}")
+            clear_app_caches()
             st.rerun()
 
     st.markdown("### Contagem atual")
-    st.json(table_counts(conn))
+    st.json(cached_table_counts(conn))
 
 
 def apply_url_params_hint():
@@ -4510,32 +4748,38 @@ def apply_url_params_hint():
 
 def main():
     setup_page()
-    conn = get_conn()
+    _reset_perf_events()
+    with perf_timer("get_conn"):
+        conn = get_conn()
     if not is_authenticated():
-        page_login(conn)
+        with perf_timer("Página: Login"):
+            page_login(conn)
+        _render_perf_debug()
         return
     apply_url_params_hint()
     page = sidebar()
-    if page == "Painel inicial":
-        page_dashboard(conn)
-    elif page == "Reservas":
-        page_reservas(conn)
-    elif page == "Equipamentos":
-        page_equipamentos(conn)
-    elif page == "Insumos":
-        page_insumos(conn)
-    elif page == "Usuários":
-        page_usuarios(conn)
-    elif page == "Projetos":
-        page_projetos(conn)
-    elif page == "Manutenção":
-        page_manutencao(conn)
-    elif page == "QR Codes":
-        page_qrcodes(conn)
-    elif page == "Relatórios":
-        page_relatorios(conn)
-    elif page == "Importar base":
-        page_importar(conn)
+    with perf_timer(f"Página: {page}"):
+        if page == "Painel inicial":
+            page_dashboard(conn)
+        elif page == "Reservas":
+            page_reservas(conn)
+        elif page == "Equipamentos":
+            page_equipamentos(conn)
+        elif page == "Insumos":
+            page_insumos(conn)
+        elif page == "Usuários":
+            page_usuarios(conn)
+        elif page == "Projetos":
+            page_projetos(conn)
+        elif page == "Manutenção":
+            page_manutencao(conn)
+        elif page == "QR Codes":
+            page_qrcodes(conn)
+        elif page == "Relatórios":
+            page_relatorios(conn)
+        elif page == "Importar base":
+            page_importar(conn)
+    _render_perf_debug()
 
 
 if __name__ == "__main__":

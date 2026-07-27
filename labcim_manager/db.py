@@ -83,7 +83,7 @@ def connect(path: Path | str, database_url: str | None = None) -> DatabaseConnec
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return DatabaseConnection(conn, "sqlite")
@@ -487,8 +487,11 @@ def table_counts(conn: DatabaseConnection) -> dict[str, int]:
 
 
 def is_operational_database_empty(conn: DatabaseConnection) -> bool:
-    counts = table_counts(conn)
-    return all(counts.get(table, 0) == 0 for table in OPERATIONAL_TABLES)
+    for table in OPERATIONAL_TABLES:
+        row = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()
+        if row["n"]:
+            return False
+    return True
 
 
 def insert_returning_id(
