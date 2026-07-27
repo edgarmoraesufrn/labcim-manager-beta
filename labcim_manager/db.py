@@ -161,20 +161,54 @@ def init_db(conn: DatabaseConnection) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             project_code TEXT,
             project_name TEXT NOT NULL,
+            objective TEXT,
             funding_source TEXT,
+            requester_id INTEGER,
+            coordinator_id INTEGER,
+            status TEXT DEFAULT 'em andamento',
             start_date TEXT,
             end_date TEXT,
             active INTEGER DEFAULT 1,
             notes TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(requester_id) REFERENCES users(id),
+            FOREIGN KEY(coordinator_id) REFERENCES users(id)
         );
+
+        CREATE TABLE IF NOT EXISTS project_services (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            service_code TEXT,
+            title TEXT NOT NULL,
+            service_type TEXT,
+            requester_id INTEGER,
+            responsible_id INTEGER,
+            status TEXT DEFAULT 'em andamento',
+            requested_date TEXT,
+            expected_date TEXT,
+            completed_date TEXT,
+            notes TEXT,
+            active INTEGER DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(project_id) REFERENCES projects(id),
+            FOREIGN KEY(requester_id) REFERENCES users(id),
+            FOREIGN KEY(responsible_id) REFERENCES users(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_project_services_project
+            ON project_services (project_id, active, status);
+
+        CREATE INDEX IF NOT EXISTS idx_project_services_code
+            ON project_services (service_code);
 
         CREATE TABLE IF NOT EXISTS bookings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             equipment_id INTEGER NOT NULL,
             user_id INTEGER NOT NULL,
             project_id INTEGER,
+            service_id INTEGER,
             operator_id INTEGER,
             performed_by_id INTEGER,
             start_datetime TEXT NOT NULL,
@@ -187,6 +221,7 @@ def init_db(conn: DatabaseConnection) -> None:
             FOREIGN KEY(equipment_id) REFERENCES equipment(id),
             FOREIGN KEY(user_id) REFERENCES users(id),
             FOREIGN KEY(project_id) REFERENCES projects(id),
+            FOREIGN KEY(service_id) REFERENCES project_services(id),
             FOREIGN KEY(operator_id) REFERENCES users(id),
             FOREIGN KEY(performed_by_id) REFERENCES users(id)
         );
@@ -317,12 +352,14 @@ def init_db(conn: DatabaseConnection) -> None:
             unit TEXT,
             user_id INTEGER,
             project_id INTEGER,
+            service_id INTEGER,
             purpose TEXT,
             document_path TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(supply_id) REFERENCES supplies(id),
             FOREIGN KEY(user_id) REFERENCES users(id),
-            FOREIGN KEY(project_id) REFERENCES projects(id)
+            FOREIGN KEY(project_id) REFERENCES projects(id),
+            FOREIGN KEY(service_id) REFERENCES project_services(id)
         );
 
         CREATE TABLE IF NOT EXISTS equipment_spare_parts (
@@ -414,11 +451,16 @@ def init_db(conn: DatabaseConnection) -> None:
     _add_column(conn, "equipment", "document_notes", "TEXT")
     _add_column(conn, "equipment", "updated_at", "TEXT")
     _add_column(conn, "users", "updated_at", "TEXT")
+    _add_column(conn, "projects", "objective", "TEXT")
+    _add_column(conn, "projects", "requester_id", "INTEGER")
+    _add_column(conn, "projects", "coordinator_id", "INTEGER")
+    _add_column(conn, "projects", "status", "TEXT DEFAULT 'em andamento'")
     _add_column(conn, "projects", "start_date", "TEXT")
     _add_column(conn, "projects", "end_date", "TEXT")
     _add_column(conn, "projects", "notes", "TEXT")
     _add_column(conn, "projects", "updated_at", "TEXT")
     _add_column(conn, "bookings", "performed_by_id", "INTEGER")
+    _add_column(conn, "bookings", "service_id", "INTEGER")
     _add_column(conn, "maintenance_preventive", "planned_end_date", "TEXT")
     _add_column(conn, "maintenance_preventive", "blocks_booking", "INTEGER DEFAULT 1")
     _add_column(conn, "maintenance_preventive", "updated_at", "TEXT")
@@ -435,9 +477,13 @@ def init_db(conn: DatabaseConnection) -> None:
     _add_column(conn, "supplies", "supply_code", "TEXT")
     _add_column(conn, "supplies", "manufacturer_code", "TEXT")
     _add_column(conn, "supplies", "compatible_model_family", "TEXT")
+    _add_column(conn, "supply_movements", "service_id", "INTEGER")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_bookings_service ON bookings (service_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_supply_movements_service ON supply_movements (service_id)")
     conn.execute("UPDATE maintenance_preventive SET is_active = 1 WHERE is_active IS NULL")
     conn.execute("UPDATE maintenance_corrective SET is_active = 1 WHERE is_active IS NULL")
     conn.execute("UPDATE supplies SET supply_type = 'Insumo' WHERE supply_type IS NULL OR TRIM(supply_type) = ''")
+    conn.execute("UPDATE projects SET status = 'em andamento' WHERE status IS NULL OR TRIM(status) = ''")
     conn.execute("UPDATE users SET role = 'manager' WHERE LOWER(COALESCE(role, '')) IN ('operator', 'operador', 'gerente')")
     conn.commit()
 
@@ -461,6 +507,7 @@ OPERATIONAL_TABLES = [
     "equipment",
     "users",
     "projects",
+    "project_services",
     "bookings",
     "maintenance_preventive",
     "maintenance_corrective",
@@ -1282,6 +1329,7 @@ def create_booking(
     sample_count: int | None,
     purpose: str | None,
     performed_by_id: int | None = None,
+    service_id: int | None = None,
 ) -> tuple[bool, str, int | None]:
     eq = conn.execute("SELECT * FROM equipment WHERE id = ?", [equipment_id]).fetchone()
     if not eq:
@@ -1293,6 +1341,14 @@ def create_booking(
     if sample_count and eq["max_sample_capacity"] and sample_count > int(eq["max_sample_capacity"]):
         if int(eq["capacity_enforced"] or 0) == 1:
             return False, f"A quantidade excede a capacidade máxima cadastrada ({eq['max_sample_capacity']} {eq['capacity_unit'] or 'amostras'}).", None
+
+    ok, msg, project_id, service_id = _normalize_project_service_ids(
+        conn,
+        project_id=project_id,
+        service_id=service_id,
+    )
+    if not ok:
+        return False, msg or "Serviço/análise incompatível com o projeto.", None
 
     conflict = _booking_conflict(conn, equipment_id, start_iso, end_iso)
     if conflict:
@@ -1306,12 +1362,12 @@ def create_booking(
         conn,
         """
         INSERT INTO bookings (
-            equipment_id, user_id, project_id, operator_id, performed_by_id,
+            equipment_id, user_id, project_id, service_id, operator_id, performed_by_id,
             start_datetime, end_datetime, sample_count, purpose, status
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled')
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled')
         """,
-        [equipment_id, user_id, project_id, operator_id, performed_by_id, start_iso, end_iso, sample_count, purpose],
+        [equipment_id, user_id, project_id, service_id, operator_id, performed_by_id, start_iso, end_iso, sample_count, purpose],
     )
     return True, "Reserva registrada com sucesso.", booking_id
 
@@ -1624,18 +1680,36 @@ def create_project(
     end_date: str | None,
     active: int,
     notes: str | None,
+    objective: str | None = None,
+    requester_id: int | None = None,
+    coordinator_id: int | None = None,
+    status: str | None = None,
 ) -> tuple[bool, str]:
     project_name = project_name.strip()
     if not project_name:
         return False, "Informe o nome do projeto."
+    status = status.strip() if status and status.strip() else "em andamento"
     conn.execute(
         """
         INSERT INTO projects (
-            project_code, project_name, funding_source, start_date, end_date, active, notes
+            project_code, project_name, objective, funding_source, requester_id,
+            coordinator_id, status, start_date, end_date, active, notes
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        [project_code, project_name, funding_source, start_date, end_date, active, notes],
+        [
+            project_code,
+            project_name,
+            objective,
+            funding_source,
+            requester_id,
+            coordinator_id,
+            status,
+            start_date,
+            end_date,
+            active,
+            notes,
+        ],
     )
     conn.commit()
     return True, "Projeto cadastrado com sucesso."
@@ -1652,16 +1726,25 @@ def update_project(
     end_date: str | None,
     active: int,
     notes: str | None,
+    objective: str | None = None,
+    requester_id: int | None = None,
+    coordinator_id: int | None = None,
+    status: str | None = None,
 ) -> tuple[bool, str]:
     project_name = project_name.strip()
     if not project_name:
         return False, "Informe o nome do projeto."
+    status = status.strip() if status and status.strip() else "em andamento"
     conn.execute(
         """
         UPDATE projects
         SET project_code = ?,
             project_name = ?,
+            objective = ?,
             funding_source = ?,
+            requester_id = ?,
+            coordinator_id = ?,
+            status = ?,
             start_date = ?,
             end_date = ?,
             active = ?,
@@ -1669,10 +1752,267 @@ def update_project(
             updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
         """,
-        [project_code, project_name, funding_source, start_date, end_date, active, notes, project_id],
+        [
+            project_code,
+            project_name,
+            objective,
+            funding_source,
+            requester_id,
+            coordinator_id,
+            status,
+            start_date,
+            end_date,
+            active,
+            notes,
+            project_id,
+        ],
     )
     conn.commit()
     return True, "Projeto atualizado com sucesso."
+
+
+def list_projects_with_status(conn: DatabaseConnection, *, active_only: bool = False) -> pd.DataFrame:
+    sql = """
+        SELECT p.*, requester.full_name AS requester_name,
+               coordinator.full_name AS coordinator_name
+        FROM projects p
+        LEFT JOIN users requester ON requester.id = p.requester_id
+        LEFT JOIN users coordinator ON coordinator.id = p.coordinator_id
+    """
+    params: list[Any] = []
+    if active_only:
+        sql += " WHERE p.active = 1"
+    sql += " ORDER BY p.active DESC, p.project_name"
+    return query_df(conn, sql, params)
+
+
+def list_active_projects(conn: DatabaseConnection) -> pd.DataFrame:
+    return list_projects_with_status(conn, active_only=True)
+
+
+def get_project_service(conn: DatabaseConnection, service_id: int) -> Any | None:
+    return conn.execute("SELECT * FROM project_services WHERE id = ?", [service_id]).fetchone()
+
+
+def validate_project_service_belongs_to_project(
+    conn: DatabaseConnection,
+    *,
+    project_id: int | None,
+    service_id: int | None,
+) -> bool:
+    if service_id is None:
+        return True
+    if project_id is None:
+        return False
+    row = conn.execute(
+        """
+        SELECT id
+        FROM project_services
+        WHERE id = ?
+          AND project_id = ?
+          AND active = 1
+        """,
+        [service_id, project_id],
+    ).fetchone()
+    return row is not None
+
+
+def _normalize_project_service_ids(
+    conn: DatabaseConnection,
+    *,
+    project_id: int | None,
+    service_id: int | None,
+) -> tuple[bool, str | None, int | None, int | None]:
+    if project_id is None:
+        return True, None, None, None
+    if service_id is None:
+        return True, None, project_id, None
+    if validate_project_service_belongs_to_project(conn, project_id=project_id, service_id=service_id):
+        return True, None, project_id, service_id
+    return False, "O serviço/análise selecionado não pertence ao projeto informado.", project_id, None
+
+
+def create_project_service(
+    conn: DatabaseConnection,
+    *,
+    project_id: int,
+    title: str,
+    service_code: str | None = None,
+    service_type: str | None = None,
+    requester_id: int | None = None,
+    responsible_id: int | None = None,
+    status: str | None = None,
+    requested_date: str | None = None,
+    expected_date: str | None = None,
+    completed_date: str | None = None,
+    notes: str | None = None,
+    active: int = 1,
+) -> tuple[bool, str, int | None]:
+    if not project_id:
+        return False, "Selecione o projeto do serviço/análise.", None
+    title = title.strip()
+    if not title:
+        return False, "Informe o título do serviço/análise.", None
+    project = conn.execute("SELECT id FROM projects WHERE id = ?", [project_id]).fetchone()
+    if project is None:
+        return False, "Projeto não encontrado.", None
+    status = status.strip() if status and status.strip() else "em andamento"
+    service_id = insert_returning_id(
+        conn,
+        """
+        INSERT INTO project_services (
+            project_id, service_code, title, service_type, requester_id,
+            responsible_id, status, requested_date, expected_date,
+            completed_date, notes, active
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            project_id,
+            service_code,
+            title,
+            service_type,
+            requester_id,
+            responsible_id,
+            status,
+            requested_date,
+            expected_date,
+            completed_date,
+            notes,
+            active,
+        ],
+    )
+    return True, "Serviço/análise cadastrado com sucesso.", service_id
+
+
+def update_project_service(
+    conn: DatabaseConnection,
+    service_id: int,
+    *,
+    project_id: int,
+    service_code: str | None,
+    title: str,
+    service_type: str | None,
+    requester_id: int | None,
+    responsible_id: int | None,
+    status: str | None,
+    requested_date: str | None,
+    expected_date: str | None,
+    completed_date: str | None,
+    notes: str | None,
+    active: int,
+) -> tuple[bool, str]:
+    if not project_id:
+        return False, "Selecione o projeto do serviço/análise."
+    title = title.strip()
+    if not title:
+        return False, "Informe o título do serviço/análise."
+    if get_project_service(conn, service_id) is None:
+        return False, "Serviço/análise não encontrado."
+    project = conn.execute("SELECT id FROM projects WHERE id = ?", [project_id]).fetchone()
+    if project is None:
+        return False, "Projeto não encontrado."
+    status = status.strip() if status and status.strip() else "em andamento"
+    conn.execute(
+        """
+        UPDATE project_services
+        SET project_id = ?,
+            service_code = ?,
+            title = ?,
+            service_type = ?,
+            requester_id = ?,
+            responsible_id = ?,
+            status = ?,
+            requested_date = ?,
+            expected_date = ?,
+            completed_date = ?,
+            notes = ?,
+            active = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        [
+            project_id,
+            service_code,
+            title,
+            service_type,
+            requester_id,
+            responsible_id,
+            status,
+            requested_date,
+            expected_date,
+            completed_date,
+            notes,
+            active,
+            service_id,
+        ],
+    )
+    conn.commit()
+    return True, "Serviço/análise atualizado com sucesso."
+
+
+def inactivate_project_service(conn: DatabaseConnection, service_id: int) -> tuple[bool, str]:
+    row = get_project_service(conn, service_id)
+    if row is None:
+        return False, "Serviço/análise não encontrado."
+    conn.execute(
+        """
+        UPDATE project_services
+        SET active = 0,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        [service_id],
+    )
+    conn.commit()
+    return True, "Serviço/análise inativado sem exclusão definitiva."
+
+
+def list_project_services(
+    conn: DatabaseConnection,
+    *,
+    active_only: bool = False,
+) -> pd.DataFrame:
+    sql = """
+        SELECT ps.*, p.project_code, p.project_name,
+               requester.full_name AS requester_name,
+               responsible.full_name AS responsible_name
+        FROM project_services ps
+        JOIN projects p ON p.id = ps.project_id
+        LEFT JOIN users requester ON requester.id = ps.requester_id
+        LEFT JOIN users responsible ON responsible.id = ps.responsible_id
+    """
+    if active_only:
+        sql += " WHERE ps.active = 1"
+    sql += " ORDER BY ps.active DESC, p.project_name, ps.title"
+    return query_df(conn, sql)
+
+
+def list_active_project_services(conn: DatabaseConnection) -> pd.DataFrame:
+    return list_project_services(conn, active_only=True)
+
+
+def list_project_services_for_project(
+    conn: DatabaseConnection,
+    project_id: int,
+    *,
+    active_only: bool = True,
+) -> pd.DataFrame:
+    sql = """
+        SELECT ps.*, p.project_code, p.project_name,
+               requester.full_name AS requester_name,
+               responsible.full_name AS responsible_name
+        FROM project_services ps
+        JOIN projects p ON p.id = ps.project_id
+        LEFT JOIN users requester ON requester.id = ps.requester_id
+        LEFT JOIN users responsible ON responsible.id = ps.responsible_id
+        WHERE ps.project_id = ?
+    """
+    params: list[Any] = [project_id]
+    if active_only:
+        sql += " AND ps.active = 1"
+    sql += " ORDER BY ps.active DESC, ps.requested_date DESC, ps.title"
+    return query_df(conn, sql, params)
 
 
 def create_preventive_activity(
@@ -2389,6 +2729,7 @@ def create_supply_movement(
     project_id: int | None,
     purpose: str | None,
     document_path: str | None,
+    service_id: int | None = None,
 ) -> tuple[bool, str, int | None]:
     row = conn.execute("SELECT * FROM supplies WHERE id = ?", [supply_id]).fetchone()
     if not row:
@@ -2411,15 +2752,22 @@ def create_supply_movement(
     new_quantity = current + delta_map[movement_type]
     if new_quantity < -1e-9:
         return False, f"Saldo insuficiente. Saldo atual: {current:g} {row['unit'] or ''}.", None
+    ok, msg, project_id, service_id = _normalize_project_service_ids(
+        conn,
+        project_id=project_id,
+        service_id=service_id,
+    )
+    if not ok:
+        return False, msg or "Serviço/análise incompatível com o projeto.", None
 
     movement_id = _execute_insert_returning_id(
         conn,
         """
         INSERT INTO supply_movements (
             supply_id, movement_type, movement_date, quantity, unit,
-            user_id, project_id, purpose, document_path
+            user_id, project_id, service_id, purpose, document_path
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             supply_id,
@@ -2429,6 +2777,7 @@ def create_supply_movement(
             row["unit"],
             user_id,
             project_id,
+            service_id,
             purpose,
             document_path,
         ],

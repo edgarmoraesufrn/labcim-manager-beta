@@ -36,6 +36,7 @@ from labcim_manager.db import (
     create_access_code_record,
     create_preventive_activity,
     create_project,
+    create_project_service,
     create_supply,
     create_supply_movement,
     create_user,
@@ -48,6 +49,7 @@ from labcim_manager.db import (
     list_attachments,
     list_equipment_for_spare_part,
     list_maintenance_status_history,
+    list_project_services,
     list_spare_parts_for_equipment,
     list_upcoming_preventive_maintenance,
     log_notification,
@@ -62,8 +64,10 @@ from labcim_manager.db import (
     update_legacy_attachment_path,
     update_preventive_activity,
     update_project,
+    update_project_service,
     update_supply,
     update_user,
+    inactivate_project_service,
     inactivate_maintenance_record,
     verify_access_code_record,
 )
@@ -120,6 +124,9 @@ ROLE_REVERSE = {v: k for k, v in ROLE_LABELS.items()}
 
 BOOLEAN_LABELS = {0: "Não", 1: "Sim", False: "Não", True: "Sim"}
 SUPPLY_TYPES = ["Insumo", "Peça de reposição"]
+PROJECT_STATUSES = ["em andamento", "concluído", "pausado", "cancelado", "arquivado"]
+SERVICE_STATUSES = ["em andamento", "aguardando amostras", "em análise", "concluído", "cancelado", "arquivado"]
+SERVICE_TYPES = ["Análise", "Ensaio", "Caracterização", "Preparação", "Relatório", "Outro"]
 PREVENTIVE_STATUSES = ["pendente", "realizado", "reprovado", "reagendado", "cancelado"]
 CORRECTIVE_STATUSES = ["aberto", "em análise", "aguardando peça", "enviado para fornecedor", "concluído", "cancelado"]
 MAINTENANCE_JUSTIFICATION_STATUSES = {"reprovado", "reagendado", "cancelado"}
@@ -200,7 +207,18 @@ COLUMN_LABELS = {
     "training_completed": "Treinamento concluído?",
     "project_code": "Código do projeto",
     "project_name": "Projeto",
+    "objective": "Objetivo",
     "funding_source": "Fonte de financiamento",
+    "requester_name": "Solicitante",
+    "coordinator_name": "Coordenador/responsável",
+    "title": "Título",
+    "service_code": "Código do serviço/análise",
+    "service_title": "Serviço/análise",
+    "service_type": "Tipo de serviço/análise",
+    "requested_date": "Data solicitada",
+    "expected_date": "Data prevista",
+    "completed_date": "Data concluída",
+    "responsible_name": "Responsável",
     "start_date": "Início do projeto",
     "end_date": "Fim do projeto",
     "start_datetime": "Início",
@@ -628,6 +646,29 @@ def _cached_supply_page_data(database_fingerprint: str, _database_url_value: str
         return supplies, users, projects, equipment
     finally:
         conn.close()
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def _cached_project_services_data(
+    database_fingerprint: str,
+    active_only: bool = True,
+    _database_url_value: str | None = None,
+) -> pd.DataFrame:
+    conn = connect(DB_PATH, database_url=_database_url_value)
+    try:
+        return list_project_services(conn, active_only=active_only)
+    finally:
+        conn.close()
+
+
+def cached_project_services(*, active_only: bool = True) -> pd.DataFrame:
+    database_url = _database_url()
+    with perf_timer("Serviços/análises"):
+        return _cached_project_services_data(
+            _database_fingerprint(database_url),
+            active_only=active_only,
+            _database_url_value=database_url,
+        )
 
 
 def _storage_config_fingerprint() -> str:
@@ -1207,6 +1248,9 @@ def _display_df(df: pd.DataFrame) -> pd.DataFrame:
         "conclusion_date",
         "start_date",
         "end_date",
+        "requested_date",
+        "expected_date",
+        "completed_date",
     ]:
         if c in out.columns:
             out[c] = out[c].map(_format_datetime)
@@ -1249,11 +1293,13 @@ def page_dashboard(conn):
         conn,
         """
         SELECT b.id, e.equipment_code, e.equipment_name, u.full_name, p.project_name,
+               ps.title AS service_title,
                b.start_datetime, b.end_datetime, b.status, b.sample_count
         FROM bookings b
         JOIN equipment e ON e.id=b.equipment_id
         JOIN users u ON u.id=b.user_id
         LEFT JOIN projects p ON p.id=b.project_id
+        LEFT JOIN project_services ps ON ps.id=b.service_id
         ORDER BY b.start_datetime DESC
         LIMIT 12
         """,
@@ -1333,6 +1379,51 @@ def _project_options(projects: pd.DataFrame) -> list[str]:
     ).tolist()
 
 
+def _optional_user_index(users: pd.DataFrame, user_id) -> int:
+    if users.empty or is_blank(user_id):
+        return 0
+    ids = users["id"].astype(int).tolist()
+    try:
+        user_id = int(user_id)
+    except Exception:
+        return 0
+    return ids.index(user_id) + 1 if user_id in ids else 0
+
+
+def _project_services_for_project(project_id: int | None, *, active_only: bool = True) -> pd.DataFrame:
+    if project_id is None:
+        return pd.DataFrame()
+    services = cached_project_services(active_only=active_only)
+    if services.empty:
+        return services
+    return services[services["project_id"].astype(int) == int(project_id)].copy()
+
+
+def _service_options(services: pd.DataFrame, *, include_project: bool = False) -> list[str]:
+    if services.empty:
+        return ["Sem serviço/análise específico"]
+    if include_project:
+        return ["Sem serviço/análise específico"] + services.apply(
+            lambda r: (
+                f"{clean_value(r.get('project_code'), 'Sem código')} — "
+                f"{clean_value(r.get('project_name'))} · "
+                f"{clean_value(r.get('service_code'), 'Sem código')} — {clean_value(r.get('title'))}"
+            ),
+            axis=1,
+        ).tolist()
+    return ["Sem serviço/análise específico"] + services.apply(
+        lambda r: f"{clean_value(r.get('service_code'), 'Sem código')} — {clean_value(r.get('title'))}",
+        axis=1,
+    ).tolist()
+
+
+def _service_id_from_label(services: pd.DataFrame, label: str, *, include_project: bool = False) -> int | None:
+    options = _service_options(services, include_project=include_project)
+    if label == "Sem serviço/análise específico" or services.empty:
+        return None
+    return int(services.iloc[options.index(label) - 1]["id"])
+
+
 def _operator_options(operators: pd.DataFrame) -> list[str]:
     if operators.empty:
         return ["Selecionar depois"]
@@ -1344,7 +1435,8 @@ def _booking_query_for_equipment(conn, equipment_id: int, start_date: date, end_
     end_iso = datetime.combine(end_date + timedelta(days=1), time.min).isoformat(timespec="minutes")
     sql = """
         SELECT b.id, e.equipment_code, e.equipment_name, u.full_name AS solicitante,
-               p.project_name, op.full_name AS operador, perf.full_name AS executante,
+               p.project_name, ps.service_code, ps.title AS service_title,
+               op.full_name AS operador, perf.full_name AS executante,
                b.start_datetime, b.end_datetime,
                b.sample_count, b.purpose, b.status
         FROM bookings b
@@ -1353,6 +1445,7 @@ def _booking_query_for_equipment(conn, equipment_id: int, start_date: date, end_
         LEFT JOIN users op ON op.id=b.operator_id
         LEFT JOIN users perf ON perf.id=b.performed_by_id
         LEFT JOIN projects p ON p.id=b.project_id
+        LEFT JOIN project_services ps ON ps.id=b.service_id
         WHERE b.equipment_id = ?
           AND b.start_datetime >= ?
           AND b.start_datetime < ?
@@ -1372,7 +1465,8 @@ def _calendar_events_for_equipment(conn, equipment_id: int, start_date: date, en
     bookings_sql = """
         SELECT 'booking' AS event_type, b.id, e.equipment_code, e.equipment_name,
                u.full_name AS solicitante, op.full_name AS operador, perf.full_name AS executante,
-               p.project_name, b.start_datetime AS start_datetime, b.end_datetime AS end_datetime,
+               p.project_name, ps.service_code, ps.title AS service_title,
+               b.start_datetime AS start_datetime, b.end_datetime AS end_datetime,
                b.sample_count, b.purpose, b.status
         FROM bookings b
         JOIN equipment e ON e.id=b.equipment_id
@@ -1380,6 +1474,7 @@ def _calendar_events_for_equipment(conn, equipment_id: int, start_date: date, en
         LEFT JOIN users op ON op.id=b.operator_id
         LEFT JOIN users perf ON perf.id=b.performed_by_id
         LEFT JOIN projects p ON p.id=b.project_id
+        LEFT JOIN project_services ps ON ps.id=b.service_id
         WHERE b.equipment_id = ?
           AND b.start_datetime < ?
           AND b.end_datetime > ?
@@ -1395,6 +1490,8 @@ def _calendar_events_for_equipment(conn, equipment_id: int, start_date: date, en
         SELECT 'maintenance' AS event_type, mp.id, e.equipment_code, e.equipment_name,
                NULL AS solicitante, NULL AS operador, NULL AS executante,
                NULL AS project_name,
+               NULL AS service_code,
+               NULL AS service_title,
                mp.planned_date AS start_datetime,
                COALESCE(mp.planned_end_date, mp.planned_date) AS end_datetime,
                NULL AS sample_count,
@@ -1751,8 +1848,28 @@ def page_reservas(conn):
             st.dataframe(_display_df(agenda_df), use_container_width=True, hide_index=True)
 
     with tab_nova:
+        st.markdown("### Criar reserva")
+        project_id = None
+        service_id = None
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            project_options = _project_options(active_projects)
+            project_label = st.selectbox("Projeto", project_options, key="booking_project")
+            if project_label != "Sem projeto específico" and not active_projects.empty:
+                project_id = _project_id_from_label(active_projects, project_label)
+        with pc2:
+            if project_id is not None:
+                project_services = _project_services_for_project(project_id, active_only=True)
+                service_label = st.selectbox(
+                    "Serviço/análise",
+                    _service_options(project_services),
+                    key=f"booking_service_{project_id}",
+                )
+                service_id = _service_id_from_label(project_services, service_label)
+            else:
+                st.caption("Selecione um projeto para vincular um serviço/análise.")
+
         with st.form("form_nova_reserva", clear_on_submit=False):
-            st.markdown("### Criar reserva")
             c1, c2, c3 = st.columns(3)
             with c1:
                 user_placeholder = "Selecione o solicitante"
@@ -1767,11 +1884,6 @@ def page_reservas(conn):
                 end_t = st.time_input("Horário final", value=time(10, 0), step=timedelta(minutes=30), key="booking_end")
                 sample_count = st.number_input("Número de amostras", min_value=0, step=1, value=0, key="booking_samples")
             with c3:
-                project_options = _project_options(active_projects)
-                project_label = st.selectbox("Projeto", project_options, key="booking_project")
-                project_id = None
-                if project_label != "Sem projeto específico" and not active_projects.empty:
-                    project_id = int(active_projects.iloc[project_options.index(project_label) - 1]["id"])
                 operator_id = None
                 if truthy(selected_eq.get("requires_operator")):
                     op_options = _operator_options(operators)
@@ -1804,6 +1916,7 @@ def page_reservas(conn):
                     equipment_id=equipment_id,
                     user_id=user_id,
                     project_id=project_id,
+                    service_id=service_id,
                     operator_id=operator_id,
                     performed_by_id=user_id,
                     start_iso=start_dt.isoformat(timespec="minutes"),
@@ -1963,70 +2076,226 @@ def page_usuarios(conn):
 def page_projetos(conn):
     hero()
     st.subheader("Projetos")
-    st.caption("Cadastro de projetos usado nas reservas, movimentações de insumos e relatórios semestrais/anuais.")
+    st.caption("Cadastro simples de projetos e serviços/análises para rastrear reservas, uso de equipamentos e consumo de insumos.")
 
-    _, _, projects, _ = load_reference_data(conn)
-    display_cols = ["project_code", "project_name", "funding_source", "start_date", "end_date", "active", "notes"]
+    _, users, projects, _ = load_reference_data(conn)
+    user_names = {}
+    if not users.empty:
+        user_names = {int(row["id"]): clean_value(row.get("full_name")) for _, row in users.iterrows()}
+    project_display = projects.copy()
+    if not project_display.empty:
+        project_display["requester_name"] = project_display["requester_id"].map(lambda value: user_names.get(int(value), "-") if not is_blank(value) else "-")
+        project_display["coordinator_name"] = project_display["coordinator_id"].map(lambda value: user_names.get(int(value), "-") if not is_blank(value) else "-")
+    display_cols = [
+        "project_code", "project_name", "objective", "funding_source",
+        "requester_name", "coordinator_name", "status", "start_date",
+        "end_date", "active", "notes"
+    ]
     if projects.empty:
         st.info("Nenhum projeto cadastrado.")
     else:
-        st.dataframe(_display_df(projects[[c for c in display_cols if c in projects.columns]]), use_container_width=True, hide_index=True)
+        st.dataframe(_display_df(project_display[[c for c in display_cols if c in project_display.columns]]), use_container_width=True, hide_index=True)
 
     if not can_manage_master_data():
-        admin_required_message("incluir ou atualizar projetos")
+        admin_required_message("incluir ou atualizar projetos e serviços/análises")
+    else:
+        st.markdown("### Incluir ou atualizar projeto")
+        mode = st.radio("Modo", ["Novo projeto", "Editar projeto existente"], horizontal=True, key="project_edit_mode")
+        selected = None
+        project_id = None
+        if mode == "Editar projeto existente":
+            if projects.empty:
+                st.info("Cadastre um projeto antes de editar.")
+                selected = None
+            else:
+                labels = projects.apply(lambda r: f"{clean_value(r.get('project_code'), 'Sem código')} — {clean_value(r.get('project_name'))}", axis=1).tolist()
+                label = st.selectbox("Selecionar projeto", labels, key="project_edit_select")
+                selected = projects.iloc[labels.index(label)]
+                project_id = int(selected["id"])
+
+        if mode == "Novo projeto" or selected is not None:
+            with st.form("form_project_master"):
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    project_code = st.text_input("Código interno do projeto", value=clean_input(selected.get("project_code")) if selected is not None else "")
+                    project_name = st.text_input("Nome do projeto", value=clean_input(selected.get("project_name")) if selected is not None else "")
+                    funding_source = st.text_input("Fonte/convênio/financiamento", value=clean_input(selected.get("funding_source")) if selected is not None else "")
+                with c2:
+                    objective = st.text_area("Objetivo", value=clean_input(selected.get("objective")) if selected is not None else "", height=120)
+                    status = st.selectbox(
+                        "Status",
+                        PROJECT_STATUSES,
+                        index=_option_index(PROJECT_STATUSES, selected.get("status") if selected is not None else "em andamento"),
+                    )
+                with c3:
+                    requester_options = ["Não informado"] + _user_options(users)
+                    requester_label = st.selectbox(
+                        "Solicitante",
+                        requester_options,
+                        index=_optional_user_index(users, selected.get("requester_id")) if selected is not None else 0,
+                        key="project_requester",
+                    )
+                    coordinator_label = st.selectbox(
+                        "Coordenador/responsável",
+                        requester_options,
+                        index=_optional_user_index(users, selected.get("coordinator_id")) if selected is not None else 0,
+                        key="project_coordinator",
+                    )
+                    start_value = _date_input_value(selected.get("start_date"), None) if selected is not None else None
+                    end_value = _date_input_value(selected.get("end_date"), None) if selected is not None else None
+                    start_date_value = st.date_input("Data de início", value=start_value, key="project_start_date")
+                    end_date_value = st.date_input("Data de conclusão/término", value=end_value, key="project_end_date")
+                    active = st.checkbox("Projeto ativo", value=truthy(selected.get("active")) if selected is not None else True)
+                notes = st.text_area("Observações", value=clean_input(selected.get("notes")) if selected is not None else "")
+                submitted = st.form_submit_button("Salvar projeto", type="primary")
+
+            if submitted:
+                if start_date_value and end_date_value and start_date_value > end_date_value:
+                    st.error("A data de início não pode ser posterior à data de conclusão/término.")
+                    return
+                payload = dict(
+                    project_code=project_code.strip() or None,
+                    project_name=project_name,
+                    objective=objective.strip() or None,
+                    funding_source=funding_source.strip() or None,
+                    requester_id=_user_id_from_label(users, requester_label),
+                    coordinator_id=_user_id_from_label(users, coordinator_label),
+                    status=status,
+                    start_date=start_date_value.isoformat() if start_date_value else None,
+                    end_date=end_date_value.isoformat() if end_date_value else None,
+                    active=int(active),
+                    notes=notes.strip() or None,
+                )
+                if mode == "Novo projeto":
+                    ok, msg = create_project(conn, **payload)
+                else:
+                    ok, msg = update_project(conn, int(project_id), **payload)
+                if ok:
+                    st.success(msg)
+                    clear_app_caches()
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+    st.markdown("### Serviços/análises")
+    active_projects = projects[projects["active"] == 1].copy() if not projects.empty else projects
+    if active_projects.empty:
+        st.info("Cadastre um projeto ativo para registrar serviços/análises.")
+        return
+    service_project_label = st.selectbox(
+        "Projeto vinculado",
+        _project_options(active_projects),
+        key="service_project_select",
+    )
+    if service_project_label == "Sem projeto específico":
+        st.info("Selecione um projeto para listar ou cadastrar serviços/análises.")
         return
 
-    st.markdown("### Incluir ou atualizar projeto")
-    mode = st.radio("Modo", ["Novo projeto", "Editar projeto existente"], horizontal=True, key="project_edit_mode")
-    selected = None
-    project_id = None
-    if mode == "Editar projeto existente":
-        if projects.empty:
-            st.info("Cadastre um projeto antes de editar.")
-            return
-        labels = projects.apply(lambda r: f"{clean_value(r.get('project_code'), 'Sem código')} — {clean_value(r.get('project_name'))}", axis=1).tolist()
-        label = st.selectbox("Selecionar projeto", labels, key="project_edit_select")
-        selected = projects.iloc[labels.index(label)]
-        project_id = int(selected["id"])
+    service_project_id = _project_id_from_label(active_projects, service_project_label)
+    services = _project_services_for_project(service_project_id, active_only=False)
+    service_cols = [
+        "service_code", "title", "service_type", "status", "requested_date",
+        "expected_date", "completed_date", "requester_name", "responsible_name",
+        "active", "notes"
+    ]
+    if services.empty:
+        st.caption("Nenhum serviço/análise cadastrado para este projeto.")
+    else:
+        st.dataframe(_display_df(services[[c for c in service_cols if c in services.columns]]), use_container_width=True, hide_index=True)
 
-    with st.form("form_project_master"):
-        c1, c2 = st.columns(2)
+    if not can_manage_master_data():
+        return
+
+    service_mode = st.radio("Modo do serviço/análise", ["Novo serviço/análise", "Editar serviço/análise existente"], horizontal=True, key="service_edit_mode")
+    selected_service = None
+    service_id = None
+    if service_mode == "Editar serviço/análise existente":
+        if services.empty:
+            st.info("Cadastre um serviço/análise antes de editar.")
+            return
+        service_labels = services.apply(lambda r: f"{clean_value(r.get('service_code'), 'Sem código')} — {clean_value(r.get('title'))}", axis=1).tolist()
+        service_label = st.selectbox("Selecionar serviço/análise", service_labels, key="service_edit_select")
+        selected_service = services.iloc[service_labels.index(service_label)]
+        service_id = int(selected_service["id"])
+
+    with st.form("form_project_service"):
+        c1, c2, c3 = st.columns(3)
         with c1:
-            project_code = st.text_input("Código do projeto", value=clean_input(selected.get("project_code")) if selected is not None else "")
-            project_name = st.text_input("Nome do projeto", value=clean_input(selected.get("project_name")) if selected is not None else "")
-            funding_source = st.text_input("Fonte de financiamento", value=clean_input(selected.get("funding_source")) if selected is not None else "")
+            service_code = st.text_input("Código do serviço/análise", value=clean_input(selected_service.get("service_code")) if selected_service is not None else "")
+            title = st.text_input("Título", value=clean_input(selected_service.get("title")) if selected_service is not None else "")
+            service_type = st.selectbox(
+                "Tipo de serviço/análise",
+                SERVICE_TYPES,
+                index=_option_index(SERVICE_TYPES, selected_service.get("service_type") if selected_service is not None else "Análise"),
+            )
         with c2:
-            start_value = _date_input_value(selected.get("start_date"), None) if selected is not None else None
-            end_value = _date_input_value(selected.get("end_date"), None) if selected is not None else None
-            start_date_value = st.date_input("Data de início", value=start_value, key="project_start_date")
-            end_date_value = st.date_input("Data de fim", value=end_value, key="project_end_date")
-            active = st.checkbox("Projeto ativo", value=truthy(selected.get("active")) if selected is not None else True)
-        notes = st.text_area("Observações", value=clean_input(selected.get("notes")) if selected is not None else "")
-        submitted = st.form_submit_button("Salvar projeto", type="primary")
+            service_status = st.selectbox(
+                "Status",
+                SERVICE_STATUSES,
+                index=_option_index(SERVICE_STATUSES, selected_service.get("status") if selected_service is not None else "em andamento"),
+                key="project_service_status",
+            )
+            requested_date = st.date_input("Data solicitada", value=_date_input_value(selected_service.get("requested_date"), date.today()) if selected_service is not None else date.today(), key="service_requested_date")
+            expected_date = st.date_input("Data prevista", value=_date_input_value(selected_service.get("expected_date")) if selected_service is not None else None, key="service_expected_date")
+            completed_date = st.date_input("Data concluída", value=_date_input_value(selected_service.get("completed_date")) if selected_service is not None else None, key="service_completed_date")
+        with c3:
+            user_options = ["Não informado"] + _user_options(users)
+            service_requester_label = st.selectbox(
+                "Solicitante",
+                user_options,
+                index=_optional_user_index(users, selected_service.get("requester_id")) if selected_service is not None else 0,
+                key="service_requester",
+            )
+            responsible_label = st.selectbox(
+                "Responsável",
+                user_options,
+                index=_optional_user_index(users, selected_service.get("responsible_id")) if selected_service is not None else 0,
+                key="service_responsible",
+            )
+            service_active = st.checkbox("Serviço/análise ativo", value=truthy(selected_service.get("active")) if selected_service is not None else True)
+        service_notes = st.text_area("Observações do serviço/análise", value=clean_input(selected_service.get("notes")) if selected_service is not None else "")
+        service_submitted = st.form_submit_button("Salvar serviço/análise", type="primary")
 
-    if submitted:
-        if start_date_value and end_date_value and start_date_value > end_date_value:
-            st.error("A data de início não pode ser posterior à data de fim.")
-            return
-        payload = dict(
-            project_code=project_code.strip() or None,
-            project_name=project_name,
-            funding_source=funding_source.strip() or None,
-            start_date=start_date_value.isoformat() if start_date_value else None,
-            end_date=end_date_value.isoformat() if end_date_value else None,
-            active=int(active),
-            notes=notes.strip() or None,
-        )
-        if mode == "Novo projeto":
-            ok, msg = create_project(conn, **payload)
+    if service_submitted:
+        if completed_date and requested_date and completed_date < requested_date:
+            st.error("A data concluída não pode ser anterior à data solicitada.")
         else:
-            ok, msg = update_project(conn, int(project_id), **payload)
-        if ok:
-            st.success(msg)
-            clear_app_caches()
-            st.rerun()
-        else:
-            st.error(msg)
+            service_payload = dict(
+                project_id=service_project_id,
+                service_code=service_code.strip() or None,
+                title=title.strip(),
+                service_type=service_type,
+                requester_id=_user_id_from_label(users, service_requester_label),
+                responsible_id=_user_id_from_label(users, responsible_label),
+                status=service_status,
+                requested_date=requested_date.isoformat() if requested_date else None,
+                expected_date=expected_date.isoformat() if expected_date else None,
+                completed_date=completed_date.isoformat() if completed_date else None,
+                notes=service_notes.strip() or None,
+                active=int(service_active),
+            )
+            if service_mode == "Novo serviço/análise":
+                ok, msg, _ = create_project_service(conn, **service_payload)
+            else:
+                ok, msg = update_project_service(conn, int(service_id), **service_payload)
+            if ok:
+                st.success(msg)
+                clear_app_caches()
+                st.rerun()
+            else:
+                st.error(msg)
+
+    if selected_service is not None and truthy(selected_service.get("active")):
+        with st.expander("Inativar serviço/análise", expanded=False):
+            st.caption("Use inativação para lançamentos encerrados por erro, sem exclusão definitiva.")
+            if st.button("Inativar serviço/análise", key=f"inactivate_service_{int(selected_service['id'])}"):
+                ok, msg = inactivate_project_service(conn, int(selected_service["id"]))
+                if ok:
+                    st.success(msg)
+                    clear_app_caches()
+                    st.rerun()
+                else:
+                    st.error(msg)
 
 
 def page_equipamentos(conn):
@@ -3101,6 +3370,25 @@ def page_insumos(conn):
         if active_supplies.empty:
             st.info("Cadastre ao menos um item ativo para movimentar estoque.")
         else:
+            movement_project_id = None
+            movement_service_id = None
+            pc1, pc2 = st.columns(2)
+            with pc1:
+                project_label = st.selectbox("Projeto", _project_options(projects), key="movement_project")
+                if project_label != "Sem projeto específico" and not projects.empty:
+                    movement_project_id = _project_id_from_label(projects, project_label)
+            with pc2:
+                if movement_project_id is not None:
+                    movement_services = _project_services_for_project(movement_project_id, active_only=True)
+                    movement_service_label = st.selectbox(
+                        "Serviço/análise",
+                        _service_options(movement_services),
+                        key=f"movement_service_{movement_project_id}",
+                    )
+                    movement_service_id = _service_id_from_label(movement_services, movement_service_label)
+                else:
+                    st.caption("Selecione um projeto para vincular um serviço/análise.")
+
             with st.form("form_supply_movement"):
                 c1, c2, c3 = st.columns(3)
                 with c1:
@@ -3116,7 +3404,6 @@ def page_insumos(conn):
                 with c2:
                     quantity = st.number_input("Quantidade", min_value=0.0, value=0.0, step=1.0, key="movement_qty")
                     user_label = st.selectbox("Responsável pela movimentação", ["Não informado"] + _user_options(users), key="movement_user")
-                    project_label = st.selectbox("Projeto", _project_options(projects), key="movement_project")
                 with c3:
                     purpose = st.text_area("Finalidade/observação", placeholder="Ex.: preparo de pasta; recebimento de material; descarte por vencimento...")
                     movement_doc = st.file_uploader("Anexo da movimentação", type=["pdf", "png", "jpg", "jpeg", "xlsx"], key="movement_doc")
@@ -3157,7 +3444,8 @@ def page_insumos(conn):
                         movement_date=movement_date.isoformat(),
                         quantity=float(quantity),
                         user_id=_user_id_from_label(users, user_label),
-                        project_id=_project_id_from_label(projects, project_label),
+                        project_id=movement_project_id,
+                        service_id=movement_service_id,
                         purpose=purpose.strip() or None,
                         document_path=None,
                     )
@@ -3187,11 +3475,14 @@ def page_insumos(conn):
             conn,
             """
             SELECT sm.id, s.supply_name, sm.movement_type, sm.movement_date, sm.quantity, sm.unit,
-                   u.full_name AS responsible_name, p.project_name, sm.purpose, sm.document_path, sm.created_at
+                   u.full_name AS responsible_name, p.project_name,
+                   ps.service_code, ps.title AS service_title,
+                   sm.purpose, sm.document_path, sm.created_at
             FROM supply_movements sm
             JOIN supplies s ON s.id = sm.supply_id
             LEFT JOIN users u ON u.id = sm.user_id
             LEFT JOIN projects p ON p.id = sm.project_id
+            LEFT JOIN project_services ps ON ps.id = sm.service_id
             ORDER BY sm.movement_date DESC, sm.id DESC
             """,
         )
@@ -4143,7 +4434,8 @@ def _filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, 
         """
         SELECT b.id, e.equipment_code, e.equipment_name, e.lab_unit, e.location,
                u.full_name AS solicitante, u.department AS departamento,
-               p.project_name, p.funding_source,
+               b.project_id, p.project_code, p.project_name, p.funding_source,
+               b.service_id, ps.service_code, ps.title AS service_title, ps.service_type,
                op.full_name AS operador, perf.full_name AS executante,
                COALESCE(perf.full_name, op.full_name, u.full_name) AS responsavel_execucao,
                b.start_datetime, b.end_datetime, b.sample_count, b.purpose, b.status,
@@ -4154,6 +4446,7 @@ def _filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, 
         LEFT JOIN users op ON op.id=b.operator_id
         LEFT JOIN users perf ON perf.id=b.performed_by_id
         LEFT JOIN projects p ON p.id=b.project_id
+        LEFT JOIN project_services ps ON ps.id=b.service_id
         WHERE SUBSTR(b.start_datetime, 1, 10) BETWEEN ? AND ?
         ORDER BY b.start_datetime
         """,
@@ -4203,11 +4496,14 @@ def _filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, 
         SELECT sm.id, s.supply_name, s.commercial_name, s.manufacturer, s.category,
                s.physical_state, sm.movement_type, sm.movement_date, sm.quantity,
                COALESCE(sm.unit, s.unit) AS unit, u.full_name AS responsavel,
-               p.project_name, sm.purpose, sm.document_path, sm.created_at
+               sm.project_id, p.project_code, p.project_name,
+               sm.service_id, ps.service_code, ps.title AS service_title, ps.service_type,
+               sm.purpose, sm.document_path, sm.created_at
         FROM supply_movements sm
         JOIN supplies s ON s.id=sm.supply_id
         LEFT JOIN users u ON u.id=sm.user_id
         LEFT JOIN projects p ON p.id=sm.project_id
+        LEFT JOIN project_services ps ON ps.id=sm.service_id
         WHERE SUBSTR(sm.movement_date, 1, 10) BETWEEN ? AND ?
         ORDER BY sm.movement_date
         """,
@@ -4239,6 +4535,29 @@ def _filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, 
         """,
     )
 
+    services = query_df(
+        conn,
+        """
+        SELECT ps.id, p.project_code, p.project_name, ps.service_code,
+               ps.title AS service_title, ps.service_type,
+               requester.full_name AS requester_name,
+               responsible.full_name AS responsible_name,
+               ps.status, ps.requested_date, ps.expected_date, ps.completed_date,
+               ps.active, ps.notes, ps.created_at, ps.updated_at
+        FROM project_services ps
+        JOIN projects p ON p.id=ps.project_id
+        LEFT JOIN users requester ON requester.id=ps.requester_id
+        LEFT JOIN users responsible ON responsible.id=ps.responsible_id
+        WHERE ps.active = 1
+          AND (
+              SUBSTR(COALESCE(ps.completed_date, ps.expected_date, ps.requested_date, ps.created_at), 1, 10) BETWEEN ? AND ?
+              OR LOWER(COALESCE(ps.status, '')) NOT IN ('concluído', 'concluido', 'cancelado', 'arquivado')
+          )
+        ORDER BY p.project_name, ps.requested_date DESC, ps.title
+        """,
+        [start_date.isoformat(), end_date.isoformat()],
+    )
+
     return {
         "bookings": bookings,
         "preventive": preventive,
@@ -4246,6 +4565,7 @@ def _filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, 
         "supply_movements": supply_movements,
         "supplies": supplies,
         "equipment": equipment,
+        "services": services,
     }
 
 
@@ -4267,6 +4587,7 @@ def _report_summary(data: dict[str, pd.DataFrame]) -> pd.DataFrame:
     preventive = data["preventive"]
     supply_movements = data["supply_movements"]
     supplies = data["supplies"]
+    services = data.get("services", pd.DataFrame())
 
     total_bookings = len(bookings)
     completed = int((bookings["status"] == "done").sum()) if not bookings.empty else 0
@@ -4289,6 +4610,7 @@ def _report_summary(data: dict[str, pd.DataFrame]) -> pd.DataFrame:
         ("Usuários solicitantes", unique_users),
         ("Preventivas/calibrações", len(preventive)),
         ("Tickets corretivos", len(corrective)),
+        ("Serviços/análises", len(services)),
         ("Downtime corretivo (h)", round(downtime, 1)),
         ("Movimentações de insumos", len(supply_movements)),
         ("Saídas/consumo de insumos", len(outputs)),
@@ -4320,6 +4642,7 @@ def _reports_excel_bytes(period_text: str, data: dict[str, pd.DataFrame]) -> byt
         "Reservas": _display_df(bookings),
         "Preventivas": _display_df(data["preventive"]),
         "Corretivas": _display_df(data["corrective"]),
+        "Serviços": _display_df(data["services"]),
         "Movimentos insumos": _display_df(data["supply_movements"]),
         "Estoque atual": _display_df(data["supplies"]),
         "Equipamentos": _display_df(data["equipment"]),
@@ -4404,15 +4727,17 @@ def page_relatorios(conn):
     corrective = data["corrective"]
     supply_movements = data["supply_movements"]
     supplies = data["supplies"]
+    services = data["services"]
     summary = _report_summary(data)
 
     st.markdown(f"#### Período analisado: {period_text}")
-    k1, k2, k3, k4, k5 = st.columns(5)
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
     k1.metric("Reservas", len(bookings))
     k2.metric("Concluídas", int((bookings["status"] == "done").sum()) if not bookings.empty else 0)
     k3.metric("Amostras", int(bookings["sample_count"].fillna(0).sum()) if not bookings.empty and "sample_count" in bookings else 0)
     k4.metric("Manutenções", len(preventive) + len(corrective))
-    k5.metric("Mov. insumos", len(supply_movements))
+    k5.metric("Serviços", len(services))
+    k6.metric("Mov. insumos", len(supply_movements))
 
     excel_bytes = _reports_excel_bytes(period_text, data)
     st.download_button(
@@ -4424,8 +4749,8 @@ def page_relatorios(conn):
         type="primary",
     )
 
-    tab_overview, tab_bookings, tab_maintenance, tab_supplies, tab_tables = st.tabs(
-        ["Resumo executivo", "Reservas e uso", "Manutenção", "Insumos", "Tabelas auditáveis"]
+    tab_overview, tab_bookings, tab_projects, tab_maintenance, tab_supplies, tab_tables = st.tabs(
+        ["Resumo executivo", "Reservas e uso", "Projetos e serviços", "Manutenção", "Insumos", "Tabelas auditáveis"]
     )
 
     with tab_overview:
@@ -4435,16 +4760,18 @@ def page_relatorios(conn):
             st.dataframe(summary, use_container_width=True, hide_index=True)
         with c2:
             st.markdown("### Leitura rápida")
-            if bookings.empty and preventive.empty and corrective.empty and supply_movements.empty:
+            if bookings.empty and preventive.empty and corrective.empty and supply_movements.empty and services.empty:
                 st.info("Não há registros operacionais no período selecionado.")
             else:
                 top_equipment = clean_value(bookings["equipment_name"].value_counts().idxmax()) if not bookings.empty else "-"
                 top_user = clean_value(bookings["responsavel_execucao"].value_counts().idxmax()) if not bookings.empty else "-"
+                open_services = int((~services["status"].isin(["concluído", "cancelado", "arquivado"])).sum()) if not services.empty else 0
                 st.markdown(
                     f"""
                     <div class="soft-card">
                     <b>Equipamento mais demandado:</b> {top_equipment}<br>
                     <b>Responsável/executante mais frequente:</b> {top_user}<br>
+                    <b>Serviços/análises em andamento:</b> {open_services}<br>
                     <b>Registros de manutenção:</b> {len(preventive) + len(corrective)}<br>
                     <b>Insumos em alerta:</b> {int(supplies["alerta"].isin(["Estoque baixo", "Vencido", "Vence em até 60 dias"]).sum()) if not supplies.empty else 0}
                     </div>
@@ -4492,6 +4819,75 @@ def page_relatorios(conn):
             st.dataframe(performers.rename(columns={"responsavel_execucao": "Responsável/executante", "reservas": "Reservas", "amostras": "Amostras", "horas": "Horas"}), use_container_width=True, hide_index=True)
         else:
             st.info("Sem executantes para listar.")
+
+    with tab_projects:
+        st.markdown("### Serviços/análises")
+        if services.empty:
+            st.info("Sem serviços/análises para o período ou em andamento.")
+        else:
+            st.dataframe(_display_df(services), use_container_width=True, hide_index=True)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("### Reservas por projeto")
+            if bookings.empty:
+                st.info("Sem reservas no período.")
+            else:
+                by_project = bookings.copy()
+                by_project["projeto"] = by_project["project_name"].fillna("Não informado")
+                project_bookings = by_project.groupby("projeto", dropna=False).agg(
+                    reservas=("id", "count"),
+                    amostras=("sample_count", "sum"),
+                    horas=("duracao_h", "sum"),
+                ).reset_index().sort_values("reservas", ascending=False)
+                project_bookings["horas"] = project_bookings["horas"].round(1)
+                st.dataframe(project_bookings.rename(columns={"projeto": "Projeto", "reservas": "Reservas", "amostras": "Amostras", "horas": "Horas"}), use_container_width=True, hide_index=True)
+        with c2:
+            st.markdown("### Reservas por serviço/análise")
+            if bookings.empty or "service_title" not in bookings.columns or bookings["service_title"].dropna().empty:
+                st.info("Sem reservas vinculadas a serviços/análises no período.")
+            else:
+                by_service = bookings.copy()
+                by_service["serviço/análise"] = by_service["service_title"].fillna("Não informado")
+                service_bookings = by_service.groupby("serviço/análise", dropna=False).agg(
+                    reservas=("id", "count"),
+                    amostras=("sample_count", "sum"),
+                    horas=("duracao_h", "sum"),
+                ).reset_index().sort_values("reservas", ascending=False)
+                service_bookings["horas"] = service_bookings["horas"].round(1)
+                st.dataframe(service_bookings.rename(columns={"serviço/análise": "Serviço/análise", "reservas": "Reservas", "amostras": "Amostras", "horas": "Horas"}), use_container_width=True, hide_index=True)
+
+        c3, c4 = st.columns(2)
+        with c3:
+            st.markdown("### Consumo por projeto")
+            consumed = supply_movements[supply_movements["movement_type"].isin(["saída", "descarte", "ajuste negativo"])].copy() if not supply_movements.empty else supply_movements
+            if consumed.empty:
+                st.info("Sem consumo de insumos no período.")
+            else:
+                consumed["projeto"] = consumed["project_name"].fillna("Não informado")
+                project_consumption = consumed.groupby("projeto", dropna=False).agg(
+                    movimentações=("id", "count"),
+                    quantidade=("quantity", "sum"),
+                ).reset_index().sort_values("movimentações", ascending=False)
+                st.dataframe(project_consumption.rename(columns={"projeto": "Projeto", "movimentações": "Movimentações", "quantidade": "Quantidade"}), use_container_width=True, hide_index=True)
+        with c4:
+            st.markdown("### Consumo por serviço/análise")
+            if supply_movements.empty or "service_title" not in supply_movements.columns:
+                st.info("Sem consumo vinculado a serviços/análises no período.")
+            else:
+                consumed_by_service = supply_movements[
+                    supply_movements["movement_type"].isin(["saída", "descarte", "ajuste negativo"])
+                    & supply_movements["service_title"].notna()
+                ].copy()
+                if consumed_by_service.empty:
+                    st.info("Sem consumo vinculado a serviços/análises no período.")
+                else:
+                    consumed_by_service["serviço/análise"] = consumed_by_service["service_title"].fillna("Não informado")
+                    service_consumption = consumed_by_service.groupby("serviço/análise", dropna=False).agg(
+                        movimentações=("id", "count"),
+                        quantidade=("quantity", "sum"),
+                    ).reset_index().sort_values("movimentações", ascending=False)
+                    st.dataframe(service_consumption.rename(columns={"serviço/análise": "Serviço/análise", "movimentações": "Movimentações", "quantidade": "Quantidade"}), use_container_width=True, hide_index=True)
 
     with tab_maintenance:
         c1, c2 = st.columns(2)
@@ -4562,11 +4958,12 @@ def page_relatorios(conn):
         st.markdown("### Tabelas auditáveis")
         table_choice = st.selectbox(
             "Tabela",
-            ["Reservas", "Preventivas/calibrações", "Corretivas", "Movimentações de insumos", "Estoque atual", "Equipamentos"],
+            ["Reservas", "Serviços/análises", "Preventivas/calibrações", "Corretivas", "Movimentações de insumos", "Estoque atual", "Equipamentos"],
             key="report_table_choice",
         )
         table_map = {
             "Reservas": bookings,
+            "Serviços/análises": services,
             "Preventivas/calibrações": preventive,
             "Corretivas": corrective,
             "Movimentações de insumos": supply_movements,
