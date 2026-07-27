@@ -343,9 +343,35 @@ def init_db(conn: DatabaseConnection) -> None:
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS supply_lots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            supply_id INTEGER NOT NULL,
+            lot_code TEXT NOT NULL,
+            expiration_date TEXT,
+            received_date TEXT,
+            supplier_name TEXT,
+            initial_quantity REAL DEFAULT 0,
+            current_quantity REAL DEFAULT 0,
+            unit TEXT,
+            location TEXT,
+            certificate_path TEXT,
+            notes TEXT,
+            is_active INTEGER DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(supply_id) REFERENCES supplies(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_supply_lots_supply_active_expiration
+            ON supply_lots (supply_id, is_active, expiration_date);
+
+        CREATE INDEX IF NOT EXISTS idx_supply_lots_code
+            ON supply_lots (lot_code);
+
         CREATE TABLE IF NOT EXISTS supply_movements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             supply_id INTEGER NOT NULL,
+            supply_lot_id INTEGER,
             movement_type TEXT NOT NULL,
             movement_date TEXT NOT NULL,
             quantity REAL NOT NULL,
@@ -357,10 +383,17 @@ def init_db(conn: DatabaseConnection) -> None:
             document_path TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(supply_id) REFERENCES supplies(id),
+            FOREIGN KEY(supply_lot_id) REFERENCES supply_lots(id),
             FOREIGN KEY(user_id) REFERENCES users(id),
             FOREIGN KEY(project_id) REFERENCES projects(id),
             FOREIGN KEY(service_id) REFERENCES project_services(id)
         );
+
+        CREATE INDEX IF NOT EXISTS idx_supply_movements_lot
+            ON supply_movements (supply_lot_id);
+
+        CREATE INDEX IF NOT EXISTS idx_supply_movements_supply_date
+            ON supply_movements (supply_id, movement_date);
 
         CREATE TABLE IF NOT EXISTS equipment_spare_parts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -478,8 +511,13 @@ def init_db(conn: DatabaseConnection) -> None:
     _add_column(conn, "supplies", "manufacturer_code", "TEXT")
     _add_column(conn, "supplies", "compatible_model_family", "TEXT")
     _add_column(conn, "supply_movements", "service_id", "INTEGER")
+    _add_column(conn, "supply_movements", "supply_lot_id", "INTEGER")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bookings_service ON bookings (service_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_supply_movements_service ON supply_movements (service_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_supply_lots_supply_active_expiration ON supply_lots (supply_id, is_active, expiration_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_supply_lots_code ON supply_lots (lot_code)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_supply_movements_lot ON supply_movements (supply_lot_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_supply_movements_supply_date ON supply_movements (supply_id, movement_date)")
     conn.execute("UPDATE maintenance_preventive SET is_active = 1 WHERE is_active IS NULL")
     conn.execute("UPDATE maintenance_corrective SET is_active = 1 WHERE is_active IS NULL")
     conn.execute("UPDATE supplies SET supply_type = 'Insumo' WHERE supply_type IS NULL OR TRIM(supply_type) = ''")
@@ -512,6 +550,7 @@ OPERATIONAL_TABLES = [
     "maintenance_preventive",
     "maintenance_corrective",
     "supplies",
+    "supply_lots",
     "supply_movements",
     "equipment_spare_parts",
 ]
@@ -815,6 +854,7 @@ def deactivate_attachment(conn: DatabaseConnection, attachment_id: int) -> None:
 
 _LEGACY_ATTACHMENT_COLUMNS: dict[str, set[str]] = {
     "supplies": {"safety_doc_path", "technical_doc_path"},
+    "supply_lots": {"certificate_path"},
     "supply_movements": {"document_path"},
     "maintenance_preventive": {"checklist_path", "certificate_path"},
     "maintenance_corrective": {"attachment_path"},
@@ -2718,10 +2758,222 @@ def update_supply(
     conn.commit()
 
 
-def create_supply_movement(
-    conn: sqlite3.Connection,
+def _non_negative_float(value: Any, field_label: str) -> float:
+    try:
+        number = float(value or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_label} precisa ser numérico.") from exc
+    if number < 0:
+        raise ValueError(f"{field_label} não pode ser negativo.")
+    return number
+
+
+def create_supply_lot(
+    conn: DatabaseConnection,
     *,
     supply_id: int,
+    lot_code: str,
+    expiration_date: str | None = None,
+    received_date: str | None = None,
+    supplier_name: str | None = None,
+    initial_quantity: float | None = None,
+    current_quantity: float | None = None,
+    unit: str | None = None,
+    location: str | None = None,
+    certificate_path: str | None = None,
+    notes: str | None = None,
+    is_active: int = 1,
+) -> int:
+    supply = conn.execute("SELECT id, unit, location FROM supplies WHERE id = ?", [supply_id]).fetchone()
+    if not supply:
+        raise ValueError("Insumo não encontrado.")
+    lot_code = str(lot_code or "").strip()
+    if not lot_code:
+        raise ValueError("Informe o código do lote.")
+    initial_quantity = _non_negative_float(initial_quantity, "Quantidade inicial")
+    if current_quantity is not None:
+        current_quantity = _non_negative_float(current_quantity, "Saldo do lote")
+        if abs(current_quantity) > 1e-9:
+            raise ValueError("Saldo do lote deve ser registrado por movimentação de estoque.")
+    current_quantity = 0.0
+    lot_id = _execute_insert_returning_id(
+        conn,
+        """
+        INSERT INTO supply_lots (
+            supply_id, lot_code, expiration_date, received_date, supplier_name,
+            initial_quantity, current_quantity, unit, location, certificate_path,
+            notes, is_active
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            supply_id,
+            lot_code,
+            expiration_date,
+            received_date,
+            supplier_name,
+            initial_quantity,
+            current_quantity,
+            unit or supply["unit"],
+            location or supply["location"],
+            certificate_path,
+            notes,
+            int(is_active),
+        ],
+    )
+    conn.commit()
+    return lot_id
+
+
+def update_supply_lot(
+    conn: DatabaseConnection,
+    lot_id: int,
+    *,
+    lot_code: str,
+    expiration_date: str | None = None,
+    received_date: str | None = None,
+    supplier_name: str | None = None,
+    initial_quantity: float = 0.0,
+    current_quantity: float | None = None,
+    unit: str | None = None,
+    location: str | None = None,
+    certificate_path: str | None = None,
+    notes: str | None = None,
+    is_active: int = 1,
+) -> None:
+    lot = conn.execute("SELECT * FROM supply_lots WHERE id = ?", [lot_id]).fetchone()
+    if not lot:
+        raise ValueError("Lote não encontrado.")
+    lot_code = str(lot_code or "").strip()
+    if not lot_code:
+        raise ValueError("Informe o código do lote.")
+    previous_initial = float(lot["initial_quantity"] or 0)
+    if initial_quantity is None:
+        initial_quantity = previous_initial
+    initial_quantity = _non_negative_float(initial_quantity, "Quantidade inicial")
+    if abs(initial_quantity - previous_initial) > 1e-9:
+        raise ValueError("Quantidade inicial do lote não deve ser alterada por edição comum.")
+    previous_current = float(lot["current_quantity"] or 0)
+    if current_quantity is None:
+        current_quantity = previous_current
+    current_quantity = _non_negative_float(current_quantity, "Saldo do lote")
+    if abs(current_quantity - previous_current) > 1e-9:
+        raise ValueError("Saldo do lote deve ser alterado por movimentação ou ajuste de estoque.")
+
+    conn.execute(
+        """
+        UPDATE supply_lots
+        SET lot_code = ?,
+            expiration_date = ?,
+            received_date = ?,
+            supplier_name = ?,
+            initial_quantity = ?,
+            current_quantity = ?,
+            unit = ?,
+            location = ?,
+            certificate_path = ?,
+            notes = ?,
+            is_active = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        [
+            lot_code,
+            expiration_date,
+            received_date,
+            supplier_name,
+            initial_quantity,
+            current_quantity,
+            unit,
+            location,
+            certificate_path,
+            notes,
+            int(is_active),
+            lot_id,
+        ],
+    )
+    conn.commit()
+
+
+def inactivate_supply_lot(conn: DatabaseConnection, lot_id: int) -> tuple[bool, str]:
+    lot = conn.execute(
+        "SELECT id FROM supply_lots WHERE id = ? AND COALESCE(is_active, 1) = 1",
+        [lot_id],
+    ).fetchone()
+    if not lot:
+        return False, "Lote não encontrado ou já inativo."
+    conn.execute(
+        """
+        UPDATE supply_lots
+        SET is_active = 0,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        [lot_id],
+    )
+    conn.commit()
+    return True, "Lote inativado sem exclusão definitiva."
+
+
+def list_supply_lots(
+    conn: DatabaseConnection,
+    supply_id: int | None = None,
+    *,
+    active_only: bool = False,
+) -> pd.DataFrame:
+    sql = """
+        SELECT sl.*, s.supply_name, s.supply_type
+        FROM supply_lots sl
+        JOIN supplies s ON s.id = sl.supply_id
+        WHERE 1 = 1
+    """
+    params: list[Any] = []
+    if supply_id is not None:
+        sql += " AND sl.supply_id = ?"
+        params.append(supply_id)
+    if active_only:
+        sql += " AND COALESCE(sl.is_active, 1) = 1"
+    sql += """
+        ORDER BY
+            CASE WHEN sl.expiration_date IS NULL OR TRIM(sl.expiration_date) = '' THEN 1 ELSE 0 END,
+            sl.expiration_date ASC,
+            sl.lot_code ASC
+    """
+    return query_df(conn, sql, params)
+
+
+def list_active_supply_lots_for_supply(conn: DatabaseConnection, supply_id: int) -> pd.DataFrame:
+    return list_supply_lots(conn, supply_id=supply_id, active_only=True)
+
+
+def get_supply_lot(conn: DatabaseConnection, lot_id: int) -> Any | None:
+    return conn.execute("SELECT * FROM supply_lots WHERE id = ?", [lot_id]).fetchone()
+
+
+def validate_supply_lot_belongs_to_supply(
+    conn: DatabaseConnection,
+    *,
+    supply_lot_id: int,
+    supply_id: int,
+) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM supply_lots
+        WHERE id = ?
+          AND supply_id = ?
+        LIMIT 1
+        """,
+        [supply_lot_id, supply_id],
+    ).fetchone()
+    return row is not None
+
+
+def create_supply_movement(
+    conn: DatabaseConnection,
+    *,
+    supply_id: int,
+    supply_lot_id: int | None = None,
     movement_type: str,
     movement_date: str,
     quantity: float,
@@ -2737,8 +2989,25 @@ def create_supply_movement(
     if quantity <= 0:
         return False, "A quantidade precisa ser maior que zero.", None
 
+    lot_row = None
+    if supply_lot_id is not None:
+        lot_row = conn.execute(
+            """
+            SELECT *
+            FROM supply_lots
+            WHERE id = ?
+              AND supply_id = ?
+            """,
+            [supply_lot_id, supply_id],
+        ).fetchone()
+        if not lot_row:
+            return False, "Lote não encontrado para este insumo.", None
+        if int(lot_row["is_active"] if lot_row["is_active"] is not None else 1) != 1:
+            return False, "Lote inativo não pode receber nova movimentação operacional.", None
+
     movement_type = movement_type.lower()
     current = float(row["current_quantity"] or 0)
+    lot_current = float(lot_row["current_quantity"] or 0) if lot_row else None
     delta_map = {
         "entrada": quantity,
         "saída": -quantity,
@@ -2750,6 +3019,12 @@ def create_supply_movement(
     if movement_type not in delta_map:
         return False, "Tipo de movimentação inválido.", None
     new_quantity = current + delta_map[movement_type]
+    if lot_row is not None:
+        new_lot_quantity = float(lot_current or 0) + delta_map[movement_type]
+        if new_lot_quantity < -1e-9:
+            return False, f"Saldo insuficiente no lote. Saldo atual do lote: {float(lot_current or 0):g} {lot_row['unit'] or row['unit'] or ''}.", None
+    else:
+        new_lot_quantity = None
     if new_quantity < -1e-9:
         return False, f"Saldo insuficiente. Saldo atual: {current:g} {row['unit'] or ''}.", None
     ok, msg, project_id, service_id = _normalize_project_service_ids(
@@ -2764,17 +3039,18 @@ def create_supply_movement(
         conn,
         """
         INSERT INTO supply_movements (
-            supply_id, movement_type, movement_date, quantity, unit,
+            supply_id, supply_lot_id, movement_type, movement_date, quantity, unit,
             user_id, project_id, service_id, purpose, document_path
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             supply_id,
+            supply_lot_id,
             movement_type,
             movement_date,
             quantity,
-            row["unit"],
+            lot_row["unit"] if lot_row and lot_row["unit"] else row["unit"],
             user_id,
             project_id,
             service_id,
@@ -2786,5 +3062,10 @@ def create_supply_movement(
         "UPDATE supplies SET current_quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         [new_quantity, supply_id],
     )
+    if lot_row is not None:
+        conn.execute(
+            "UPDATE supply_lots SET current_quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            [new_lot_quantity, supply_lot_id],
+        )
     conn.commit()
     return True, f"Movimentação registrada. Novo saldo: {new_quantity:g} {row['unit'] or ''}.", movement_id

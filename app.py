@@ -38,18 +38,21 @@ from labcim_manager.db import (
     create_project,
     create_project_service,
     create_supply,
+    create_supply_lot,
     create_supply_movement,
     create_user,
     get_active_user_by_email,
     get_attachment,
     get_latest_attachment_for_entity,
     import_base_xlsx,
+    inactivate_supply_lot,
     init_db,
     is_operational_database_empty,
     list_attachments,
     list_equipment_for_spare_part,
     list_maintenance_status_history,
     list_project_services,
+    list_supply_lots,
     list_spare_parts_for_equipment,
     list_upcoming_preventive_maintenance,
     log_notification,
@@ -65,6 +68,7 @@ from labcim_manager.db import (
     update_preventive_activity,
     update_project,
     update_project_service,
+    update_supply_lot,
     update_supply,
     update_user,
     inactivate_project_service,
@@ -180,7 +184,16 @@ COLUMN_LABELS = {
     "current_quantity": "Saldo atual",
     "minimum_quantity": "Estoque mínimo",
     "lot": "Lote",
+    "lot_code": "Lote",
+    "supply_lot_id": "ID do lote",
+    "supply_lot_code": "Lote",
+    "supply_lot_expiration_date": "Validade do lote",
+    "supplier_name": "Fornecedor",
+    "initial_quantity": "Quantidade inicial",
+    "lot_status": "Status do lote",
     "expiration_date": "Validade",
+    "received_date": "Recebido em",
+    "certificate_path": "Certificado de análise",
     "safety_doc_path": "FDS/FISPQ",
     "technical_doc_path": "Ficha técnica/caracterização",
     "density": "Massa específica",
@@ -640,10 +653,11 @@ def _cached_supply_page_data(database_fingerprint: str, _database_url_value: str
     conn = connect(DB_PATH, database_url=_database_url_value)
     try:
         supplies = query_df(conn, "SELECT * FROM supplies ORDER BY active DESC, supply_name")
+        supply_lots = list_supply_lots(conn)
         users = query_df(conn, "SELECT * FROM users WHERE active=1 ORDER BY full_name")
         projects = query_df(conn, "SELECT * FROM projects WHERE active=1 ORDER BY project_name")
         equipment = query_df(conn, "SELECT * FROM equipment ORDER BY active DESC, equipment_code")
-        return supplies, users, projects, equipment
+        return supplies, supply_lots, users, projects, equipment
     finally:
         conn.close()
 
@@ -1240,6 +1254,8 @@ def _display_df(df: pd.DataFrame) -> pd.DataFrame:
         "inactive_at",
         "occurrence_datetime",
         "expiration_date",
+        "supply_lot_expiration_date",
+        "received_date",
         "movement_date",
         "planned_date",
         "planned_end_date",
@@ -2758,6 +2774,70 @@ def _select_index_by_supply_id(supplies: pd.DataFrame, supply_id: str | int | No
     return ids.index(supply_id) if supply_id in ids else 0
 
 
+def _supply_lots_for_supply(supply_lots: pd.DataFrame, supply_id: int, *, active_only: bool = False) -> pd.DataFrame:
+    if supply_lots.empty:
+        return supply_lots
+    lots = supply_lots[supply_lots["supply_id"].astype(int) == int(supply_id)].copy()
+    if active_only and "is_active" in lots.columns:
+        lots = lots[lots["is_active"].fillna(1).astype(int) == 1]
+    return lots
+
+
+def _lot_expiration_status(expiration_value) -> str:
+    if is_blank(expiration_value):
+        return "Sem validade"
+    try:
+        expiration = datetime.fromisoformat(str(expiration_value)).date()
+    except Exception:
+        return "Validade inválida"
+    today = date.today()
+    if expiration < today:
+        return "Vencido"
+    if expiration <= today + timedelta(days=60):
+        return "Vence em até 60 dias"
+    return "OK"
+
+
+def _lot_display_df(lots: pd.DataFrame) -> pd.DataFrame:
+    if lots.empty:
+        return lots
+    out = lots.copy()
+    out["lot_status"] = out["expiration_date"].map(_lot_expiration_status) if "expiration_date" in out.columns else "Sem validade"
+    cols = [
+        "lot_code",
+        "expiration_date",
+        "lot_status",
+        "current_quantity",
+        "unit",
+        "initial_quantity",
+        "supplier_name",
+        "location",
+        "received_date",
+        "is_active",
+        "notes",
+    ]
+    return _display_df(out[[c for c in cols if c in out.columns]])
+
+
+def _supply_lot_options(lots: pd.DataFrame) -> list[str]:
+    def _label(row: pd.Series) -> str:
+        qty = float(row.get("current_quantity") or 0)
+        unit = clean_value(row.get("unit"), "")
+        return (
+            f"{int(row['id'])} — lote {clean_value(row.get('lot_code'))} · "
+            f"saldo: {qty:g} {unit} · validade: {_format_datetime(row.get('expiration_date'))}"
+        )
+
+    return lots.apply(_label, axis=1).tolist()
+
+
+def _supply_lot_id_from_label(lots: pd.DataFrame, label: str) -> int | None:
+    if label == "Sem lote específico" or lots.empty:
+        return None
+    options = ["Sem lote específico"] + _supply_lot_options(lots)
+    return int(lots.iloc[options.index(label) - 1]["id"])
+
+
 def _render_attachment_download(attachment_row, label: str, key: str) -> bool:
     if not attachment_row:
         return False
@@ -2851,6 +2931,220 @@ def render_attachment_list(
 
     if not rendered:
         st.caption(empty_message)
+
+
+def render_supply_lots_section(conn, supply_row: pd.Series, supply_lots: pd.DataFrame) -> None:
+    supply_id = int(supply_row["id"])
+    supply_unit = clean_input(supply_row.get("unit")) or "kg"
+    supply_location = clean_input(supply_row.get("location"))
+    active_lots = _supply_lots_for_supply(supply_lots, supply_id, active_only=True)
+
+    st.markdown("#### Lotes do insumo")
+    if active_lots.empty:
+        st.caption("Nenhum lote ativo cadastrado.")
+    else:
+        st.dataframe(_lot_display_df(active_lots), use_container_width=True, hide_index=True)
+        with st.expander("Certificados de análise", expanded=False):
+            for _, lot in active_lots.iterrows():
+                st.markdown(f"##### Lote {clean_value(lot.get('lot_code'))}")
+                render_attachment_list(
+                    conn,
+                    entity_type="supply_lot",
+                    entity_id=int(lot["id"]),
+                    attachment_role="analysis_certificate",
+                    legacy_path=lot.get("certificate_path"),
+                    key_prefix=f"supply_lot_{int(lot['id'])}_certificate",
+                    title=None,
+                    empty_message="Nenhum certificado de análise cadastrado.",
+                )
+
+    if not can_manage_master_data():
+        st.caption("Cadastro e edição de lotes ficam disponíveis para Gerente ou Administrador.")
+        return
+
+    with st.expander("Criar lote", expanded=False):
+        with st.form(f"form_create_lot_{supply_id}"):
+            lc1, lc2, lc3 = st.columns(3)
+            with lc1:
+                lot_code = st.text_input("Código do lote *", key=f"lot_code_new_{supply_id}")
+                expiration_date = st.date_input("Validade", value=None, key=f"lot_exp_new_{supply_id}")
+                received_date = st.date_input("Recebido em", value=date.today(), key=f"lot_received_new_{supply_id}")
+            with lc2:
+                supplier_name = st.text_input("Fornecedor", key=f"lot_supplier_new_{supply_id}")
+                initial_quantity = st.number_input(
+                    "Quantidade inicial",
+                    min_value=0.0,
+                    value=0.0,
+                    step=1.0,
+                    key=f"lot_initial_new_{supply_id}",
+                    help="Se informada, uma entrada de estoque será registrada para manter rastreabilidade.",
+                )
+                unit = st.text_input("Unidade", value=supply_unit, key=f"lot_unit_new_{supply_id}")
+            with lc3:
+                location = st.text_input("Localização", value=supply_location, key=f"lot_location_new_{supply_id}")
+                certificate_upload = st.file_uploader(
+                    "Certificado de análise",
+                    type=["pdf", "png", "jpg", "jpeg", "xlsx"],
+                    key=f"lot_certificate_new_{supply_id}",
+                )
+                notes = st.text_area("Observações", key=f"lot_notes_new_{supply_id}")
+            create_lot_submitted = st.form_submit_button("Criar lote", type="primary")
+
+        if create_lot_submitted:
+            if not lot_code.strip():
+                st.error("Informe o código do lote.")
+            elif not _ensure_storage_ready_for_upload(certificate_upload):
+                pass
+            else:
+                try:
+                    lot_id = create_supply_lot(
+                        conn,
+                        supply_id=supply_id,
+                        lot_code=lot_code.strip(),
+                        expiration_date=expiration_date.isoformat() if expiration_date else None,
+                        received_date=received_date.isoformat() if received_date else None,
+                        supplier_name=supplier_name.strip() or None,
+                        initial_quantity=float(initial_quantity),
+                        current_quantity=0.0,
+                        unit=unit.strip() or supply_unit,
+                        location=location.strip() or None,
+                        notes=notes.strip() or None,
+                    )
+                    if initial_quantity:
+                        ok, msg, _ = create_supply_movement(
+                            conn,
+                            supply_id=supply_id,
+                            supply_lot_id=lot_id,
+                            movement_type="entrada",
+                            movement_date=(received_date or date.today()).isoformat(),
+                            quantity=float(initial_quantity),
+                            user_id=_current_user_id(),
+                            project_id=None,
+                            service_id=None,
+                            purpose="Saldo inicial do lote.",
+                            document_path=None,
+                        )
+                        if not ok:
+                            st.error(msg)
+                            clear_app_caches()
+                            st.rerun()
+                    if certificate_upload is not None:
+                        certificate_ref = _save_upload(
+                            conn,
+                            certificate_upload,
+                            entity_type="supply_lot",
+                            entity_id=lot_id,
+                            attachment_role="analysis_certificate",
+                        )
+                        update_legacy_attachment_path(
+                            conn,
+                            table="supply_lots",
+                            row_id=lot_id,
+                            column="certificate_path",
+                            value=certificate_ref,
+                        )
+                    st.success("Lote cadastrado com sucesso.")
+                    clear_app_caches()
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+
+    if active_lots.empty:
+        return
+
+    with st.expander("Editar lote", expanded=False):
+        edit_label = st.selectbox(
+            "Lote para editar",
+            _supply_lot_options(active_lots),
+            key=f"lot_edit_select_{supply_id}",
+        )
+        edit_lot = active_lots[active_lots["id"].astype(int) == int(_supply_lot_id_from_label(active_lots, edit_label))].iloc[0]
+        with st.form(f"form_edit_lot_{int(edit_lot['id'])}"):
+            le1, le2, le3 = st.columns(3)
+            with le1:
+                edit_lot_code = st.text_input("Código do lote *", value=clean_input(edit_lot.get("lot_code")), key=f"lot_code_edit_{int(edit_lot['id'])}")
+                edit_expiration_date = st.date_input(
+                    "Validade",
+                    value=_date_input_value(edit_lot.get("expiration_date")),
+                    key=f"lot_exp_edit_{int(edit_lot['id'])}",
+                )
+                edit_received_date = st.date_input(
+                    "Recebido em",
+                    value=_date_input_value(edit_lot.get("received_date")),
+                    key=f"lot_received_edit_{int(edit_lot['id'])}",
+                )
+            with le2:
+                edit_supplier_name = st.text_input("Fornecedor", value=clean_input(edit_lot.get("supplier_name")), key=f"lot_supplier_edit_{int(edit_lot['id'])}")
+                edit_initial_quantity = float(edit_lot.get("initial_quantity") or 0)
+                st.caption(f"Quantidade inicial registrada: {edit_initial_quantity:g} {clean_value(edit_lot.get('unit'), supply_unit)}")
+                edit_unit = st.text_input("Unidade", value=clean_input(edit_lot.get("unit")) or supply_unit, key=f"lot_unit_edit_{int(edit_lot['id'])}")
+            with le3:
+                edit_location = st.text_input("Localização", value=clean_input(edit_lot.get("location")), key=f"lot_location_edit_{int(edit_lot['id'])}")
+                edit_certificate_upload = st.file_uploader(
+                    "Novo certificado de análise",
+                    type=["pdf", "png", "jpg", "jpeg", "xlsx"],
+                    key=f"lot_certificate_edit_{int(edit_lot['id'])}",
+                )
+                edit_notes = st.text_area("Observações", value=clean_input(edit_lot.get("notes")), key=f"lot_notes_edit_{int(edit_lot['id'])}")
+            edit_lot_submitted = st.form_submit_button("Salvar lote", type="primary")
+
+        if edit_lot_submitted:
+            if not edit_lot_code.strip():
+                st.error("Informe o código do lote.")
+            elif not _ensure_storage_ready_for_upload(edit_certificate_upload):
+                pass
+            else:
+                try:
+                    certificate_final = clean_input(edit_lot.get("certificate_path")) or None
+                    if edit_certificate_upload is not None:
+                        certificate_final = _save_upload(
+                            conn,
+                            edit_certificate_upload,
+                            entity_type="supply_lot",
+                            entity_id=int(edit_lot["id"]),
+                            attachment_role="analysis_certificate",
+                        )
+                    update_supply_lot(
+                        conn,
+                        int(edit_lot["id"]),
+                        lot_code=edit_lot_code.strip(),
+                        expiration_date=edit_expiration_date.isoformat() if edit_expiration_date else None,
+                        received_date=edit_received_date.isoformat() if edit_received_date else None,
+                        supplier_name=edit_supplier_name.strip() or None,
+                        initial_quantity=float(edit_initial_quantity),
+                        current_quantity=float(edit_lot.get("current_quantity") or 0),
+                        unit=edit_unit.strip() or supply_unit,
+                        location=edit_location.strip() or None,
+                        certificate_path=certificate_final,
+                        notes=edit_notes.strip() or None,
+                        is_active=int(edit_lot.get("is_active") if not is_blank(edit_lot.get("is_active")) else 1),
+                    )
+                    st.success("Lote atualizado com sucesso.")
+                    clear_app_caches()
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+
+    with st.expander("Inativar lote", expanded=False):
+        inactive_label = st.selectbox(
+            "Lote para inativar",
+            _supply_lot_options(active_lots),
+            key=f"lot_inactivate_select_{supply_id}",
+        )
+        inactive_lot_id = _supply_lot_id_from_label(active_lots, inactive_label)
+        confirm_inactivate = st.checkbox(
+            "Confirmo que este lote deve ficar indisponível para novas movimentações.",
+            key=f"lot_inactivate_confirm_{supply_id}",
+        )
+        if st.button("Inativar lote", key=f"lot_inactivate_button_{supply_id}"):
+            if not confirm_inactivate:
+                st.error("Confirme a inativação antes de continuar.")
+            else:
+                ok, msg = inactivate_supply_lot(conn, int(inactive_lot_id))
+                (st.success if ok else st.error)(msg)
+                if ok:
+                    clear_app_caches()
+                    st.rerun()
 
 
 def _download_or_link_document(
@@ -2980,7 +3274,7 @@ def page_insumos(conn):
 
     database_url = _database_url()
     with perf_timer("Dados de insumos"):
-        supplies, users, projects, equipment = _cached_supply_page_data(
+        supplies, supply_lots, users, projects, equipment = _cached_supply_page_data(
             _database_fingerprint(database_url),
             _database_url_value=database_url,
         )
@@ -3218,6 +3512,9 @@ def page_insumos(conn):
                     empty_message="Nenhuma ficha técnica/caracterização cadastrada.",
                 )
 
+        if selected_supply is not None:
+            render_supply_lots_section(conn, selected_supply, supply_lots)
+
         if submitted:
             if not can_manage_master_data():
                 st.error("Cadastro/edição estrutural de insumos exige perfil Gerente ou Administrador.")
@@ -3370,6 +3667,48 @@ def page_insumos(conn):
         if active_supplies.empty:
             st.info("Cadastre ao menos um item ativo para movimentar estoque.")
         else:
+            sc1, sc2 = st.columns([1.35, 1])
+            with sc1:
+                supply_label = st.selectbox(
+                    "Item de estoque",
+                    _supply_options(active_supplies),
+                    index=_select_index_by_supply_id(active_supplies, qr_supply_id),
+                    key="movement_supply",
+                )
+                supply_id = _supply_id_from_label(active_supplies, supply_label)
+                selected_movement_supply = active_supplies[active_supplies["id"].astype(int) == int(supply_id)].iloc[0]
+            with sc2:
+                active_lots = _supply_lots_for_supply(supply_lots, int(supply_id), active_only=True)
+                selected_lot_id = None
+                selected_lot = None
+                if active_lots.empty:
+                    st.caption("Este item não tem lotes ativos. A movimentação pode seguir sem lote.")
+                else:
+                    lot_label = st.selectbox(
+                        "Lote (opcional)",
+                        ["Sem lote específico"] + _supply_lot_options(active_lots),
+                        key=f"movement_lot_{int(supply_id)}",
+                    )
+                    selected_lot_id = _supply_lot_id_from_label(active_lots, lot_label)
+                    if selected_lot_id is not None:
+                        selected_lot = active_lots[active_lots["id"].astype(int) == int(selected_lot_id)].iloc[0]
+
+            if selected_lot is not None:
+                lot_status = _lot_expiration_status(selected_lot.get("expiration_date"))
+                lot_message = (
+                    f"Lote {clean_value(selected_lot.get('lot_code'))} · "
+                    f"saldo {float(selected_lot.get('current_quantity') or 0):g} {clean_value(selected_lot.get('unit'), clean_value(selected_movement_supply.get('unit'), ''))} · "
+                    f"validade {_format_datetime(selected_lot.get('expiration_date'))} · "
+                    f"fornecedor {clean_value(selected_lot.get('supplier_name'))} · "
+                    f"local {clean_value(selected_lot.get('location'))}"
+                )
+                if lot_status == "Vencido":
+                    st.error(f"{lot_message} · {lot_status}")
+                elif lot_status == "Vence em até 60 dias":
+                    st.warning(f"{lot_message} · {lot_status}")
+                else:
+                    st.caption(f"{lot_message} · {lot_status}")
+
             movement_project_id = None
             movement_service_id = None
             pc1, pc2 = st.columns(2)
@@ -3392,13 +3731,6 @@ def page_insumos(conn):
             with st.form("form_supply_movement"):
                 c1, c2, c3 = st.columns(3)
                 with c1:
-                    supply_label = st.selectbox(
-                        "Item de estoque",
-                        _supply_options(active_supplies),
-                        index=_select_index_by_supply_id(active_supplies, qr_supply_id),
-                        key="movement_supply",
-                    )
-                    supply_id = _supply_id_from_label(active_supplies, supply_label)
                     movement_type = st.selectbox("Tipo de movimentação", ["entrada", "saída", "descarte", "ajuste positivo", "ajuste negativo"])
                     movement_date = st.date_input("Data", value=date.today(), key="movement_date")
                 with c2:
@@ -3409,7 +3741,41 @@ def page_insumos(conn):
                     movement_doc = st.file_uploader("Anexo da movimentação", type=["pdf", "png", "jpg", "jpeg", "xlsx"], key="movement_doc")
                 move_submitted = st.form_submit_button("Registrar movimentação", type="primary")
 
-            selected_movement_supply = active_supplies[active_supplies["id"].astype(int) == int(supply_id)].iloc[0]
+            st.markdown("#### Ficha do item selecionado")
+            fc1, fc2, fc3, fc4 = st.columns(4)
+            fc1.metric("Saldo total", f"{float(selected_movement_supply.get('current_quantity') or 0):g} {clean_value(selected_movement_supply.get('unit'), '')}")
+            fc2.metric("Estoque mínimo", f"{float(selected_movement_supply.get('minimum_quantity') or 0):g} {clean_value(selected_movement_supply.get('unit'), '')}")
+            fc3.metric("Lotes ativos", len(active_lots))
+            fc4.metric("Status", _supply_alert_status(selected_movement_supply))
+            if active_lots.empty:
+                st.caption("Nenhum lote ativo cadastrado para este item.")
+            else:
+                st.dataframe(_lot_display_df(active_lots), use_container_width=True, hide_index=True)
+
+            supply_history = query_df(
+                conn,
+                """
+                SELECT sm.id, sm.movement_type, sm.movement_date, sm.quantity,
+                       COALESCE(sm.unit, s.unit) AS unit, sl.lot_code AS supply_lot_code,
+                       u.full_name AS responsible_name, p.project_name,
+                       ps.service_code, ps.title AS service_title, sm.purpose, sm.created_at
+                FROM supply_movements sm
+                JOIN supplies s ON s.id = sm.supply_id
+                LEFT JOIN supply_lots sl ON sl.id = sm.supply_lot_id
+                LEFT JOIN users u ON u.id = sm.user_id
+                LEFT JOIN projects p ON p.id = sm.project_id
+                LEFT JOIN project_services ps ON ps.id = sm.service_id
+                WHERE sm.supply_id = ?
+                ORDER BY sm.movement_date DESC, sm.id DESC
+                LIMIT 20
+                """,
+                [int(supply_id)],
+            )
+            if supply_history.empty:
+                st.caption("Nenhuma movimentação registrada para este item.")
+            else:
+                st.dataframe(_display_df(supply_history), use_container_width=True, hide_index=True)
+
             st.markdown("#### Documentos do item selecionado")
             d1, d2 = st.columns(2)
             with d1:
@@ -3436,10 +3802,15 @@ def page_insumos(conn):
                 )
 
             if move_submitted:
-                if _ensure_storage_ready_for_upload(movement_doc):
+                negative_movement = movement_type in {"saída", "descarte", "ajuste negativo"}
+                lot_balance = float(selected_lot.get("current_quantity") or 0) if selected_lot is not None else None
+                if selected_lot is not None and negative_movement and float(quantity) > float(lot_balance or 0) + 1e-9:
+                    st.error(f"Saldo insuficiente no lote. Saldo atual do lote: {float(lot_balance or 0):g} {clean_value(selected_lot.get('unit'), clean_value(selected_movement_supply.get('unit'), ''))}.")
+                elif _ensure_storage_ready_for_upload(movement_doc):
                     ok, msg, movement_id = create_supply_movement(
                         conn,
                         supply_id=supply_id,
+                        supply_lot_id=selected_lot_id,
                         movement_type=movement_type,
                         movement_date=movement_date.isoformat(),
                         quantity=float(quantity),
@@ -3474,12 +3845,14 @@ def page_insumos(conn):
         hist = query_df(
             conn,
             """
-            SELECT sm.id, s.supply_name, sm.movement_type, sm.movement_date, sm.quantity, sm.unit,
+            SELECT sm.id, s.supply_name, sl.lot_code AS supply_lot_code,
+                   sm.movement_type, sm.movement_date, sm.quantity, sm.unit,
                    u.full_name AS responsible_name, p.project_name,
                    ps.service_code, ps.title AS service_title,
                    sm.purpose, sm.document_path, sm.created_at
             FROM supply_movements sm
             JOIN supplies s ON s.id = sm.supply_id
+            LEFT JOIN supply_lots sl ON sl.id = sm.supply_lot_id
             LEFT JOIN users u ON u.id = sm.user_id
             LEFT JOIN projects p ON p.id = sm.project_id
             LEFT JOIN project_services ps ON ps.id = sm.service_id
@@ -4495,12 +4868,16 @@ def _filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, 
         """
         SELECT sm.id, s.supply_name, s.commercial_name, s.manufacturer, s.category,
                s.physical_state, sm.movement_type, sm.movement_date, sm.quantity,
-               COALESCE(sm.unit, s.unit) AS unit, u.full_name AS responsavel,
+               COALESCE(sm.unit, s.unit) AS unit,
+               sl.lot_code AS supply_lot_code,
+               sl.expiration_date AS supply_lot_expiration_date,
+               u.full_name AS responsavel,
                sm.project_id, p.project_code, p.project_name,
                sm.service_id, ps.service_code, ps.title AS service_title, ps.service_type,
                sm.purpose, sm.document_path, sm.created_at
         FROM supply_movements sm
         JOIN supplies s ON s.id=sm.supply_id
+        LEFT JOIN supply_lots sl ON sl.id=sm.supply_lot_id
         LEFT JOIN users u ON u.id=sm.user_id
         LEFT JOIN projects p ON p.id=sm.project_id
         LEFT JOIN project_services ps ON ps.id=sm.service_id
@@ -4523,6 +4900,21 @@ def _filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, 
     )
     if not supplies.empty:
         supplies["alerta"] = supplies.apply(_supply_alert_status, axis=1)
+
+    supply_lots = query_df(
+        conn,
+        """
+        SELECT sl.id, s.supply_name, sl.lot_code, sl.expiration_date,
+               sl.received_date, sl.supplier_name, sl.initial_quantity,
+               sl.current_quantity, sl.unit, sl.location, sl.certificate_path,
+               sl.notes, sl.is_active, sl.created_at, sl.updated_at
+        FROM supply_lots sl
+        JOIN supplies s ON s.id=sl.supply_id
+        ORDER BY s.supply_name, sl.expiration_date, sl.lot_code
+        """,
+    )
+    if not supply_lots.empty:
+        supply_lots["lot_status"] = supply_lots["expiration_date"].map(_lot_expiration_status)
 
     equipment = query_df(
         conn,
@@ -4564,6 +4956,7 @@ def _filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, 
         "corrective": corrective,
         "supply_movements": supply_movements,
         "supplies": supplies,
+        "supply_lots": supply_lots,
         "equipment": equipment,
         "services": services,
     }
@@ -4645,6 +5038,7 @@ def _reports_excel_bytes(period_text: str, data: dict[str, pd.DataFrame]) -> byt
         "Serviços": _display_df(data["services"]),
         "Movimentos insumos": _display_df(data["supply_movements"]),
         "Estoque atual": _display_df(data["supplies"]),
+        "Estoque por lote": _display_df(data["supply_lots"]),
         "Equipamentos": _display_df(data["equipment"]),
     }
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -4727,6 +5121,7 @@ def page_relatorios(conn):
     corrective = data["corrective"]
     supply_movements = data["supply_movements"]
     supplies = data["supplies"]
+    supply_lots = data["supply_lots"]
     services = data["services"]
     summary = _report_summary(data)
 
@@ -4954,11 +5349,35 @@ def page_relatorios(conn):
                 consumed_summary = consumed.groupby(["supply_name", "unit"], dropna=False)["quantity"].sum().reset_index().sort_values("quantity", ascending=False)
                 st.dataframe(consumed_summary.rename(columns={"supply_name": "Insumo", "unit": "Unidade", "quantity": "Quantidade"}), use_container_width=True, hide_index=True)
 
+        st.markdown("### Estoque atual por lote")
+        active_lots = supply_lots[supply_lots["is_active"].fillna(1).astype(int) == 1].copy() if not supply_lots.empty else supply_lots
+        if active_lots.empty:
+            st.info("Nenhum lote ativo cadastrado.")
+        else:
+            st.dataframe(_display_df(active_lots), use_container_width=True, hide_index=True)
+
+        if not active_lots.empty:
+            c3, c4 = st.columns(2)
+            with c3:
+                st.markdown("### Lotes vencidos")
+                expired_lots = active_lots[active_lots["lot_status"] == "Vencido"].copy()
+                if expired_lots.empty:
+                    st.success("Sem lotes vencidos.")
+                else:
+                    st.dataframe(_display_df(expired_lots), use_container_width=True, hide_index=True)
+            with c4:
+                st.markdown("### Lotes próximos do vencimento")
+                near_lots = active_lots[active_lots["lot_status"] == "Vence em até 60 dias"].copy()
+                if near_lots.empty:
+                    st.success("Sem lotes próximos do vencimento.")
+                else:
+                    st.dataframe(_display_df(near_lots), use_container_width=True, hide_index=True)
+
     with tab_tables:
         st.markdown("### Tabelas auditáveis")
         table_choice = st.selectbox(
             "Tabela",
-            ["Reservas", "Serviços/análises", "Preventivas/calibrações", "Corretivas", "Movimentações de insumos", "Estoque atual", "Equipamentos"],
+            ["Reservas", "Serviços/análises", "Preventivas/calibrações", "Corretivas", "Movimentações de insumos", "Estoque atual", "Estoque por lote", "Equipamentos"],
             key="report_table_choice",
         )
         table_map = {
@@ -4968,6 +5387,7 @@ def page_relatorios(conn):
             "Corretivas": corrective,
             "Movimentações de insumos": supply_movements,
             "Estoque atual": supplies,
+            "Estoque por lote": supply_lots,
             "Equipamentos": data["equipment"],
         }
         selected_df = table_map[table_choice]
