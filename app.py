@@ -134,6 +134,8 @@ SERVICE_TYPES = ["Análise", "Ensaio", "Caracterização", "Preparação", "Rela
 PREVENTIVE_STATUSES = ["pendente", "realizado", "reprovado", "reagendado", "cancelado"]
 CORRECTIVE_STATUSES = ["aberto", "em análise", "aguardando peça", "enviado para fornecedor", "concluído", "cancelado"]
 MAINTENANCE_JUSTIFICATION_STATUSES = {"reprovado", "reagendado", "cancelado"}
+SUPPLY_CONSUMPTION_MOVEMENT_TYPES = {"saída", "saida", "descarte", "ajuste negativo"}
+LOT_EXPIRATION_ALERT_STATUSES = {"Vencido", "Vence em até 60 dias"}
 
 PAGE_LABELS = [
     "Painel inicial",
@@ -206,6 +208,18 @@ COLUMN_LABELS = {
     "document_path": "Documento",
     "stock_status": "Status de estoque",
     "association_notes": "Observação da associação",
+    "alerta": "Alerta",
+    "quantity_to_minimum": "Falta para o mínimo",
+    "days_until_expiration": "Dias até validade",
+    "certificate_status": "Status do certificado",
+    "movement_document_status": "Documento/anexo da movimentação",
+    "movement_count": "Movimentações",
+    "consumed_quantity": "Quantidade consumida",
+    "project_label": "Projeto",
+    "service_label": "Serviço/análise",
+    "supply_lot_label": "Lote",
+    "lot_supplier_name": "Fornecedor do lote",
+    "lot_location": "Local do lote",
     "active": "Ativo?",
     "is_active": "Ativo?",
     "association_active": "Associação ativa?",
@@ -2798,6 +2812,16 @@ def _lot_expiration_status(expiration_value) -> str:
     return "OK"
 
 
+def _days_until_date(value) -> int | None:
+    if is_blank(value):
+        return None
+    try:
+        target = datetime.fromisoformat(str(value)).date()
+    except Exception:
+        return None
+    return (target - date.today()).days
+
+
 def _lot_display_df(lots: pd.DataFrame) -> pd.DataFrame:
     if lots.empty:
         return lots
@@ -4801,6 +4825,260 @@ def _period_label(start_date: date, end_date: date) -> str:
     return f"{start_date.strftime('%d/%m/%Y')} a {end_date.strftime('%d/%m/%Y')}"
 
 
+def _movement_type_is_consumption(value) -> bool:
+    return clean_input(value).lower() in SUPPLY_CONSUMPTION_MOVEMENT_TYPES
+
+
+def _report_label(row: pd.Series, code_col: str, name_col: str, fallback: str) -> str:
+    code = clean_input(row.get(code_col))
+    name = clean_input(row.get(name_col))
+    if code and name:
+        return f"{code} - {name}"
+    return name or code or fallback
+
+
+def _attachment_count_map(conn, *, entity_type: str, attachment_role: str) -> dict[int, int]:
+    rows = query_df(
+        conn,
+        """
+        SELECT entity_id, COUNT(*) AS attachment_count
+        FROM attachments
+        WHERE entity_type = ?
+          AND attachment_role = ?
+          AND COALESCE(is_active, 1) = 1
+        GROUP BY entity_id
+        """,
+        [entity_type, attachment_role],
+    )
+    if rows.empty:
+        return {}
+    return {
+        int(row["entity_id"]): int(row["attachment_count"] or 0)
+        for _, row in rows.iterrows()
+        if not is_blank(row.get("entity_id"))
+    }
+
+
+def _metadata_status_from_attachment(path_value, attachment_count, *, present_label: str, missing_label: str) -> str:
+    try:
+        count = int(attachment_count or 0)
+    except Exception:
+        count = 0
+    if count > 0:
+        return present_label
+    if not is_blank(path_value):
+        return "Anexo legado"
+    return missing_label
+
+
+def _enrich_supply_report_metadata(
+    conn,
+    supply_lots: pd.DataFrame,
+    supply_movements: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    lots = supply_lots.copy()
+    movements = supply_movements.copy()
+
+    certificate_counts = _attachment_count_map(
+        conn,
+        entity_type="supply_lot",
+        attachment_role="analysis_certificate",
+    )
+    movement_attachment_counts = _attachment_count_map(
+        conn,
+        entity_type="supply_movement",
+        attachment_role="movement_document",
+    )
+
+    if not lots.empty and "id" in lots.columns:
+        lots["certificate_attachment_count"] = lots["id"].map(
+            lambda value: certificate_counts.get(int(value), 0) if not is_blank(value) else 0
+        )
+        lots["certificate_status"] = lots.apply(
+            lambda row: _metadata_status_from_attachment(
+                row.get("certificate_path"),
+                row.get("certificate_attachment_count"),
+                present_label="Com certificado",
+                missing_label="Sem certificado",
+            ),
+            axis=1,
+        )
+
+    lot_certificate_status = {}
+    if not lots.empty and {"id", "certificate_status"}.issubset(lots.columns):
+        lot_certificate_status = {
+            int(row["id"]): clean_value(row.get("certificate_status"), "Sem certificado")
+            for _, row in lots.iterrows()
+            if not is_blank(row.get("id"))
+        }
+
+    if not movements.empty:
+        movements["project_label"] = movements.apply(
+            lambda row: _report_label(row, "project_code", "project_name", "Sem projeto"),
+            axis=1,
+        )
+        movements["service_label"] = movements.apply(
+            lambda row: _report_label(row, "service_code", "service_title", "Sem serviço/análise"),
+            axis=1,
+        )
+        movements["supply_lot_label"] = movements["supply_lot_code"].map(lambda value: clean_value(value, "Sem lote"))
+        movements["lot_supplier_name"] = movements.get("lot_supplier_name", pd.Series(index=movements.index)).map(clean_value)
+        movements["lot_location"] = movements.get("lot_location", pd.Series(index=movements.index)).map(clean_value)
+        movements["movement_attachment_count"] = movements["id"].map(
+            lambda value: movement_attachment_counts.get(int(value), 0) if not is_blank(value) else 0
+        )
+        movements["movement_document_status"] = movements.apply(
+            lambda row: _metadata_status_from_attachment(
+                row.get("document_path"),
+                row.get("movement_attachment_count"),
+                present_label="Com anexo",
+                missing_label="Sem anexo",
+            ),
+            axis=1,
+        )
+        movements["certificate_status"] = movements["supply_lot_id"].map(
+            lambda value: "Sem lote" if is_blank(value) else lot_certificate_status.get(int(value), "Sem certificado")
+        )
+
+    return lots, movements
+
+
+def _stock_minimum_alerts_df(supplies: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "alerta",
+        "supply_type",
+        "supply_name",
+        "supply_code",
+        "current_quantity",
+        "unit",
+        "minimum_quantity",
+        "quantity_to_minimum",
+        "location",
+        "responsible_name",
+        "category",
+    ]
+    if supplies.empty:
+        return pd.DataFrame(columns=columns)
+    out = supplies.copy()
+    if "active" in out.columns:
+        out = out[out["active"].map(lambda value: True if is_blank(value) else truthy(value))]
+    if out.empty:
+        return pd.DataFrame(columns=columns)
+    out["current_quantity"] = pd.to_numeric(out["current_quantity"], errors="coerce").fillna(0)
+    out["minimum_quantity"] = pd.to_numeric(out["minimum_quantity"], errors="coerce").fillna(0)
+    out["alerta"] = out.apply(_supply_alert_status, axis=1)
+    out = out[(out["minimum_quantity"] > 0) & (out["alerta"] == "Estoque baixo")].copy()
+    if out.empty:
+        return pd.DataFrame(columns=columns)
+    out["quantity_to_minimum"] = (out["minimum_quantity"] - out["current_quantity"]).clip(lower=0).round(4)
+    out = out.sort_values(["quantity_to_minimum", "supply_name"], ascending=[False, True])
+    return out[[c for c in columns if c in out.columns]]
+
+
+def _lot_validity_alerts_df(supply_lots: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "lot_status",
+        "supply_name",
+        "supply_code",
+        "lot_code",
+        "expiration_date",
+        "days_until_expiration",
+        "current_quantity",
+        "unit",
+        "supplier_name",
+        "location",
+        "certificate_status",
+        "is_active",
+    ]
+    if supply_lots.empty:
+        return pd.DataFrame(columns=columns)
+    out = supply_lots.copy()
+    if "is_active" in out.columns:
+        out = out[out["is_active"].map(lambda value: True if is_blank(value) else truthy(value))]
+    if out.empty:
+        return pd.DataFrame(columns=columns)
+    if "lot_status" not in out.columns:
+        out["lot_status"] = out["expiration_date"].map(_lot_expiration_status)
+    out["days_until_expiration"] = out["expiration_date"].map(_days_until_date)
+    out = out[out["lot_status"].isin(LOT_EXPIRATION_ALERT_STATUSES)].copy()
+    if out.empty:
+        return pd.DataFrame(columns=columns)
+    out = out.sort_values(["days_until_expiration", "supply_name", "lot_code"], ascending=[True, True, True])
+    return out[[c for c in columns if c in out.columns]]
+
+
+def _supply_consumption_detail_df(supply_movements: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "project_label",
+        "service_label",
+        "supply_name",
+        "supply_lot_label",
+        "unit",
+        "movement_count",
+        "consumed_quantity",
+    ]
+    if supply_movements.empty:
+        return pd.DataFrame(columns=columns)
+    consumed = supply_movements[supply_movements["movement_type"].map(_movement_type_is_consumption)].copy()
+    if consumed.empty:
+        return pd.DataFrame(columns=columns)
+    if "project_label" not in consumed.columns:
+        consumed["project_label"] = consumed.apply(lambda row: _report_label(row, "project_code", "project_name", "Sem projeto"), axis=1)
+    if "service_label" not in consumed.columns:
+        consumed["service_label"] = consumed.apply(lambda row: _report_label(row, "service_code", "service_title", "Sem serviço/análise"), axis=1)
+    if "supply_lot_label" not in consumed.columns:
+        consumed["supply_lot_label"] = consumed["supply_lot_code"].map(lambda value: clean_value(value, "Sem lote"))
+    consumed["quantity"] = pd.to_numeric(consumed["quantity"], errors="coerce").fillna(0)
+    grouped = (
+        consumed.groupby(["project_label", "service_label", "supply_name", "supply_lot_label", "unit"], dropna=False)
+        .agg(movement_count=("id", "count"), consumed_quantity=("quantity", "sum"))
+        .reset_index()
+    )
+    grouped["consumed_quantity"] = grouped["consumed_quantity"].round(4)
+    return grouped.sort_values(["project_label", "service_label", "supply_name", "supply_lot_label"])
+
+
+def _supply_traceability_df(supply_movements: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "id",
+        "supply_name",
+        "supply_lot_label",
+        "supply_lot_expiration_date",
+        "lot_supplier_name",
+        "lot_location",
+        "certificate_status",
+        "movement_type",
+        "movement_date",
+        "quantity",
+        "unit",
+        "responsavel",
+        "project_label",
+        "service_label",
+        "movement_document_status",
+        "purpose",
+        "created_at",
+    ]
+    if supply_movements.empty:
+        return pd.DataFrame(columns=columns)
+    out = supply_movements.copy()
+    if "project_label" not in out.columns:
+        out["project_label"] = out.apply(lambda row: _report_label(row, "project_code", "project_name", "Sem projeto"), axis=1)
+    if "service_label" not in out.columns:
+        out["service_label"] = out.apply(lambda row: _report_label(row, "service_code", "service_title", "Sem serviço/análise"), axis=1)
+    if "supply_lot_label" not in out.columns:
+        out["supply_lot_label"] = out["supply_lot_code"].map(lambda value: clean_value(value, "Sem lote"))
+    for col in ["lot_supplier_name", "lot_location", "responsavel"]:
+        if col in out.columns:
+            out[col] = out[col].map(clean_value)
+    if "certificate_status" not in out.columns:
+        out["certificate_status"] = out["supply_lot_label"].map(lambda value: "Sem lote" if value == "Sem lote" else "Sem certificado")
+    if "movement_document_status" not in out.columns:
+        out["movement_document_status"] = out["document_path"].map(lambda value: "Anexo legado" if not is_blank(value) else "Sem anexo")
+    out["quantity"] = pd.to_numeric(out["quantity"], errors="coerce").fillna(0)
+    out = out.sort_values(["supply_name", "supply_lot_label", "movement_date", "id"], ascending=[True, True, True, True])
+    return out[[c for c in columns if c in out.columns]]
+
+
 def _filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, pd.DataFrame]:
     bookings = query_df(
         conn,
@@ -4866,11 +5144,17 @@ def _filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, 
     supply_movements = query_df(
         conn,
         """
-        SELECT sm.id, s.supply_name, s.commercial_name, s.manufacturer, s.category,
+        SELECT sm.id, sm.supply_id, sm.supply_lot_id,
+               s.supply_type, s.supply_code, s.supply_name,
+               s.commercial_name, s.manufacturer, s.category,
                s.physical_state, sm.movement_type, sm.movement_date, sm.quantity,
                COALESCE(sm.unit, s.unit) AS unit,
                sl.lot_code AS supply_lot_code,
                sl.expiration_date AS supply_lot_expiration_date,
+               sl.supplier_name AS lot_supplier_name,
+               sl.location AS lot_location,
+               sl.certificate_path AS lot_certificate_path,
+               sl.is_active AS supply_lot_active,
                u.full_name AS responsavel,
                sm.project_id, p.project_code, p.project_name,
                sm.service_id, ps.service_code, ps.title AS service_title, ps.service_type,
@@ -4890,7 +5174,8 @@ def _filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, 
     supplies = query_df(
         conn,
         """
-        SELECT supply_name, commercial_name, manufacturer, category, physical_state,
+        SELECT id, supply_type, supply_code, commercial_name, manufacturer,
+               manufacturer_code, supply_name, category, physical_state,
                application_function, addition_mode, current_quantity, minimum_quantity,
                unit, lot, expiration_date, location, responsible_name, active,
                safety_doc_path, technical_doc_path, notes
@@ -4904,7 +5189,8 @@ def _filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, 
     supply_lots = query_df(
         conn,
         """
-        SELECT sl.id, s.supply_name, sl.lot_code, sl.expiration_date,
+        SELECT sl.id, sl.supply_id, s.supply_type, s.supply_code, s.supply_name,
+               sl.lot_code, sl.expiration_date,
                sl.received_date, sl.supplier_name, sl.initial_quantity,
                sl.current_quantity, sl.unit, sl.location, sl.certificate_path,
                sl.notes, sl.is_active, sl.created_at, sl.updated_at
@@ -4950,6 +5236,12 @@ def _filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, 
         [start_date.isoformat(), end_date.isoformat()],
     )
 
+    supply_lots, supply_movements = _enrich_supply_report_metadata(conn, supply_lots, supply_movements)
+    stock_alerts = _stock_minimum_alerts_df(supplies)
+    validity_alerts = _lot_validity_alerts_df(supply_lots)
+    consumption_detailed = _supply_consumption_detail_df(supply_movements)
+    traceability = _supply_traceability_df(supply_movements)
+
     return {
         "bookings": bookings,
         "preventive": preventive,
@@ -4957,6 +5249,10 @@ def _filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, 
         "supply_movements": supply_movements,
         "supplies": supplies,
         "supply_lots": supply_lots,
+        "stock_alerts": stock_alerts,
+        "validity_alerts": validity_alerts,
+        "consumption_detailed": consumption_detailed,
+        "traceability": traceability,
         "equipment": equipment,
         "services": services,
     }
@@ -4981,6 +5277,8 @@ def _report_summary(data: dict[str, pd.DataFrame]) -> pd.DataFrame:
     supply_movements = data["supply_movements"]
     supplies = data["supplies"]
     services = data.get("services", pd.DataFrame())
+    stock_alerts = data.get("stock_alerts", pd.DataFrame())
+    validity_alerts = data.get("validity_alerts", pd.DataFrame())
 
     total_bookings = len(bookings)
     completed = int((bookings["status"] == "done").sum()) if not bookings.empty else 0
@@ -4990,8 +5288,11 @@ def _report_summary(data: dict[str, pd.DataFrame]) -> pd.DataFrame:
     unique_equipment = int(bookings["equipment_code"].nunique()) if not bookings.empty else 0
     unique_users = int(bookings["solicitante"].nunique()) if not bookings.empty else 0
     downtime = float(corrective["downtime_hours"].fillna(0).sum()) if not corrective.empty and "downtime_hours" in corrective else 0.0
-    low_stock = int(supplies["alerta"].isin(["Estoque baixo", "Vencido", "Vence em até 60 dias"]).sum()) if not supplies.empty else 0
-    outputs = supply_movements[supply_movements["movement_type"].isin(["saída", "descarte", "ajuste negativo"])] if not supply_movements.empty else supply_movements
+    if stock_alerts.empty and validity_alerts.empty:
+        low_stock = int(supplies["alerta"].isin(["Estoque baixo", "Vencido", "Vence em até 60 dias"]).sum()) if not supplies.empty else 0
+    else:
+        low_stock = len(stock_alerts) + len(validity_alerts)
+    outputs = supply_movements[supply_movements["movement_type"].map(_movement_type_is_consumption)] if not supply_movements.empty else supply_movements
 
     rows = [
         ("Reservas registradas", total_bookings),
@@ -5039,6 +5340,10 @@ def _reports_excel_bytes(period_text: str, data: dict[str, pd.DataFrame]) -> byt
         "Movimentos insumos": _display_df(data["supply_movements"]),
         "Estoque atual": _display_df(data["supplies"]),
         "Estoque por lote": _display_df(data["supply_lots"]),
+        "Alertas estoque": _display_df(data.get("stock_alerts", pd.DataFrame())),
+        "Alertas validade": _display_df(data.get("validity_alerts", pd.DataFrame())),
+        "Consumo detalhado": _display_df(data.get("consumption_detailed", pd.DataFrame())),
+        "Rastreabilidade": _display_df(data.get("traceability", pd.DataFrame())),
         "Equipamentos": _display_df(data["equipment"]),
     }
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -5057,8 +5362,8 @@ def _reports_excel_bytes(period_text: str, data: dict[str, pd.DataFrame]) -> byt
     return output.getvalue()
 
 
-def _download_table_button(df: pd.DataFrame, file_name: str, label: str) -> None:
-    if df.empty:
+def _download_table_button(df: pd.DataFrame, file_name: str, label: str, *, allow_empty: bool = False) -> None:
+    if df.empty and not allow_empty:
         st.caption("Sem dados para exportar nesta tabela.")
         return
     st.download_button(
@@ -5122,6 +5427,10 @@ def page_relatorios(conn):
     supply_movements = data["supply_movements"]
     supplies = data["supplies"]
     supply_lots = data["supply_lots"]
+    stock_alerts = data["stock_alerts"]
+    validity_alerts = data["validity_alerts"]
+    consumption_detailed = data["consumption_detailed"]
+    traceability = data["traceability"]
     services = data["services"]
     summary = _report_summary(data)
 
@@ -5168,7 +5477,7 @@ def page_relatorios(conn):
                     <b>Responsável/executante mais frequente:</b> {top_user}<br>
                     <b>Serviços/análises em andamento:</b> {open_services}<br>
                     <b>Registros de manutenção:</b> {len(preventive) + len(corrective)}<br>
-                    <b>Insumos em alerta:</b> {int(supplies["alerta"].isin(["Estoque baixo", "Vencido", "Vence em até 60 dias"]).sum()) if not supplies.empty else 0}
+                    <b>Insumos/lotes em alerta:</b> {len(stock_alerts) + len(validity_alerts)}
                     </div>
                     """,
                     unsafe_allow_html=True,
@@ -5255,7 +5564,7 @@ def page_relatorios(conn):
         c3, c4 = st.columns(2)
         with c3:
             st.markdown("### Consumo por projeto")
-            consumed = supply_movements[supply_movements["movement_type"].isin(["saída", "descarte", "ajuste negativo"])].copy() if not supply_movements.empty else supply_movements
+            consumed = supply_movements[supply_movements["movement_type"].map(_movement_type_is_consumption)].copy() if not supply_movements.empty else supply_movements
             if consumed.empty:
                 st.info("Sem consumo de insumos no período.")
             else:
@@ -5271,7 +5580,7 @@ def page_relatorios(conn):
                 st.info("Sem consumo vinculado a serviços/análises no período.")
             else:
                 consumed_by_service = supply_movements[
-                    supply_movements["movement_type"].isin(["saída", "descarte", "ajuste negativo"])
+                    supply_movements["movement_type"].map(_movement_type_is_consumption)
                     & supply_movements["service_title"].notna()
                 ].copy()
                 if consumed_by_service.empty:
@@ -5330,24 +5639,78 @@ def page_relatorios(conn):
                 fig.update_layout(height=330, margin=dict(l=20, r=20, t=20, b=20), showlegend=False, xaxis_title="Tipo", yaxis_title="Movimentações")
                 st.plotly_chart(fig, use_container_width=True)
         with c2:
-            st.markdown("### Alertas de estoque")
-            if supplies.empty:
-                st.info("Nenhum insumo cadastrado.")
+            st.markdown("### Alertas de estoque mínimo")
+            if stock_alerts.empty:
+                st.success("Sem itens ativos abaixo do estoque mínimo.")
+                _download_table_button(
+                    _display_df(stock_alerts),
+                    f"LabCim_alertas_estoque_minimo_{start_date.isoformat()}_{end_date.isoformat()}.csv",
+                    "Baixar alertas de estoque em CSV",
+                    allow_empty=True,
+                )
             else:
-                alert_df = supplies[supplies["alerta"].isin(["Estoque baixo", "Vencido", "Vence em até 60 dias"])]
-                if alert_df.empty:
-                    st.success("Sem alertas críticos de estoque/validade no momento.")
-                else:
-                    st.dataframe(_display_df(alert_df[["alerta", "supply_name", "current_quantity", "unit", "minimum_quantity", "expiration_date", "location", "responsible_name"]]), use_container_width=True, hide_index=True)
+                st.dataframe(_display_df(stock_alerts), use_container_width=True, hide_index=True)
+                _download_table_button(
+                    _display_df(stock_alerts),
+                    f"LabCim_alertas_estoque_minimo_{start_date.isoformat()}_{end_date.isoformat()}.csv",
+                    "Baixar alertas de estoque em CSV",
+                    allow_empty=True,
+                )
 
-        if not supply_movements.empty:
-            st.markdown("### Consumo/saídas por insumo")
-            consumed = supply_movements[supply_movements["movement_type"].isin(["saída", "descarte", "ajuste negativo"])].copy()
-            if consumed.empty:
-                st.info("Não houve saídas, descartes ou ajustes negativos no período.")
-            else:
-                consumed_summary = consumed.groupby(["supply_name", "unit"], dropna=False)["quantity"].sum().reset_index().sort_values("quantity", ascending=False)
-                st.dataframe(consumed_summary.rename(columns={"supply_name": "Insumo", "unit": "Unidade", "quantity": "Quantidade"}), use_container_width=True, hide_index=True)
+        st.markdown("### Alertas de validade por lote")
+        if validity_alerts.empty:
+            st.success("Sem lotes ativos vencidos ou próximos do vencimento.")
+            _download_table_button(
+                _display_df(validity_alerts),
+                f"LabCim_alertas_validade_lotes_{start_date.isoformat()}_{end_date.isoformat()}.csv",
+                "Baixar alertas de validade em CSV",
+                allow_empty=True,
+            )
+        else:
+            st.dataframe(_display_df(validity_alerts), use_container_width=True, hide_index=True)
+            _download_table_button(
+                _display_df(validity_alerts),
+                f"LabCim_alertas_validade_lotes_{start_date.isoformat()}_{end_date.isoformat()}.csv",
+                "Baixar alertas de validade em CSV",
+                allow_empty=True,
+            )
+
+        st.markdown("### Consumo detalhado por projeto, serviço, insumo e lote")
+        if consumption_detailed.empty:
+            st.info("Não houve saídas, descartes ou ajustes negativos no período.")
+            _download_table_button(
+                _display_df(consumption_detailed),
+                f"LabCim_consumo_detalhado_{start_date.isoformat()}_{end_date.isoformat()}.csv",
+                "Baixar consumo detalhado em CSV",
+                allow_empty=True,
+            )
+        else:
+            st.dataframe(_display_df(consumption_detailed), use_container_width=True, hide_index=True)
+            _download_table_button(
+                _display_df(consumption_detailed),
+                f"LabCim_consumo_detalhado_{start_date.isoformat()}_{end_date.isoformat()}.csv",
+                "Baixar consumo detalhado em CSV",
+                allow_empty=True,
+            )
+
+        st.markdown("### Rastreabilidade de insumos e lotes")
+        st.caption(f"Consulta limitada ao período selecionado: {period_text}. Movimentações sem lote continuam listadas como Sem lote.")
+        if traceability.empty:
+            st.info("Sem movimentações de insumos no período selecionado.")
+            _download_table_button(
+                _display_df(traceability),
+                f"LabCim_rastreabilidade_insumos_lotes_{start_date.isoformat()}_{end_date.isoformat()}.csv",
+                "Baixar rastreabilidade em CSV",
+                allow_empty=True,
+            )
+        else:
+            st.dataframe(_display_df(traceability), use_container_width=True, hide_index=True)
+            _download_table_button(
+                _display_df(traceability),
+                f"LabCim_rastreabilidade_insumos_lotes_{start_date.isoformat()}_{end_date.isoformat()}.csv",
+                "Baixar rastreabilidade em CSV",
+                allow_empty=True,
+            )
 
         st.markdown("### Estoque atual por lote")
         active_lots = supply_lots[supply_lots["is_active"].fillna(1).astype(int) == 1].copy() if not supply_lots.empty else supply_lots
@@ -5377,7 +5740,20 @@ def page_relatorios(conn):
         st.markdown("### Tabelas auditáveis")
         table_choice = st.selectbox(
             "Tabela",
-            ["Reservas", "Serviços/análises", "Preventivas/calibrações", "Corretivas", "Movimentações de insumos", "Estoque atual", "Estoque por lote", "Equipamentos"],
+            [
+                "Reservas",
+                "Serviços/análises",
+                "Preventivas/calibrações",
+                "Corretivas",
+                "Movimentações de insumos",
+                "Estoque atual",
+                "Estoque por lote",
+                "Alertas estoque",
+                "Alertas validade",
+                "Consumo detalhado",
+                "Rastreabilidade",
+                "Equipamentos",
+            ],
             key="report_table_choice",
         )
         table_map = {
@@ -5388,6 +5764,10 @@ def page_relatorios(conn):
             "Movimentações de insumos": supply_movements,
             "Estoque atual": supplies,
             "Estoque por lote": supply_lots,
+            "Alertas estoque": stock_alerts,
+            "Alertas validade": validity_alerts,
+            "Consumo detalhado": consumption_detailed,
+            "Rastreabilidade": traceability,
             "Equipamentos": data["equipment"],
         }
         selected_df = table_map[table_choice]
