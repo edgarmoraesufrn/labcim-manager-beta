@@ -96,6 +96,18 @@ CACHE_TTL_SECONDS = 120
 DB_CONNECTION_KEY = "labcim_db_connection"
 DB_CONNECTION_FINGERPRINT_KEY = "labcim_db_connection_fingerprint"
 PERF_EVENTS_KEY = "labcim_perf_events"
+REPORT_CACHE_TABLES = (
+    "bookings",
+    "maintenance_preventive",
+    "maintenance_corrective",
+    "supplies",
+    "supply_lots",
+    "supply_movements",
+    "projects",
+    "project_services",
+    "equipment",
+    "attachments",
+)
 
 LAB_BLUE = "#0033A0"
 LAB_CYAN = "#00AEEF"
@@ -2928,15 +2940,18 @@ def render_attachment_list(
     key_prefix: str,
     title: str | None = "Anexos cadastrados",
     empty_message: str = "Nenhum anexo cadastrado.",
+    attachment_rows: list | None = None,
 ) -> None:
     if title:
         st.markdown(f"##### {title}")
-    rows = list_attachments(
-        conn,
-        entity_type=entity_type,
-        entity_id=int(entity_id),
-        attachment_role=attachment_role,
-    )
+    rows = attachment_rows
+    if rows is None:
+        rows = list_attachments(
+            conn,
+            entity_type=entity_type,
+            entity_id=int(entity_id),
+            attachment_role=attachment_role,
+        )
     rendered = False
     for row in rows:
         rendered = True
@@ -3893,28 +3908,31 @@ def page_insumos(conn):
         else:
             st.dataframe(_display_df(hist), use_container_width=True, hide_index=True)
             st.markdown("#### Anexos cadastrados")
+            movement_attachments = _attachment_rows_by_entity(
+                conn,
+                entity_type="supply_movement",
+                attachment_role="movement_document",
+                entity_ids=[int(value) for value in hist["id"].tolist() if not is_blank(value)],
+            )
             shown_movements = 0
             for _, movement in hist.iterrows():
-                attachment_rows = list_attachments(
-                    conn,
-                    entity_type="supply_movement",
-                    entity_id=int(movement["id"]),
-                    attachment_role="movement_document",
-                )
+                movement_id = int(movement["id"])
+                attachment_rows = movement_attachments.get(movement_id, [])
                 legacy_path = movement.get("document_path")
                 if not attachment_rows and is_blank(legacy_path):
                     continue
                 shown_movements += 1
-                with st.expander(f"Movimentação #{int(movement['id'])} · {clean_value(movement.get('supply_name'))}", expanded=False):
+                with st.expander(f"Movimentação #{movement_id} · {clean_value(movement.get('supply_name'))}", expanded=False):
                     render_attachment_list(
                         conn,
                         entity_type="supply_movement",
-                        entity_id=int(movement["id"]),
+                        entity_id=movement_id,
                         attachment_role="movement_document",
                         legacy_path=legacy_path,
-                        key_prefix=f"supply_movement_{int(movement['id'])}",
+                        key_prefix=f"supply_movement_{movement_id}",
                         title="Documento/anexo",
                         empty_message="Nenhum documento/anexo cadastrado.",
+                        attachment_rows=attachment_rows,
                     )
             if shown_movements == 0:
                 st.caption("Nenhum anexo cadastrado.")
@@ -4864,6 +4882,41 @@ def _attachment_count_map(conn, *, entity_type: str, attachment_role: str) -> di
     }
 
 
+def _attachment_rows_by_entity(
+    conn,
+    *,
+    entity_type: str,
+    attachment_role: str,
+    entity_ids: list[int] | tuple[int, ...] | set[int],
+) -> dict[int, list[dict]]:
+    ids = sorted({int(entity_id) for entity_id in entity_ids if not is_blank(entity_id)})
+    if not ids:
+        return {}
+    attachment_rows: list[dict] = []
+    for offset in range(0, len(ids), 800):
+        id_chunk = ids[offset : offset + 800]
+        placeholders = ", ".join(["?"] * len(id_chunk))
+        rows = query_df(
+            conn,
+            f"""
+            SELECT *
+            FROM attachments
+            WHERE entity_type = ?
+              AND attachment_role = ?
+              AND COALESCE(is_active, 1) = 1
+              AND entity_id IN ({placeholders})
+            ORDER BY entity_id, uploaded_at DESC, id DESC
+            """,
+            [entity_type, attachment_role, *id_chunk],
+        )
+        if not rows.empty:
+            attachment_rows.extend(rows.to_dict("records"))
+    grouped: dict[int, list[dict]] = {}
+    for row in attachment_rows:
+        grouped.setdefault(int(row["entity_id"]), []).append(row)
+    return grouped
+
+
 def _metadata_status_from_attachment(path_value, attachment_count, *, present_label: str, missing_label: str) -> str:
     try:
         count = int(attachment_count or 0)
@@ -5263,6 +5316,46 @@ def _filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, 
     }
 
 
+def _reports_data_fingerprint(conn) -> str:
+    counts = cached_table_counts(conn)
+    relevant_counts = tuple(
+        (table_name, int(counts.get(table_name, 0) or 0))
+        for table_name in REPORT_CACHE_TABLES
+    )
+    return hashlib.sha256(repr(relevant_counts).encode("utf-8")).hexdigest()[:16]
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def _cached_filtered_reports_data(
+    database_fingerprint: str,
+    start_iso: str,
+    end_iso: str,
+    data_fingerprint: str,
+    _database_url_value: str | None = None,
+) -> dict[str, pd.DataFrame]:
+    conn = connect(DB_PATH, database_url=_database_url_value)
+    try:
+        return _filtered_reports_data(
+            conn,
+            date.fromisoformat(start_iso),
+            date.fromisoformat(end_iso),
+        )
+    finally:
+        conn.close()
+
+
+def filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, pd.DataFrame]:
+    database_url = _database_url()
+    with perf_timer("Dados de relatórios"):
+        return _cached_filtered_reports_data(
+            _database_fingerprint(database_url),
+            start_date.isoformat(),
+            end_date.isoformat(),
+            _reports_data_fingerprint(conn),
+            _database_url_value=database_url,
+        )
+
+
 def _with_booking_duration(bookings: pd.DataFrame) -> pd.DataFrame:
     out = bookings.copy()
     if out.empty:
@@ -5425,7 +5518,7 @@ def page_relatorios(conn):
             return
 
     period_text = _period_label(start_date, end_date)
-    data = _filtered_reports_data(conn, start_date, end_date)
+    data = filtered_reports_data(conn, start_date, end_date)
     bookings = _with_booking_duration(data["bookings"])
     preventive = data["preventive"]
     corrective = data["corrective"]
@@ -5812,6 +5905,40 @@ def _make_qr_png(url: str) -> bytes:
     return buf.getvalue()
 
 
+def _qr_dataframe_signature(df: pd.DataFrame, base_url: str, columns: list[str]) -> str:
+    available_columns = [column for column in columns if column in df.columns]
+    if df.empty or not available_columns:
+        payload = ""
+    else:
+        payload = df[available_columns].fillna("").astype(str).to_csv(index=False)
+    return hashlib.sha256(f"{base_url}\0{payload}".encode("utf-8")).hexdigest()[:16]
+
+
+def _equipment_qr_zip_bytes(equipment: pd.DataFrame, base_url: str) -> bytes:
+    zip_buf = BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for _, row in equipment.iterrows():
+            code = row["equipment_code"]
+            suffixes = ["reserva", "manutencao"]
+            if not is_blank(row.get("pop_path")):
+                suffixes.append("pop")
+            for suffix in suffixes:
+                url = f"{base_url}?eq={code}&view={suffix}"
+                zf.writestr(f"equipamentos/{code}_{suffix}.png", _make_qr_png(url))
+    return zip_buf.getvalue()
+
+
+def _supply_qr_zip_bytes(supplies: pd.DataFrame, base_url: str) -> bytes:
+    zip_buf = BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for _, row in supplies.iterrows():
+            supply_id = int(row["id"])
+            safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", clean_value(row.get("supply_name")))
+            url = f"{base_url}?view=insumo&sid={supply_id}"
+            zf.writestr(f"insumos/INSUMO_{supply_id}_{safe_name}.png", _make_qr_png(url))
+    return zip_buf.getvalue()
+
+
 def page_qrcodes(conn):
     hero()
     st.subheader("QR Codes físicos")
@@ -5867,23 +5994,20 @@ def page_qrcodes(conn):
 
             st.markdown("### Baixar todos os QR Codes de equipamentos")
             st.caption("Gera um pacote ZIP com QR Codes de reserva, manutenção e POP quando houver documentação cadastrada.")
-            zip_buf = BytesIO()
-            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                for _, r in equipment.iterrows():
-                    code = r["equipment_code"]
-                    suffixes = ["reserva", "manutencao"]
-                    if not is_blank(r.get("pop_path")):
-                        suffixes.append("pop")
-                    for suffix in suffixes:
-                        url = f"{base_url}?eq={code}&view={suffix}"
-                        zf.writestr(f"equipamentos/{code}_{suffix}.png", _make_qr_png(url))
-            st.download_button(
-                "Baixar ZIP - QR Codes de equipamentos",
-                data=zip_buf.getvalue(),
-                file_name="LabCim_QRCodes_Equipamentos.zip",
-                mime="application/zip",
-                key="download_all_equipment_qr",
-            )
+            equipment_zip_signature = _qr_dataframe_signature(equipment, base_url, ["equipment_code", "pop_path"])
+            if st.button("Preparar ZIP - QR Codes de equipamentos", key="prepare_all_equipment_qr"):
+                st.session_state["equipment_qr_zip_bytes"] = _equipment_qr_zip_bytes(equipment, base_url)
+                st.session_state["equipment_qr_zip_signature"] = equipment_zip_signature
+            if st.session_state.get("equipment_qr_zip_signature") == equipment_zip_signature:
+                st.download_button(
+                    "Baixar ZIP - QR Codes de equipamentos",
+                    data=st.session_state["equipment_qr_zip_bytes"],
+                    file_name="LabCim_QRCodes_Equipamentos.zip",
+                    mime="application/zip",
+                    key="download_all_equipment_qr",
+                )
+            else:
+                st.caption("Prepare o ZIP para habilitar o download do pacote completo.")
 
     with tab_sup:
         st.markdown("### QR Codes por insumo")
@@ -5913,20 +6037,20 @@ def page_qrcodes(conn):
                 st.code(url)
 
             st.markdown("### Baixar todos os QR Codes de insumos")
-            zip_buf = BytesIO()
-            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                for _, r in supplies.iterrows():
-                    sid = int(r["id"])
-                    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", clean_value(r.get("supply_name")))
-                    url = f"{base_url}?view=insumo&sid={sid}"
-                    zf.writestr(f"insumos/INSUMO_{sid}_{safe_name}.png", _make_qr_png(url))
-            st.download_button(
-                "Baixar ZIP - QR Codes de insumos",
-                data=zip_buf.getvalue(),
-                file_name="LabCim_QRCodes_Insumos.zip",
-                mime="application/zip",
-                key="download_all_supply_qr",
-            )
+            supply_zip_signature = _qr_dataframe_signature(supplies, base_url, ["id", "supply_name"])
+            if st.button("Preparar ZIP - QR Codes de insumos", key="prepare_all_supply_qr"):
+                st.session_state["supply_qr_zip_bytes"] = _supply_qr_zip_bytes(supplies, base_url)
+                st.session_state["supply_qr_zip_signature"] = supply_zip_signature
+            if st.session_state.get("supply_qr_zip_signature") == supply_zip_signature:
+                st.download_button(
+                    "Baixar ZIP - QR Codes de insumos",
+                    data=st.session_state["supply_qr_zip_bytes"],
+                    file_name="LabCim_QRCodes_Insumos.zip",
+                    mime="application/zip",
+                    key="download_all_supply_qr",
+                )
+            else:
+                st.caption("Prepare o ZIP para habilitar o download do pacote completo.")
 
 
 def page_importar(conn):
