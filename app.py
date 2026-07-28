@@ -5628,8 +5628,68 @@ def page_relatorios(conn):
             st.dataframe(corr_eq.rename(columns={"equipment_code": "Código", "equipment_name": "Equipamento", "tickets": "Tickets", "downtime_h": "Downtime (h)"}), use_container_width=True, hide_index=True)
 
     with tab_supplies:
-        c1, c2 = st.columns(2)
-        with c1:
+        validity_display_cols = [
+            "lot_status",
+            "supply_name",
+            "supply_code",
+            "lot_code",
+            "expiration_date",
+            "days_until_expiration",
+            "current_quantity",
+            "unit",
+            "supplier_name",
+            "location",
+            "certificate_status",
+        ]
+        validity_display = validity_alerts[[c for c in validity_display_cols if c in validity_alerts.columns]].copy()
+        traceability_display_cols = [
+            "supply_name",
+            "supply_lot_label",
+            "supply_lot_expiration_date",
+            "lot_supplier_name",
+            "lot_location",
+            "certificate_status",
+            "movement_type",
+            "movement_date",
+            "quantity",
+            "unit",
+            "responsavel",
+            "project_label",
+            "service_label",
+            "movement_document_status",
+            "purpose",
+        ]
+        traceability_display = traceability[[c for c in traceability_display_cols if c in traceability.columns]].copy()
+
+        with st.expander("Alertas operacionais", expanded=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("### Alertas de estoque mínimo")
+                if stock_alerts.empty:
+                    st.success("Sem itens ativos abaixo do estoque mínimo.")
+                else:
+                    st.dataframe(_display_df(stock_alerts), use_container_width=True, hide_index=True)
+                _download_table_button(
+                    _display_df(stock_alerts),
+                    f"LabCim_alertas_estoque_minimo_{start_date.isoformat()}_{end_date.isoformat()}.csv",
+                    "Baixar alertas de estoque em CSV",
+                    allow_empty=True,
+                )
+            with c2:
+                st.markdown("### Alertas de validade por lote")
+                st.caption("Critério: lotes vencidos ou com vencimento em até 60 dias.")
+                if validity_alerts.empty:
+                    st.success("Sem lotes ativos vencidos ou próximos do vencimento.")
+                else:
+                    st.dataframe(_display_df(validity_display), use_container_width=True, hide_index=True)
+                _download_table_button(
+                    _display_df(validity_alerts),
+                    f"LabCim_alertas_validade_lotes_{start_date.isoformat()}_{end_date.isoformat()}.csv",
+                    "Baixar alertas de validade em CSV",
+                    allow_empty=True,
+                )
+
+        with st.expander("Consumo", expanded=True):
             st.markdown("### Movimentações por tipo")
             if supply_movements.empty:
                 st.info("Sem movimentações de insumos no período.")
@@ -5638,73 +5698,32 @@ def page_relatorios(conn):
                 fig = px.bar(move_type, x="movement_type", y="total", color="movement_type", color_discrete_sequence=[LAB_BLUE, LAB_CYAN, "#F97316", "#94A3B8"])
                 fig.update_layout(height=330, margin=dict(l=20, r=20, t=20, b=20), showlegend=False, xaxis_title="Tipo", yaxis_title="Movimentações")
                 st.plotly_chart(fig, use_container_width=True)
-        with c2:
-            st.markdown("### Alertas de estoque mínimo")
-            if stock_alerts.empty:
-                st.success("Sem itens ativos abaixo do estoque mínimo.")
-                _download_table_button(
-                    _display_df(stock_alerts),
-                    f"LabCim_alertas_estoque_minimo_{start_date.isoformat()}_{end_date.isoformat()}.csv",
-                    "Baixar alertas de estoque em CSV",
-                    allow_empty=True,
-                )
+
+            st.markdown("### Consumo detalhado por projeto, serviço, insumo e lote")
+            if consumption_detailed.empty:
+                st.info("Não houve saídas, descartes ou ajustes negativos no período.")
             else:
-                st.dataframe(_display_df(stock_alerts), use_container_width=True, hide_index=True)
-                _download_table_button(
-                    _display_df(stock_alerts),
-                    f"LabCim_alertas_estoque_minimo_{start_date.isoformat()}_{end_date.isoformat()}.csv",
-                    "Baixar alertas de estoque em CSV",
-                    allow_empty=True,
+                st.dataframe(_display_df(consumption_detailed), use_container_width=True, hide_index=True)
+            _download_table_button(
+                _display_df(consumption_detailed),
+                f"LabCim_consumo_detalhado_{start_date.isoformat()}_{end_date.isoformat()}.csv",
+                "Baixar consumo detalhado em CSV",
+                allow_empty=True,
+            )
+
+        with st.expander("Rastreabilidade", expanded=False):
+            st.markdown("### Rastreabilidade de insumos e lotes")
+            st.caption(
+                "Movimentações sem lote aparecem como 'Sem lote'. "
+                "Isso pode representar registros antigos ou movimentações feitas sem rastreio por lote."
+            )
+            if traceability.empty:
+                st.info("Sem movimentações de insumos no período selecionado.")
+            else:
+                traceability_screen = _display_df(traceability_display).rename(
+                    columns={"Documento/anexo da movimentação": "Anexo da movimentação"}
                 )
-
-        st.markdown("### Alertas de validade por lote")
-        if validity_alerts.empty:
-            st.success("Sem lotes ativos vencidos ou próximos do vencimento.")
-            _download_table_button(
-                _display_df(validity_alerts),
-                f"LabCim_alertas_validade_lotes_{start_date.isoformat()}_{end_date.isoformat()}.csv",
-                "Baixar alertas de validade em CSV",
-                allow_empty=True,
-            )
-        else:
-            st.dataframe(_display_df(validity_alerts), use_container_width=True, hide_index=True)
-            _download_table_button(
-                _display_df(validity_alerts),
-                f"LabCim_alertas_validade_lotes_{start_date.isoformat()}_{end_date.isoformat()}.csv",
-                "Baixar alertas de validade em CSV",
-                allow_empty=True,
-            )
-
-        st.markdown("### Consumo detalhado por projeto, serviço, insumo e lote")
-        if consumption_detailed.empty:
-            st.info("Não houve saídas, descartes ou ajustes negativos no período.")
-            _download_table_button(
-                _display_df(consumption_detailed),
-                f"LabCim_consumo_detalhado_{start_date.isoformat()}_{end_date.isoformat()}.csv",
-                "Baixar consumo detalhado em CSV",
-                allow_empty=True,
-            )
-        else:
-            st.dataframe(_display_df(consumption_detailed), use_container_width=True, hide_index=True)
-            _download_table_button(
-                _display_df(consumption_detailed),
-                f"LabCim_consumo_detalhado_{start_date.isoformat()}_{end_date.isoformat()}.csv",
-                "Baixar consumo detalhado em CSV",
-                allow_empty=True,
-            )
-
-        st.markdown("### Rastreabilidade de insumos e lotes")
-        st.caption(f"Consulta limitada ao período selecionado: {period_text}. Movimentações sem lote continuam listadas como Sem lote.")
-        if traceability.empty:
-            st.info("Sem movimentações de insumos no período selecionado.")
-            _download_table_button(
-                _display_df(traceability),
-                f"LabCim_rastreabilidade_insumos_lotes_{start_date.isoformat()}_{end_date.isoformat()}.csv",
-                "Baixar rastreabilidade em CSV",
-                allow_empty=True,
-            )
-        else:
-            st.dataframe(_display_df(traceability), use_container_width=True, hide_index=True)
+                st.dataframe(traceability_screen, use_container_width=True, hide_index=True)
             _download_table_button(
                 _display_df(traceability),
                 f"LabCim_rastreabilidade_insumos_lotes_{start_date.isoformat()}_{end_date.isoformat()}.csv",
@@ -5712,29 +5731,31 @@ def page_relatorios(conn):
                 allow_empty=True,
             )
 
-        st.markdown("### Estoque atual por lote")
-        active_lots = supply_lots[supply_lots["is_active"].fillna(1).astype(int) == 1].copy() if not supply_lots.empty else supply_lots
-        if active_lots.empty:
-            st.info("Nenhum lote ativo cadastrado.")
-        else:
-            st.dataframe(_display_df(active_lots), use_container_width=True, hide_index=True)
+        with st.expander("Estoque por lote", expanded=False):
+            st.markdown("### Estoque atual por lote")
+            st.caption("A validade do item é um campo legado. Para rastreabilidade operacional, priorize a validade do lote.")
+            active_lots = supply_lots[supply_lots["is_active"].fillna(1).astype(int) == 1].copy() if not supply_lots.empty else supply_lots
+            if active_lots.empty:
+                st.info("Nenhum lote ativo cadastrado.")
+            else:
+                st.dataframe(_display_df(active_lots), use_container_width=True, hide_index=True)
 
-        if not active_lots.empty:
-            c3, c4 = st.columns(2)
-            with c3:
-                st.markdown("### Lotes vencidos")
-                expired_lots = active_lots[active_lots["lot_status"] == "Vencido"].copy()
-                if expired_lots.empty:
-                    st.success("Sem lotes vencidos.")
-                else:
-                    st.dataframe(_display_df(expired_lots), use_container_width=True, hide_index=True)
-            with c4:
-                st.markdown("### Lotes próximos do vencimento")
-                near_lots = active_lots[active_lots["lot_status"] == "Vence em até 60 dias"].copy()
-                if near_lots.empty:
-                    st.success("Sem lotes próximos do vencimento.")
-                else:
-                    st.dataframe(_display_df(near_lots), use_container_width=True, hide_index=True)
+            if not active_lots.empty:
+                c3, c4 = st.columns(2)
+                with c3:
+                    st.markdown("### Lotes vencidos")
+                    expired_lots = active_lots[active_lots["lot_status"] == "Vencido"].copy()
+                    if expired_lots.empty:
+                        st.success("Sem lotes vencidos.")
+                    else:
+                        st.dataframe(_display_df(expired_lots), use_container_width=True, hide_index=True)
+                with c4:
+                    st.markdown("### Lotes próximos do vencimento")
+                    near_lots = active_lots[active_lots["lot_status"] == "Vence em até 60 dias"].copy()
+                    if near_lots.empty:
+                        st.success("Sem lotes próximos do vencimento.")
+                    else:
+                        st.dataframe(_display_df(near_lots), use_container_width=True, hide_index=True)
 
     with tab_tables:
         st.markdown("### Tabelas auditáveis")
