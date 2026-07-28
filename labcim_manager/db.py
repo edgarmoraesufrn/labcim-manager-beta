@@ -389,9 +389,6 @@ def init_db(conn: DatabaseConnection) -> None:
             FOREIGN KEY(service_id) REFERENCES project_services(id)
         );
 
-        CREATE INDEX IF NOT EXISTS idx_supply_movements_lot
-            ON supply_movements (supply_lot_id);
-
         CREATE INDEX IF NOT EXISTS idx_supply_movements_supply_date
             ON supply_movements (supply_id, movement_date);
 
