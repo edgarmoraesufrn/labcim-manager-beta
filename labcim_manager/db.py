@@ -2983,6 +2983,7 @@ def create_supply_movement(
     row = conn.execute("SELECT * FROM supplies WHERE id = ?", [supply_id]).fetchone()
     if not row:
         return False, "Insumo não encontrado.", None
+    quantity = float(quantity)
     if quantity <= 0:
         return False, "A quantidade precisa ser maior que zero.", None
 
@@ -3002,9 +3003,7 @@ def create_supply_movement(
         if int(lot_row["is_active"] if lot_row["is_active"] is not None else 1) != 1:
             return False, "Lote inativo não pode receber nova movimentação operacional.", None
 
-    movement_type = movement_type.lower()
-    current = float(row["current_quantity"] or 0)
-    lot_current = float(lot_row["current_quantity"] or 0) if lot_row else None
+    movement_type = str(movement_type or "").strip().lower()
     delta_map = {
         "entrada": quantity,
         "saída": -quantity,
@@ -3015,15 +3014,7 @@ def create_supply_movement(
     }
     if movement_type not in delta_map:
         return False, "Tipo de movimentação inválido.", None
-    new_quantity = current + delta_map[movement_type]
-    if lot_row is not None:
-        new_lot_quantity = float(lot_current or 0) + delta_map[movement_type]
-        if new_lot_quantity < -1e-9:
-            return False, f"Saldo insuficiente no lote. Saldo atual do lote: {float(lot_current or 0):g} {lot_row['unit'] or row['unit'] or ''}.", None
-    else:
-        new_lot_quantity = None
-    if new_quantity < -1e-9:
-        return False, f"Saldo insuficiente. Saldo atual: {current:g} {row['unit'] or ''}.", None
+    delta = delta_map[movement_type]
     ok, msg, project_id, service_id = _normalize_project_service_ids(
         conn,
         project_id=project_id,
@@ -3032,37 +3023,99 @@ def create_supply_movement(
     if not ok:
         return False, msg or "Serviço/análise incompatível com o projeto.", None
 
-    movement_id = _execute_insert_returning_id(
-        conn,
-        """
-        INSERT INTO supply_movements (
-            supply_id, supply_lot_id, movement_type, movement_date, quantity, unit,
-            user_id, project_id, service_id, purpose, document_path
+    try:
+        if delta < 0:
+            supply_update = conn.execute(
+                """
+                UPDATE supplies
+                SET current_quantity = COALESCE(current_quantity, 0) + ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                  AND COALESCE(current_quantity, 0) + ? >= -0.000000001
+                """,
+                [delta, supply_id, delta],
+            )
+            if (supply_update.rowcount or 0) == 0:
+                conn.rollback()
+                return False, f"Saldo insuficiente. Saldo atual menor que {quantity:g} {row['unit'] or ''}.", None
+        else:
+            supply_update = conn.execute(
+                """
+                UPDATE supplies
+                SET current_quantity = COALESCE(current_quantity, 0) + ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                [delta, supply_id],
+            )
+            if (supply_update.rowcount or 0) == 0:
+                conn.rollback()
+                return False, "Insumo não encontrado.", None
+
+        if lot_row is not None:
+            if delta < 0:
+                lot_update = conn.execute(
+                    """
+                    UPDATE supply_lots
+                    SET current_quantity = COALESCE(current_quantity, 0) + ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                      AND supply_id = ?
+                      AND COALESCE(is_active, 1) = 1
+                      AND COALESCE(current_quantity, 0) + ? >= -0.000000001
+                    """,
+                    [delta, supply_lot_id, supply_id, delta],
+                )
+                if (lot_update.rowcount or 0) == 0:
+                    conn.rollback()
+                    return False, f"Saldo insuficiente no lote. Saldo atual do lote menor que {quantity:g} {lot_row['unit'] or row['unit'] or ''}.", None
+            else:
+                lot_update = conn.execute(
+                    """
+                    UPDATE supply_lots
+                    SET current_quantity = COALESCE(current_quantity, 0) + ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                      AND supply_id = ?
+                      AND COALESCE(is_active, 1) = 1
+                    """,
+                    [delta, supply_lot_id, supply_id],
+                )
+                if (lot_update.rowcount or 0) == 0:
+                    conn.rollback()
+                    return False, "Lote não encontrado, inativo ou incompatível com este insumo.", None
+
+        movement_id = _execute_insert_returning_id(
+            conn,
+            """
+            INSERT INTO supply_movements (
+                supply_id, supply_lot_id, movement_type, movement_date, quantity, unit,
+                user_id, project_id, service_id, purpose, document_path
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                supply_id,
+                supply_lot_id,
+                movement_type,
+                movement_date,
+                quantity,
+                lot_row["unit"] if lot_row and lot_row["unit"] else row["unit"],
+                user_id,
+                project_id,
+                service_id,
+                purpose,
+                document_path,
+            ],
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        [
-            supply_id,
-            supply_lot_id,
-            movement_type,
-            movement_date,
-            quantity,
-            lot_row["unit"] if lot_row and lot_row["unit"] else row["unit"],
-            user_id,
-            project_id,
-            service_id,
-            purpose,
-            document_path,
-        ],
-    )
-    conn.execute(
-        "UPDATE supplies SET current_quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-        [new_quantity, supply_id],
-    )
-    if lot_row is not None:
-        conn.execute(
-            "UPDATE supply_lots SET current_quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            [new_lot_quantity, supply_lot_id],
-        )
-    conn.commit()
+        updated_row = conn.execute(
+            "SELECT current_quantity FROM supplies WHERE id = ?",
+            [supply_id],
+        ).fetchone()
+        new_quantity = float(updated_row["current_quantity"] or 0) if updated_row else 0.0
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
     return True, f"Movimentação registrada. Novo saldo: {new_quantity:g} {row['unit'] or ''}.", movement_id

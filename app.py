@@ -1078,9 +1078,14 @@ def sidebar(default_page: str | None = None):
     if LOGO_PATH.exists():
         st.sidebar.image(str(LOGO_PATH), use_container_width=True)
     st.sidebar.markdown("### LabCim Manager")
+    page_labels = list(PAGE_LABELS)
+    if not can_manage_master_data():
+        page_labels = [label for label in page_labels if label != "Importar base"]
     selected_default = default_page or _initial_page_from_url()
-    index = PAGE_LABELS.index(selected_default) if selected_default in PAGE_LABELS else 0
-    page = st.sidebar.radio("Navegação", PAGE_LABELS, index=index)
+    if selected_default not in page_labels:
+        selected_default = "Painel inicial"
+    index = page_labels.index(selected_default) if selected_default in page_labels else 0
+    page = st.sidebar.radio("Navegação", page_labels, index=index)
     st.sidebar.markdown("---")
     user = current_user()
     st.sidebar.markdown(f"**Usuário:** {clean_value(user.get('full_name'))}")
@@ -3273,7 +3278,7 @@ def _user_id_from_label(users: pd.DataFrame, label: str) -> int | None:
 def _supply_alert_status(row: pd.Series) -> str:
     qty = float(row.get("current_quantity") or 0)
     min_qty = float(row.get("minimum_quantity") or 0)
-    if min_qty and (qty < min_qty if _is_spare_part(row) else qty <= min_qty):
+    if min_qty and qty < min_qty:
         return "Estoque baixo"
     exp = row.get("expiration_date")
     if not is_blank(exp):
@@ -5927,6 +5932,9 @@ def page_qrcodes(conn):
 def page_importar(conn):
     hero()
     st.subheader("Importar base inicial")
+    if not can_manage_master_data():
+        admin_required_message("importar ou reimportar a base inicial")
+        return
     st.write("Use esta página para atualizar a base a partir do arquivo `LabCim_Base.xlsx`.")
     uploaded = st.file_uploader("Enviar arquivo Excel", type=["xlsx"])
     if uploaded is not None:
