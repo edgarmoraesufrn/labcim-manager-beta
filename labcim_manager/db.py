@@ -1314,6 +1314,34 @@ def _overlap_clause(start_iso: str, end_iso: str) -> tuple[str, list[str]]:
     return "(start_datetime < ? AND end_datetime > ?)", [end_iso, start_iso]
 
 
+def _format_datetime_br(value: Any) -> str:
+    if not value:
+        return "-"
+    text = str(value)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return text
+    if len(text) == 10:
+        return parsed.strftime("%d/%m/%Y")
+    return parsed.strftime("%d/%m/%Y %H:%M")
+
+
+def _lock_booking_equipment(conn: DatabaseConnection, equipment_id: int) -> None:
+    if db_backend(conn) == "postgres":
+        conn.execute("SELECT pg_advisory_xact_lock(?)", [int(equipment_id)])
+
+
+def _booking_conflict_message(equipment: Any, conflict: Any) -> str:
+    equipment_label = f"{equipment['equipment_code']} - {equipment['equipment_name']}"
+    start_text = _format_datetime_br(conflict["start_datetime"])
+    end_text = _format_datetime_br(conflict["end_datetime"])
+    return (
+        f"Conflito de horário no equipamento {equipment_label}: "
+        f"já existe a reserva #{conflict['id']} de {start_text} a {end_text}."
+    )
+
+
 def _booking_conflict(conn: sqlite3.Connection, equipment_id: int, start_iso: str, end_iso: str) -> sqlite3.Row | None:
     clause, params = _overlap_clause(start_iso, end_iso)
     return conn.execute(
@@ -1375,45 +1403,62 @@ def create_booking(
     performed_by_id: int | None = None,
     service_id: int | None = None,
 ) -> tuple[bool, str, int | None]:
-    eq = conn.execute("SELECT * FROM equipment WHERE id = ?", [equipment_id]).fetchone()
-    if not eq:
-        return False, "Equipamento não encontrado.", None
-    if int(eq["active"] or 0) != 1:
-        return False, "Este equipamento está inativo.", None
-    if eq["operational_status"] == "maintenance":
-        return False, "Este equipamento está marcado como em manutenção.", None
-    if sample_count and eq["max_sample_capacity"] and sample_count > int(eq["max_sample_capacity"]):
-        if int(eq["capacity_enforced"] or 0) == 1:
-            return False, f"A quantidade excede a capacidade máxima cadastrada ({eq['max_sample_capacity']} {eq['capacity_unit'] or 'amostras'}).", None
+    try:
+        eq = conn.execute("SELECT * FROM equipment WHERE id = ?", [equipment_id]).fetchone()
+        if not eq:
+            conn.rollback()
+            return False, "Equipamento não encontrado.", None
+        if int(eq["active"] or 0) != 1:
+            conn.rollback()
+            return False, "Este equipamento está inativo.", None
+        if eq["operational_status"] == "maintenance":
+            conn.rollback()
+            return False, "Este equipamento está marcado como em manutenção.", None
+        if int(eq["requires_operator"] or 0) == 1 and operator_id is None:
+            conn.rollback()
+            return False, "Selecione o operador responsável para este equipamento.", None
+        if sample_count and eq["max_sample_capacity"] and sample_count > int(eq["max_sample_capacity"]):
+            if int(eq["capacity_enforced"] or 0) == 1:
+                conn.rollback()
+                return False, f"A quantidade excede a capacidade máxima cadastrada ({eq['max_sample_capacity']} {eq['capacity_unit'] or 'amostras'}).", None
 
-    ok, msg, project_id, service_id = _normalize_project_service_ids(
-        conn,
-        project_id=project_id,
-        service_id=service_id,
-    )
-    if not ok:
-        return False, msg or "Serviço/análise incompatível com o projeto.", None
-
-    conflict = _booking_conflict(conn, equipment_id, start_iso, end_iso)
-    if conflict:
-        return False, f"Conflito com a reserva #{conflict['id']} ({conflict['start_datetime']} a {conflict['end_datetime']}).", None
-
-    maintenance = _preventive_conflict(conn, equipment_id, start_iso, end_iso)
-    if maintenance:
-        return False, f"Conflito com manutenção/calibração #{maintenance['id']}: {maintenance['description']}.", None
-
-    booking_id = insert_returning_id(
-        conn,
-        """
-        INSERT INTO bookings (
-            equipment_id, user_id, project_id, service_id, operator_id, performed_by_id,
-            start_datetime, end_datetime, sample_count, purpose, status
+        ok, msg, project_id, service_id = _normalize_project_service_ids(
+            conn,
+            project_id=project_id,
+            service_id=service_id,
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled')
-        """,
-        [equipment_id, user_id, project_id, service_id, operator_id, performed_by_id, start_iso, end_iso, sample_count, purpose],
-    )
-    return True, "Reserva registrada com sucesso.", booking_id
+        if not ok:
+            conn.rollback()
+            return False, msg or "Serviço/análise incompatível com o projeto.", None
+
+        _lock_booking_equipment(conn, equipment_id)
+
+        conflict = _booking_conflict(conn, equipment_id, start_iso, end_iso)
+        if conflict:
+            conn.rollback()
+            return False, _booking_conflict_message(eq, conflict), None
+
+        maintenance = _preventive_conflict(conn, equipment_id, start_iso, end_iso)
+        if maintenance:
+            conn.rollback()
+            return False, f"Conflito com manutenção/calibração #{maintenance['id']}: {maintenance['description']}.", None
+
+        booking_id = _execute_insert_returning_id(
+            conn,
+            """
+            INSERT INTO bookings (
+                equipment_id, user_id, project_id, service_id, operator_id, performed_by_id,
+                start_datetime, end_datetime, sample_count, purpose, status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled')
+            """,
+            [equipment_id, user_id, project_id, service_id, operator_id, performed_by_id, start_iso, end_iso, sample_count, purpose],
+        )
+        conn.commit()
+        return True, "Reserva registrada com sucesso.", booking_id
+    except Exception as exc:
+        conn.rollback()
+        return False, f"Erro ao registrar reserva: {exc}", None
 
 
 def update_booking_status(conn: sqlite3.Connection, booking_id: int, status: str) -> None:
