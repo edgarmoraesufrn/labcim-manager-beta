@@ -1480,10 +1480,10 @@ def _service_id_from_label(services: pd.DataFrame, label: str, *, include_projec
     return int(services.iloc[options.index(label) - 1]["id"])
 
 
-def _operator_options(operators: pd.DataFrame) -> list[str]:
+def _operator_options(operators: pd.DataFrame, *, placeholder: str = "Selecionar depois") -> list[str]:
     if operators.empty:
-        return ["Selecionar depois"]
-    return ["Selecionar depois"] + operators.apply(lambda r: f"{clean_value(r.get('full_name'))} ({role_badge(clean_value(r.get('role'), 'member'))})", axis=1).tolist()
+        return [placeholder]
+    return [placeholder] + operators.apply(lambda r: f"{clean_value(r.get('full_name'))} ({role_badge(clean_value(r.get('role'), 'member'))})", axis=1).tolist()
 
 
 def _booking_query_for_equipment(conn, equipment_id: int, start_date: date, end_date: date, include_cancelled: bool = True) -> pd.DataFrame:
@@ -1729,7 +1729,7 @@ def _render_month_calendar(events: pd.DataFrame, selected_eq: pd.Series, anchor_
 def page_reservas(conn):
     hero()
     st.subheader("Agenda funcional dos equipamentos")
-    st.caption("MVP real da Fase 2: página por equipamento, criação de reserva, validação de conflito, cancelamento, status simples e integração com QR Code.")
+    st.caption("Consulte a agenda por equipamento, crie reservas e acompanhe conflitos, status e documentação operacional.")
 
     equipment, users, projects, operators = load_reference_data(conn)
     if equipment.empty or users.empty:
@@ -1739,6 +1739,9 @@ def page_reservas(conn):
     active_equipment = equipment[equipment["active"] == 1].copy()
     active_users = users[users["active"] == 1].copy()
     active_projects = projects[projects["active"] == 1].copy()
+    booking_user = current_user()
+    current_user_id = _current_user_id()
+    can_choose_requester = can_manage_master_data()
     if active_equipment.empty or active_users.empty:
         st.warning("É necessário ter ao menos um equipamento e um usuário ativos.")
         return
@@ -1752,6 +1755,7 @@ def page_reservas(conn):
         eq_label = st.selectbox("Equipamento", eq_labels, index=selected_index, key="booking_eq_main")
     equipment_id = _equipment_id_from_label(active_equipment, eq_label)
     selected_eq = active_equipment[active_equipment["id"] == equipment_id].iloc[0]
+    operator_required = truthy(selected_eq.get("requires_operator"))
     with top2:
         st.metric("Status do equipamento", equipment_status_badge(selected_eq.get("operational_status") or "available"))
 
@@ -1928,12 +1932,18 @@ def page_reservas(conn):
         with st.form("form_nova_reserva", clear_on_submit=False):
             c1, c2, c3 = st.columns(3)
             with c1:
-                user_placeholder = "Selecione o solicitante"
-                user_labels = [user_placeholder] + _user_options(active_users)
-                user_label = st.selectbox("Solicitante", user_labels, key="booking_user")
-                user_id = None
-                if user_label != user_placeholder:
-                    user_id = int(active_users.iloc[user_labels.index(user_label) - 1]["id"])
+                if can_choose_requester:
+                    user_placeholder = "Selecione o solicitante"
+                    user_labels = [user_placeholder] + _user_options(active_users)
+                    user_label = st.selectbox("Solicitante", user_labels, key="booking_user")
+                    user_id = None
+                    if user_label != user_placeholder:
+                        user_id = int(active_users.iloc[user_labels.index(user_label) - 1]["id"])
+                else:
+                    user_id = current_user_id
+                    user_label = clean_value(booking_user.get("full_name"))
+                    st.text_input("Solicitante", value=user_label, disabled=True, key="booking_user_display")
+                    st.caption("Reservas de membro são registradas no próprio nome.")
                 booking_date = st.date_input("Data", value=date.today(), format="DD/MM/YYYY", key="booking_date")
             with c2:
                 start_t = st.time_input("Horário inicial", value=time(9, 0), step=timedelta(minutes=30), key="booking_start")
@@ -1941,12 +1951,13 @@ def page_reservas(conn):
                 sample_count = st.number_input("Número de amostras", min_value=0, step=1, value=0, key="booking_samples")
             with c3:
                 operator_id = None
-                if truthy(selected_eq.get("requires_operator")):
-                    op_options = _operator_options(operators)
+                if operator_required:
+                    operator_placeholder = "Selecione o operador"
+                    op_options = _operator_options(operators, placeholder=operator_placeholder)
                     op_label = st.selectbox("Operador", op_options, key="booking_operator")
-                    if op_label != "Selecionar depois" and not operators.empty:
+                    if op_label != operator_placeholder and not operators.empty:
                         operator_id = int(operators.iloc[op_options.index(op_label) - 1]["id"])
-                    st.caption("Este equipamento está marcado como operação assistida/requer operador.")
+                    st.caption("Este equipamento requer operador. Selecione o responsável pela operação.")
                 else:
                     st.info("Este equipamento não exige operador obrigatório.")
 
@@ -1960,8 +1971,12 @@ def page_reservas(conn):
             capacity_unit = clean_value(selected_eq.get("capacity_unit"), "amostras")
             if user_id is None:
                 st.error("Selecione o solicitante para criar a reserva.")
+            elif not can_choose_requester and user_id != current_user_id:
+                st.error("Usuário comum só pode criar reserva no próprio nome.")
             elif end_dt <= start_dt:
                 st.error("O horário final precisa ser maior que o horário inicial.")
+            elif operator_required and operator_id is None:
+                st.error("Selecione o operador responsável para este equipamento.")
             elif max_capacity and sample_count and int(sample_count) > max_capacity and truthy(selected_eq.get("capacity_enforced")):
                 st.error(f"A quantidade excede a capacidade máxima cadastrada para este equipamento ({max_capacity} {capacity_unit}).")
             else:
@@ -2016,22 +2031,41 @@ def page_reservas(conn):
                 row = manage_df[manage_df["id"] == x].iloc[0]
                 return f"#{x} · {row['solicitante']} · {_format_datetime(row['start_datetime'])} · {status_badge(row['status'])}"
             booking_id = st.selectbox("Selecionar reserva", options, format_func=_booking_format, key="manage_booking_id")
-            a1, a2, a3 = st.columns(3)
-            with a1:
-                if st.button("Marcar como concluída", key="booking_mark_done"):
-                    update_booking_status(conn, int(booking_id), "done")
-                    clear_app_caches()
-                    st.rerun()
-            with a2:
-                if st.button("Cancelar reserva", key="booking_cancel"):
-                    update_booking_status(conn, int(booking_id), "cancelled")
-                    clear_app_caches()
-                    st.rerun()
-            with a3:
-                if st.button("Marcar como não compareceu", key="booking_no_show"):
-                    update_booking_status(conn, int(booking_id), "no_show")
-                    clear_app_caches()
-                    st.rerun()
+            booking_row = conn.execute("SELECT user_id, status FROM bookings WHERE id = ?", [int(booking_id)]).fetchone()
+            booking_owner_id = int(booking_row["user_id"]) if booking_row else None
+            booking_status = str(booking_row["status"]) if booking_row else ""
+            can_manage_any_booking = can_manage_master_data()
+            is_own_booking = current_user_id is not None and booking_owner_id == current_user_id
+            can_cancel_own_booking = is_own_booking and booking_status == "scheduled"
+
+            if can_manage_any_booking:
+                a1, a2, a3 = st.columns(3)
+                with a1:
+                    if st.button("Marcar como concluída", key="booking_mark_done"):
+                        update_booking_status(conn, int(booking_id), "done")
+                        clear_app_caches()
+                        st.rerun()
+                with a2:
+                    if st.button("Cancelar reserva", key="booking_cancel"):
+                        update_booking_status(conn, int(booking_id), "cancelled")
+                        clear_app_caches()
+                        st.rerun()
+                with a3:
+                    if st.button("Marcar como não compareceu", key="booking_no_show"):
+                        update_booking_status(conn, int(booking_id), "no_show")
+                        clear_app_caches()
+                        st.rerun()
+            elif is_own_booking:
+                st.caption("Você pode cancelar apenas suas próprias reservas agendadas. Conclusão e não comparecimento são ações de Gerente/Administrador.")
+                if can_cancel_own_booking:
+                    if st.button("Cancelar minha reserva", key="booking_cancel_own"):
+                        update_booking_status(conn, int(booking_id), "cancelled")
+                        clear_app_caches()
+                        st.rerun()
+                else:
+                    st.info("Esta reserva não está agendada e não pode ser cancelada por membro comum.")
+            else:
+                st.info("Você pode consultar esta reserva, mas alterações de status são restritas ao solicitante ou a Gerente/Administrador.")
 
 
 def page_table(conn, table_name: str, title: str):
