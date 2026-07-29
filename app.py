@@ -44,6 +44,7 @@ from labcim_manager.db import (
     create_supply_lot,
     create_supply_movement,
     create_user,
+    deactivate_attachment,
     get_active_user_by_email,
     get_attachment,
     get_latest_attachment_for_entity,
@@ -137,6 +138,15 @@ EQUIPMENT_STATUS_LABELS = {
     "inactive": "Inativo",
 }
 EQUIPMENT_STATUS_REVERSE = {v: k for k, v in EQUIPMENT_STATUS_LABELS.items()}
+EQUIPMENT_DOCUMENT_ROLE_LABELS = {
+    "pop": "POP / procedimento operacional",
+    "manual": "Manual",
+    "certificate": "Certificado",
+    "checklist": "Checklist",
+    "technical_document": "Documento técnico",
+    "other": "Outro",
+}
+EQUIPMENT_DOCUMENT_ROLE_REVERSE = {v: k for k, v in EQUIPMENT_DOCUMENT_ROLE_LABELS.items()}
 
 ROLE_LABELS = {
     "member": "Membro",
@@ -1877,6 +1887,15 @@ def page_reservas(conn):
             )
             if not is_blank(selected_eq.get("document_notes")):
                 st.caption(clean_value(selected_eq.get("document_notes")))
+        if _equipment_document_rows(conn, equipment_id):
+            st.markdown("##### Documentos cadastrados")
+            render_equipment_document_downloads(
+                conn,
+                selected_eq,
+                key_prefix=f"booking_equipment_documents_{equipment_id}",
+                show_empty=False,
+                can_deactivate=False,
+            )
 
     confirmation = st.session_state.get("booking_confirmation")
     if confirmation:
@@ -2530,7 +2549,12 @@ def page_equipamentos(conn):
         existing_cols = [c for c in display_cols if c in equipment.columns]
         st.dataframe(_display_df(equipment[existing_cols]), use_container_width=True, hide_index=True)
 
-    tab_oper, tab_parts, tab_master = st.tabs(["Atualizar dados operacionais", "Peças de reposição", "Cadastro mestre"])
+    tab_oper, tab_parts, tab_docs, tab_master = st.tabs([
+        "Atualizar dados operacionais",
+        "Peças de reposição",
+        "Documentos",
+        "Cadastro mestre",
+    ])
 
     with tab_oper:
         if equipment.empty:
@@ -2641,6 +2665,25 @@ def page_equipamentos(conn):
             )
             spare_parts = list_spare_parts_for_equipment(conn, equipment_id)
             render_equipment_spare_parts(spare_parts)
+
+    with tab_docs:
+        st.markdown("### Documentos operacionais")
+        if equipment.empty:
+            st.info("Cadastre um equipamento antes de consultar documentos.")
+        else:
+            eq_label = st.selectbox("Selecionar equipamento", _equipment_options(equipment), key="equipment_documents_select")
+            equipment_id = _equipment_id_from_label(equipment, eq_label)
+            selected = equipment[equipment["id"] == equipment_id].iloc[0]
+            st.caption(
+                f"{clean_value(selected.get('equipment_code'))} — {clean_value(selected.get('equipment_name'))} · "
+                f"Local: {clean_value(selected.get('location'))}"
+            )
+            render_equipment_documents_section(
+                conn,
+                selected,
+                key_prefix=f"equipment_documents_{equipment_id}",
+                can_manage=can_manage_master_data(),
+            )
 
     with tab_master:
         if not can_manage_master_data():
@@ -3162,6 +3205,122 @@ def render_attachment_list(
 
     if not rendered:
         st.caption(empty_message)
+
+
+def _equipment_document_role_label(role: str | None) -> str:
+    return EQUIPMENT_DOCUMENT_ROLE_LABELS.get(clean_input(role), clean_value(role, "Documento"))
+
+
+def _equipment_document_rows(conn, equipment_id: int) -> list:
+    rows = list_attachments(
+        conn,
+        entity_type="equipment",
+        entity_id=int(equipment_id),
+        active_only=True,
+    )
+    role_order = {role: idx for idx, role in enumerate(EQUIPMENT_DOCUMENT_ROLE_LABELS)}
+    return sorted(
+        rows,
+        key=lambda row: (
+            0 if clean_input(row["attachment_role"]) == "pop" else 1,
+            role_order.get(clean_input(row["attachment_role"]), 999),
+        ),
+    )
+
+
+def render_equipment_document_downloads(
+    conn,
+    equipment_row,
+    *,
+    key_prefix: str,
+    show_empty: bool = False,
+    can_deactivate: bool = False,
+) -> int:
+    rows = _equipment_document_rows(conn, int(equipment_row["id"]))
+    if not rows:
+        if show_empty:
+            st.caption("Nenhum documento cadastrado via anexos.")
+        return 0
+
+    for row in rows:
+        role_label = _equipment_document_role_label(row["attachment_role"])
+        filename = clean_value(row["original_filename"], "arquivo")
+        notes = clean_input(row["notes"] if "notes" in row.keys() else "")
+        caption = f"{role_label}: {filename} · {_attachment_metadata_caption(row)}"
+        if notes:
+            caption += f" · {notes}"
+        st.caption(caption)
+        if can_deactivate:
+            col_download, col_action = st.columns([4, 1])
+            with col_download:
+                _render_attachment_download(row, "Baixar", f"{key_prefix}_attachment_{int(row['id'])}")
+            with col_action:
+                if st.button("Inativar", key=f"{key_prefix}_deactivate_{int(row['id'])}"):
+                    deactivate_attachment(conn, int(row["id"]))
+                    st.success("Documento inativado.")
+                    clear_app_caches()
+                    st.rerun()
+        else:
+            _render_attachment_download(row, "Baixar", f"{key_prefix}_attachment_{int(row['id'])}")
+    return len(rows)
+
+
+def render_equipment_documents_section(
+    conn,
+    equipment_row,
+    *,
+    key_prefix: str,
+    can_manage: bool,
+) -> None:
+    equipment_id = int(equipment_row["id"])
+    with st.expander("Documentos do equipamento", expanded=False):
+        legacy_path = clean_input(equipment_row.get("pop_path"))
+        if legacy_path:
+            st.markdown("##### POP legado")
+            _download_or_link_document(conn, legacy_path, "Baixar/abrir POP legado", f"{key_prefix}_legacy_pop")
+            st.caption(
+                f"{clean_value(equipment_row.get('pop_title'), 'POP do equipamento')} · "
+                f"Versão: {clean_value(equipment_row.get('pop_version'))} · "
+                f"Responsável: {clean_value(equipment_row.get('pop_responsible'))}"
+            )
+
+        st.markdown("##### Documentos cadastrados")
+        render_equipment_document_downloads(
+            conn,
+            equipment_row,
+            key_prefix=f"{key_prefix}_docs",
+            show_empty=True,
+            can_deactivate=can_manage,
+        )
+
+        if not can_manage:
+            st.caption("Envio e inativação de documentos ficam disponíveis para Gerente ou Administrador.")
+            return
+
+        st.markdown("##### Enviar documento")
+        role_label = st.selectbox(
+            "Tipo do documento",
+            list(EQUIPMENT_DOCUMENT_ROLE_LABELS.values()),
+            key=f"{key_prefix}_role",
+        )
+        upload = st.file_uploader("Arquivo", key=f"{key_prefix}_upload")
+        notes = st.text_area("Observação", value="", key=f"{key_prefix}_notes")
+        if st.button("Salvar documento", type="primary", key=f"{key_prefix}_save"):
+            if upload is None:
+                st.error("Selecione um arquivo para enviar.")
+            elif _ensure_storage_ready_for_upload(upload):
+                role = EQUIPMENT_DOCUMENT_ROLE_REVERSE[role_label]
+                _save_upload(
+                    conn,
+                    upload,
+                    entity_type="equipment",
+                    entity_id=equipment_id,
+                    attachment_role=role,
+                    notes=notes.strip() or None,
+                )
+                st.success("Documento do equipamento cadastrado.")
+                clear_app_caches()
+                st.rerun()
 
 
 def render_supply_lots_section(conn, supply_row: pd.Series, supply_lots: pd.DataFrame) -> None:
