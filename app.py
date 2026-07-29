@@ -1816,6 +1816,7 @@ def page_reservas(conn):
         return
 
     qr_eq = st.query_params.get("eq", None)
+    qr_view = clean_input(st.query_params.get("view")).lower()
     qr_issue = None
     qr_selection_code = qr_eq
     if qr_eq:
@@ -1876,6 +1877,8 @@ def page_reservas(conn):
 
     with st.container(border=True):
         st.markdown("#### Documentação operacional")
+        if qr_view == "pop":
+            st.info("QR de documentação operacional aberto. Consulte abaixo o POP e os documentos cadastrados deste equipamento.")
         d1, d2 = st.columns([1, 2])
         with d1:
             pop_download_button(selected_eq, key_prefix="booking_pop")
@@ -6437,13 +6440,63 @@ def _qr_dataframe_signature(df: pd.DataFrame, base_url: str, columns: list[str])
     return hashlib.sha256(f"{base_url}\0{payload}".encode("utf-8")).hexdigest()[:16]
 
 
-def _equipment_qr_zip_bytes(equipment: pd.DataFrame, base_url: str) -> bytes:
+def _equipment_has_legacy_pop(equipment_row) -> bool:
+    return not is_blank(equipment_row.get("pop_path"))
+
+
+def _equipment_ids_with_pop_attachments(conn, equipment_ids) -> set[int]:
+    normalized_ids: list[int] = []
+    for equipment_id in equipment_ids:
+        if is_blank(equipment_id):
+            continue
+        try:
+            normalized_ids.append(int(equipment_id))
+        except (TypeError, ValueError):
+            continue
+    if not normalized_ids:
+        return set()
+    return set(
+        _attachment_rows_by_entity(
+            conn,
+            entity_type="equipment",
+            attachment_role="pop",
+            entity_ids=normalized_ids,
+        ).keys()
+    )
+
+
+def _equipment_has_pop_document(equipment_row, pop_attachment_equipment_ids: set[int] | None = None) -> bool:
+    if _equipment_has_legacy_pop(equipment_row):
+        return True
+    if pop_attachment_equipment_ids is None:
+        return False
+    equipment_id = equipment_row.get("id")
+    if is_blank(equipment_id):
+        return False
+    try:
+        return int(equipment_id) in pop_attachment_equipment_ids
+    except (TypeError, ValueError):
+        return False
+
+
+def _equipment_qr_signature(equipment: pd.DataFrame, base_url: str, pop_attachment_equipment_ids: set[int]) -> str:
+    base_signature = _qr_dataframe_signature(equipment, base_url, ["id", "equipment_code", "pop_path"])
+    attachment_payload = ",".join(str(equipment_id) for equipment_id in sorted(pop_attachment_equipment_ids))
+    return hashlib.sha256(f"{base_signature}\0{attachment_payload}".encode("utf-8")).hexdigest()[:16]
+
+
+def _equipment_qr_zip_bytes(
+    equipment: pd.DataFrame,
+    base_url: str,
+    pop_attachment_equipment_ids: set[int] | None = None,
+) -> bytes:
+    pop_attachment_equipment_ids = pop_attachment_equipment_ids or set()
     zip_buf = BytesIO()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for _, row in equipment.iterrows():
             code = row["equipment_code"]
             suffixes = ["reserva", "manutencao"]
-            if not is_blank(row.get("pop_path")):
+            if _equipment_has_pop_document(row, pop_attachment_equipment_ids):
                 suffixes.append("pop")
             for suffix in suffixes:
                 url = f"{base_url}?eq={code}&view={suffix}"
@@ -6478,14 +6531,21 @@ def page_qrcodes(conn):
         if equipment.empty:
             st.info("Nenhum equipamento ativo encontrado.")
         else:
+            equipment_ids = equipment["id"].tolist() if "id" in equipment.columns else []
+            pop_attachment_equipment_ids = _equipment_ids_with_pop_attachments(conn, equipment_ids)
             eq = st.selectbox("Equipamento", equipment["equipment_code"].tolist(), key="qr_equipment")
             selected = equipment[equipment["equipment_code"] == eq].iloc[0]
+            selected_has_pop_document = _equipment_has_pop_document(selected, pop_attachment_equipment_ids)
+            pop_summary = clean_value(
+                selected.get("pop_title"),
+                "documento operacional cadastrado" if selected_has_pop_document else "não cadastrado",
+            )
             st.markdown(
                 f"""
                 <div class="soft-card">
                 <b>{clean_value(selected.get('equipment_code'))} — {clean_value(selected.get('equipment_name'))}</b><br>
                 Local: {clean_value(selected.get('location'))} · Responsável: {clean_value(selected.get('responsible_name'))}<br>
-                POP: {clean_value(selected.get('pop_title'), 'não cadastrado')}
+                POP: {pop_summary}
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -6495,8 +6555,8 @@ def page_qrcodes(conn):
                 ("Reservar / Ver agenda", "reserva", "Aponte a câmera para reservar ou consultar a agenda deste equipamento."),
                 ("Reportar problema / Manutenção", "manutencao", "Aponte a câmera para abrir um ticket de suporte/manutenção."),
             ]
-            if not is_blank(selected.get("pop_path")):
-                cards.append(("Consultar POP / Documentação", "pop", "Aponte a câmera para consultar ou baixar o POP/documentação operacional."))
+            if selected_has_pop_document:
+                cards.append(("POP / documentação operacional", "pop", "Aponte a câmera para consultar ou baixar o POP/documentação operacional."))
 
             cols = st.columns(len(cards))
             for (label, suffix, instruction), col in zip(cards, cols):
@@ -6517,9 +6577,13 @@ def page_qrcodes(conn):
 
             st.markdown("### Baixar todos os QR Codes de equipamentos")
             st.caption("Gera um pacote ZIP com QR Codes de reserva, manutenção e POP quando houver documentação cadastrada.")
-            equipment_zip_signature = _qr_dataframe_signature(equipment, base_url, ["equipment_code", "pop_path"])
+            equipment_zip_signature = _equipment_qr_signature(equipment, base_url, pop_attachment_equipment_ids)
             if st.button("Preparar ZIP - QR Codes de equipamentos", key="prepare_all_equipment_qr"):
-                st.session_state["equipment_qr_zip_bytes"] = _equipment_qr_zip_bytes(equipment, base_url)
+                st.session_state["equipment_qr_zip_bytes"] = _equipment_qr_zip_bytes(
+                    equipment,
+                    base_url,
+                    pop_attachment_equipment_ids,
+                )
                 st.session_state["equipment_qr_zip_signature"] = equipment_zip_signature
             if st.session_state.get("equipment_qr_zip_signature") == equipment_zip_signature:
                 st.download_button(
