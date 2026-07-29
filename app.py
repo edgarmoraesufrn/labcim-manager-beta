@@ -25,6 +25,8 @@ import pandas as pd
 import plotly.express as px
 import qrcode
 import streamlit as st
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
 from labcim_manager.db import (
     change_maintenance_status,
@@ -5460,10 +5462,140 @@ def _top_counts(df: pd.DataFrame, group_col: str, value_col: str = "total", limi
     )
 
 
+def _excel_color(hex_color: str) -> str:
+    value = hex_color.strip().lstrip("#").upper()
+    return value if len(value) == 8 else f"FF{value}"
+
+
+EXCEL_BLUE = _excel_color(LAB_BLUE)
+EXCEL_CYAN = _excel_color(LAB_CYAN)
+EXCEL_TEXT = "FF1F2937"
+EXCEL_MUTED_TEXT = "FF64748B"
+EXCEL_LIGHT_BG = "FFF8FAFC"
+EXCEL_ALT_ROW = "FFF3F7FB"
+EXCEL_BORDER = "FFD9E2EC"
+EXCEL_WARNING = "FFFFF3CD"
+EXCEL_CRITICAL = "FFFDE2E2"
+EXCEL_OK = "FFDFF3E4"
+
+
+def _excel_thin_border() -> Border:
+    side = Side(style="thin", color=EXCEL_BORDER)
+    return Border(left=side, right=side, top=side, bottom=side)
+
+
+def _style_cover_sheet(worksheet, period_text: str, generated_at: str) -> None:
+    worksheet.sheet_view.showGridLines = False
+    for row_idx in range(1, 12):
+        worksheet.row_dimensions[row_idx].height = 22
+    worksheet.row_dimensions[1].height = 34
+    worksheet.row_dimensions[2].height = 26
+    worksheet.column_dimensions["A"].width = 4
+    worksheet.column_dimensions["B"].width = 24
+    worksheet.column_dimensions["C"].width = 32
+    worksheet.column_dimensions["D"].width = 24
+    worksheet.column_dimensions["E"].width = 24
+    worksheet.column_dimensions["F"].width = 4
+
+    if worksheet.max_row:
+        worksheet.delete_rows(1, worksheet.max_row)
+    worksheet.merge_cells("A1:F1")
+    worksheet.merge_cells("A2:F2")
+    worksheet.merge_cells("B5:E5")
+    worksheet.merge_cells("B6:E6")
+    worksheet["A1"] = "LabCim Manager"
+    worksheet["A2"] = "Relatório operacional do laboratório"
+    worksheet["B5"] = "Período analisado"
+    worksheet["B6"] = period_text
+    worksheet["B8"] = "Gerado em"
+    worksheet["C8"] = generated_at
+
+    title_fill = PatternFill("solid", fgColor=EXCEL_BLUE)
+    subtitle_fill = PatternFill("solid", fgColor=EXCEL_CYAN)
+    for cell in worksheet[1]:
+        cell.fill = title_fill
+    for cell in worksheet[2]:
+        cell.fill = subtitle_fill
+    worksheet["A1"].font = Font(color="FFFFFFFF", bold=True, size=18)
+    worksheet["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    worksheet["A2"].font = Font(color="FFFFFFFF", bold=True, size=12)
+    worksheet["A2"].alignment = Alignment(horizontal="center", vertical="center")
+
+    label_fill = PatternFill("solid", fgColor=EXCEL_LIGHT_BG)
+    for cell_ref in ["B5", "B8"]:
+        cell = worksheet[cell_ref]
+        cell.font = Font(color=EXCEL_TEXT, bold=True)
+        cell.fill = label_fill
+        cell.border = _excel_thin_border()
+        cell.alignment = Alignment(horizontal="left", vertical="center")
+    for cell_ref in ["B6", "C8"]:
+        cell = worksheet[cell_ref]
+        cell.font = Font(color=EXCEL_TEXT, bold=True if cell_ref == "B6" else False)
+        cell.border = _excel_thin_border()
+        cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    for row in worksheet.iter_rows(min_row=5, max_row=8, min_col=2, max_col=5):
+        for cell in row:
+            cell.border = _excel_thin_border()
+
+
+def _excel_status_fill(value) -> PatternFill | None:
+    text = clean_input(value).lower()
+    if not text:
+        return None
+    if "vencido" in text or "crítico" in text or "critico" in text:
+        return PatternFill("solid", fgColor=EXCEL_CRITICAL)
+    if "vence em até 60 dias" in text or "vence em ate 60 dias" in text or "estoque baixo" in text:
+        return PatternFill("solid", fgColor=EXCEL_WARNING)
+    if text in {"ok", "com certificado", "com anexo"}:
+        return PatternFill("solid", fgColor=EXCEL_OK)
+    return None
+
+
+def _style_table_sheet(worksheet, *, emphasize_values: bool = False) -> None:
+    worksheet.sheet_view.showGridLines = False
+    max_row = worksheet.max_row or 1
+    max_col = worksheet.max_column or 1
+    if max_row >= 1 and max_col >= 1:
+        worksheet.freeze_panes = "A2"
+        worksheet.auto_filter.ref = f"A1:{get_column_letter(max_col)}{max_row}"
+
+    header_fill = PatternFill("solid", fgColor=EXCEL_BLUE)
+    header_font = Font(color="FFFFFFFF", bold=True)
+    border = _excel_thin_border()
+    alt_fill = PatternFill("solid", fgColor=EXCEL_ALT_ROW)
+    base_fill = PatternFill("solid", fgColor="FFFFFFFF")
+
+    for cell in worksheet[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.border = border
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    worksheet.row_dimensions[1].height = 26
+
+    for row_idx, row in enumerate(worksheet.iter_rows(min_row=2, max_row=max_row), start=2):
+        row_fill = alt_fill if row_idx % 2 == 0 else base_fill
+        for cell in row:
+            cell.fill = row_fill
+            status_fill = _excel_status_fill(cell.value)
+            if status_fill is not None:
+                cell.fill = status_fill
+            cell.font = Font(color=EXCEL_TEXT)
+            cell.border = border
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+            if emphasize_values and cell.column == 2:
+                cell.font = Font(color=EXCEL_BLUE, bold=True)
+
+    for column_cells in worksheet.columns:
+        max_len = max(len(str(cell.value)) if cell.value is not None else 0 for cell in column_cells)
+        width = min(max(max_len + 2, 12), 55)
+        worksheet.column_dimensions[column_cells[0].column_letter].width = width
+
+
 def _reports_excel_bytes(period_text: str, data: dict[str, pd.DataFrame]) -> bytes:
     output = BytesIO()
     summary = _report_summary(data)
     bookings = _with_booking_duration(data["bookings"])
+    generated_at = datetime.now().strftime("%d/%m/%Y %H:%M")
     sheets = {
         "Resumo": summary,
         "Reservas": _display_df(bookings),
@@ -5480,18 +5612,17 @@ def _reports_excel_bytes(period_text: str, data: dict[str, pd.DataFrame]) -> byt
         "Equipamentos": _display_df(data["equipment"]),
     }
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        pd.DataFrame({"Relatório": ["LabCim Manager"], "Período": [period_text], "Gerado em": [datetime.now().strftime("%d/%m/%Y %H:%M")]}).to_excel(
+        pd.DataFrame({"Relatório": ["LabCim Manager"], "Período": [period_text], "Gerado em": [generated_at]}).to_excel(
             writer,
             sheet_name="Capa",
             index=False,
         )
+        _style_cover_sheet(writer.sheets["Capa"], period_text, generated_at)
         for sheet_name, df in sheets.items():
             safe_name = sheet_name[:31]
             df.to_excel(writer, sheet_name=safe_name, index=False)
             worksheet = writer.sheets[safe_name]
-            for column_cells in worksheet.columns:
-                max_len = max(len(str(cell.value)) if cell.value is not None else 0 for cell in column_cells)
-                worksheet.column_dimensions[column_cells[0].column_letter].width = min(max(max_len + 2, 12), 55)
+            _style_table_sheet(worksheet, emphasize_values=(sheet_name == "Resumo"))
     return output.getvalue()
 
 
