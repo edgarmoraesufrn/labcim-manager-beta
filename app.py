@@ -2827,14 +2827,17 @@ def page_equipamentos(conn):
         if not docs:
             st.info("Nenhum PDF de POP encontrado em assets/pops.")
         else:
-            for idx, doc in enumerate(docs):
-                st.download_button(
-                    f"📄 {doc.name}",
-                    data=doc.read_bytes(),
-                    file_name=doc.name,
-                    mime="application/pdf",
-                    key=f"library_pop_{idx}_{doc.name}",
-                )
+            doc_names = [doc.name for doc in docs]
+            selected_doc_name = st.selectbox("PDF disponível", doc_names, key="library_pop_select")
+            selected_doc = docs[doc_names.index(selected_doc_name)]
+            st.caption(selected_doc.name)
+            st.download_button(
+                f"📄 Baixar {selected_doc.name}",
+                data=selected_doc.read_bytes(),
+                file_name=selected_doc.name,
+                mime="application/pdf",
+                key=f"library_pop_{selected_doc.name}",
+            )
 
 
 
@@ -4301,6 +4304,26 @@ def page_manutencao(conn):
     if equipment.empty:
         st.warning("Cadastre/importe equipamentos antes de registrar manutenções.")
         return
+    can_manage_maintenance = can_edit_operational_data()
+    qr_view = clean_input(st.query_params.get("view")).lower()
+    qr_equipment_code = st.query_params.get("eq") if qr_view == "manutencao" else None
+    qr_maintenance_equipment_id = None
+    qr_maintenance_message = ""
+    qr_maintenance_issue = ""
+    if qr_equipment_code:
+        qr_row = _equipment_row_by_code(equipment, qr_equipment_code)
+        if qr_row is None:
+            qr_maintenance_issue = "QR de manutenção aponta para equipamento não encontrado. Selecione o equipamento manualmente."
+        else:
+            qr_status = clean_input(qr_row.get("operational_status")).lower()
+            if not truthy(qr_row.get("active")) or qr_status == "inactive":
+                qr_maintenance_issue = (
+                    "QR de manutenção aponta para equipamento inativo. "
+                    f"{clean_value(qr_row.get('equipment_code'))} — {clean_value(qr_row.get('equipment_name'))} não será selecionado automaticamente."
+                )
+            else:
+                qr_maintenance_equipment_id = int(qr_row["id"])
+                qr_maintenance_message = "QR de manutenção aberto. Registre abaixo o problema observado neste equipamento."
 
     tab_prev, tab_corr, tab_dash = st.tabs([
         "Preventiva e calibração",
@@ -4311,6 +4334,8 @@ def page_manutencao(conn):
     with tab_prev:
         st.markdown("### Manutenção preventiva e calibração")
         st.write("Registro de atividades planejadas, periódicas e obrigatórias: preventiva, calibração interna/externa e inspeções.")
+        if not can_manage_maintenance:
+            st.info("A gestão de manutenção preventiva é restrita a Gerente ou Administrador.")
 
         with st.container(border=True):
             c1, c2, c3 = st.columns([1.2, 1, 1])
@@ -4370,7 +4395,7 @@ def page_manutencao(conn):
                     key="prev_create_status_reason",
                 )
 
-            if st.button("Registrar preventiva/calibração", type="primary"):
+            if st.button("Registrar preventiva/calibração", type="primary", disabled=not can_manage_maintenance):
                 if not description.strip():
                     st.error("Informe a descrição da atividade.")
                 elif planned_end_date and planned_date and planned_end_date < planned_date:
@@ -4528,20 +4553,24 @@ def page_manutencao(conn):
             if shown_preventive == 0:
                 st.caption("Nenhum anexo cadastrado.")
 
-        st.markdown("### Editar ou inativar preventiva/calibração")
-        prev_edit_df = query_df(
-            conn,
-            """
-            SELECT mp.*, e.equipment_code, e.equipment_name, e.location
-            FROM maintenance_preventive mp
-            JOIN equipment e ON e.id = mp.equipment_id
-            WHERE COALESCE(mp.is_active, 1) = 1
-            ORDER BY COALESCE(NULLIF(mp.next_date, ''), NULLIF(mp.planned_date, ''), mp.created_at) DESC,
-                     mp.id DESC
-            """,
-        )
+        if can_manage_maintenance:
+            st.markdown("### Editar ou inativar preventiva/calibração")
+            prev_edit_df = query_df(
+                conn,
+                """
+                SELECT mp.*, e.equipment_code, e.equipment_name, e.location
+                FROM maintenance_preventive mp
+                JOIN equipment e ON e.id = mp.equipment_id
+                WHERE COALESCE(mp.is_active, 1) = 1
+                ORDER BY COALESCE(NULLIF(mp.next_date, ''), NULLIF(mp.planned_date, ''), mp.created_at) DESC,
+                         mp.id DESC
+                """,
+            )
+        else:
+            prev_edit_df = pd.DataFrame()
         if prev_edit_df.empty:
-            st.info("Nenhuma preventiva/calibração ativa para editar.")
+            if can_manage_maintenance:
+                st.info("Nenhuma preventiva/calibração ativa para editar.")
         else:
             prev_options = prev_edit_df.apply(
                 lambda r: (
@@ -4736,18 +4765,21 @@ def page_manutencao(conn):
                     else:
                         st.error(msg)
 
-        inactive_prev_df = query_df(
-            conn,
-            """
-            SELECT mp.id, e.equipment_code, e.equipment_name, mp.activity_type,
-                   mp.status, mp.inactive_reason, mp.inactive_at, u.full_name AS inactive_by_name
-            FROM maintenance_preventive mp
-            JOIN equipment e ON e.id = mp.equipment_id
-            LEFT JOIN users u ON u.id = mp.inactive_by_id
-            WHERE COALESCE(mp.is_active, 1) = 0
-            ORDER BY mp.inactive_at DESC, mp.id DESC
-            """,
-        )
+        if can_manage_maintenance:
+            inactive_prev_df = query_df(
+                conn,
+                """
+                SELECT mp.id, e.equipment_code, e.equipment_name, mp.activity_type,
+                       mp.status, mp.inactive_reason, mp.inactive_at, u.full_name AS inactive_by_name
+                FROM maintenance_preventive mp
+                JOIN equipment e ON e.id = mp.equipment_id
+                LEFT JOIN users u ON u.id = mp.inactive_by_id
+                WHERE COALESCE(mp.is_active, 1) = 0
+                ORDER BY mp.inactive_at DESC, mp.id DESC
+                """,
+            )
+        else:
+            inactive_prev_df = pd.DataFrame()
         if not inactive_prev_df.empty:
             with st.expander("Preventivas/calibrações inativas para auditoria", expanded=False):
                 st.dataframe(_display_df(inactive_prev_df), use_container_width=True, hide_index=True)
@@ -4755,66 +4787,120 @@ def page_manutencao(conn):
     with tab_corr:
         st.markdown("### Manutenção corretiva e suporte")
         st.write("Tickets abertos por usuários quando há falha, quebra, ruído, anomalia operacional ou necessidade de suporte.")
+        if qr_maintenance_message:
+            st.info(qr_maintenance_message)
+        elif qr_maintenance_issue:
+            st.warning(qr_maintenance_issue)
+        if not can_manage_maintenance:
+            st.caption("Membros podem abrir tickets corretivos. Edição, alteração de status e inativação ficam restritas a Gerente ou Administrador.")
 
         with st.container(border=True):
             c1, c2 = st.columns(2)
             with c1:
-                eq_label = st.selectbox("Equipamento", _equipment_options(equipment), key="corr_eq")
-                equipment_id = _equipment_id_from_label(equipment, eq_label)
-                selected = equipment[equipment["id"] == equipment_id].iloc[0]
-                st.info(f"**Local:** {clean_value(selected.get('location'))}  \n**Patrimônio/código:** {clean_value(selected.get('equipment_code'))}")
+                equipment_options = _equipment_options(equipment)
+                manual_placeholder = "Selecione um equipamento"
+                corr_select_options = equipment_options
+                corr_equipment_index = 0
+                if qr_maintenance_equipment_id is not None:
+                    equipment_ids = equipment["id"].astype(int).tolist()
+                    if qr_maintenance_equipment_id in equipment_ids:
+                        corr_equipment_index = equipment_ids.index(qr_maintenance_equipment_id)
+                elif qr_maintenance_issue:
+                    corr_select_options = [manual_placeholder] + equipment_options
+                eq_label = st.selectbox("Equipamento", corr_select_options, index=corr_equipment_index, key="corr_eq")
+                equipment_id = None
+                selected = pd.Series(dtype=object)
+                if eq_label == manual_placeholder:
+                    st.info("Selecione manualmente um equipamento para abrir o ticket.")
+                else:
+                    equipment_id = _equipment_id_from_label(equipment, eq_label)
+                    selected = equipment[equipment["id"] == equipment_id].iloc[0]
+                    st.info(f"**Local:** {clean_value(selected.get('location'))}  \n**Patrimônio/código:** {clean_value(selected.get('equipment_code'))}")
                 reporter_id = None
-                if not users.empty:
+                if can_manage_maintenance and not users.empty:
                     user_labels = ["Não informado"] + users.apply(lambda r: f"{clean_value(r.get('full_name'))} ({clean_value(r.get('role'), 'member')})", axis=1).tolist()
                     reporter_label = st.selectbox("Usuário que abriu o ticket", user_labels, key="corr_reporter")
                     if reporter_label != "Não informado":
                         reporter_id = int(users.iloc[user_labels.index(reporter_label) - 1]["id"])
-                title = st.text_input("Título do ticket", placeholder="Ex.: Microscópio não liga", key="corr_title")
+                elif not can_manage_maintenance:
+                    reporter_id = _current_user_id()
+                    st.caption(f"Ticket registrado por: {clean_value(current_user().get('full_name'))}")
+                title = st.text_input(
+                    "Título do ticket" if can_manage_maintenance else "Resumo do problema",
+                    placeholder="Ex.: Microscópio não liga",
+                    key="corr_title",
+                )
                 occurrence_date = st.date_input("Data da ocorrência", value=date.today(), key="corr_occurrence_date")
                 occurrence_time = st.time_input("Hora da ocorrência", value=datetime.now().time().replace(second=0, microsecond=0), step=timedelta(minutes=15), key="corr_occurrence_time")
             with c2:
-                description = st.text_area("Descrição detalhada", placeholder="Explique a falha, mensagem de erro, contexto de uso, sintomas observados...", key="corr_desc")
-                impact = st.selectbox("Impacto", ["crítico", "moderado", "baixo"], index=2, key="corr_impact")
+                description = st.text_area("Descrição detalhada" if can_manage_maintenance else "Descrição do problema *", placeholder="Explique a falha, mensagem de erro, contexto de uso, sintomas observados...", key="corr_desc")
+                if can_manage_maintenance:
+                    impact = st.selectbox("Impacto", ["crítico", "moderado", "baixo"], index=2, key="corr_impact")
+                else:
+                    impact = "baixo"
                 priority = st.selectbox("Prioridade sugerida", ["alta", "média", "baixa"], index=2, key="corr_priority")
                 attachment = st.file_uploader("Anexos (foto, vídeo, print)", type=["png", "jpg", "jpeg", "pdf", "mp4", "mov"], key="corr_attach")
 
             st.markdown("#### Peças de reposição associadas ao equipamento")
-            render_equipment_spare_parts(list_spare_parts_for_equipment(conn, equipment_id))
+            if equipment_id is None:
+                st.caption("Selecione um equipamento para consultar peças associadas.")
+            else:
+                render_equipment_spare_parts(list_spare_parts_for_equipment(conn, equipment_id))
 
-            st.markdown("#### Diagnóstico e ações")
-            d1, d2, d3 = st.columns(3)
-            with d1:
-                assigned_to = st.text_input("Responsável pelo atendimento", value=clean_input(selected.get("responsible_name")), key="corr_assigned_to")
-                operator_trained = st.selectbox("Operador era treinado?", ["não informado", "sim", "não"], key="corr_operator_trained")
-                external_supplier_needed = st.checkbox("Necessita fornecedor externo", value=False, key="corr_external_supplier_needed")
-            with d2:
-                initial_diagnosis = st.text_area("Diagnóstico inicial", key="diag")
-                probable_cause = st.text_area("Causa provável", key="cause")
-            with d3:
-                corrective_action = st.text_area("Ação corretiva realizada", key="action")
-                replaced_parts = st.text_input("Peças substituídas", key="corr_replaced_parts")
-                costs = st.number_input("Custos envolvidos (R$)", min_value=0.0, value=0.0, step=50.0, key="corr_costs")
-                downtime_hours = st.number_input("Downtime (h)", min_value=0.0, value=0.0, step=0.5, key="corr_downtime_hours")
+            if can_manage_maintenance:
+                st.markdown("#### Diagnóstico e ações")
+                d1, d2, d3 = st.columns(3)
+                with d1:
+                    assigned_to = st.text_input("Responsável pelo atendimento", value=clean_input(selected.get("responsible_name")), key="corr_assigned_to")
+                    operator_trained = st.selectbox("Operador era treinado?", ["não informado", "sim", "não"], key="corr_operator_trained")
+                    external_supplier_needed = st.checkbox("Necessita fornecedor externo", value=False, key="corr_external_supplier_needed")
+                with d2:
+                    initial_diagnosis = st.text_area("Diagnóstico inicial", key="diag")
+                    probable_cause = st.text_area("Causa provável", key="cause")
+                with d3:
+                    corrective_action = st.text_area("Ação corretiva realizada", key="action")
+                    replaced_parts = st.text_input("Peças substituídas", key="corr_replaced_parts")
+                    costs = st.number_input("Custos envolvidos (R$)", min_value=0.0, value=0.0, step=50.0, key="corr_costs")
+                    downtime_hours = st.number_input("Downtime (h)", min_value=0.0, value=0.0, step=0.5, key="corr_downtime_hours")
 
-            status = st.selectbox("Status do ticket", CORRECTIVE_STATUSES, key="corr_status")
-            corr_create_status_reason = ""
-            if _maintenance_status_requires_justification("aberto", status, creating=True):
-                corr_create_status_reason = st.text_area(
-                    "Justificativa do status *",
-                    placeholder="Explique brevemente o motivo do status selecionado.",
-                    key="corr_create_status_reason",
-                )
-            conclusion_date = st.date_input("Data de conclusão", value=None, key="corr_conclusion")
+                status = st.selectbox("Status do ticket", CORRECTIVE_STATUSES, key="corr_status")
+                corr_create_status_reason = ""
+                if _maintenance_status_requires_justification("aberto", status, creating=True):
+                    corr_create_status_reason = st.text_area(
+                        "Justificativa do status *",
+                        placeholder="Explique brevemente o motivo do status selecionado.",
+                        key="corr_create_status_reason",
+                    )
+                conclusion_date = st.date_input("Data de conclusão", value=None, key="corr_conclusion")
 
-            st.markdown("#### Notificações futuras")
-            n1, n2, n3, n4 = st.columns(4)
-            notify_technical = n1.checkbox("Responsável técnico", value=True, key="corr_notify_technical")
-            notify_manager = n2.checkbox("Gestor do laboratório", value=True, key="corr_notify_manager")
-            notify_supplier = n3.checkbox("Fornecedor", value=False, key="corr_notify_supplier")
-            notify_reporter = n4.checkbox("Usuário que abriu", value=True, key="corr_notify_reporter")
+                st.markdown("#### Notificações futuras")
+                n1, n2, n3, n4 = st.columns(4)
+                notify_technical = n1.checkbox("Responsável técnico", value=True, key="corr_notify_technical")
+                notify_manager = n2.checkbox("Gestor do laboratório", value=True, key="corr_notify_manager")
+                notify_supplier = n3.checkbox("Fornecedor", value=False, key="corr_notify_supplier")
+                notify_reporter = n4.checkbox("Usuário que abriu", value=True, key="corr_notify_reporter")
+            else:
+                assigned_to = clean_input(selected.get("responsible_name"))
+                operator_trained = "não informado"
+                external_supplier_needed = False
+                initial_diagnosis = ""
+                probable_cause = ""
+                corrective_action = ""
+                replaced_parts = ""
+                costs = 0.0
+                downtime_hours = 0.0
+                status = "aberto"
+                corr_create_status_reason = ""
+                conclusion_date = None
+                notify_technical = True
+                notify_manager = True
+                notify_supplier = False
+                notify_reporter = True
 
-            if st.button("Abrir ticket corretivo", type="primary"):
-                if not title.strip() or not description.strip():
+            if st.button("Abrir ticket corretivo", type="primary", disabled=equipment_id is None):
+                if equipment_id is None:
+                    st.error("Selecione um equipamento para abrir o ticket.")
+                elif not title.strip() or not description.strip():
                     st.error("Informe o título e a descrição do ticket.")
                 elif _maintenance_status_requires_justification("aberto", status, creating=True) and not corr_create_status_reason.strip():
                     st.error("Informe a justificativa para este status.")
@@ -4878,7 +4964,10 @@ def page_manutencao(conn):
                     st.rerun()
 
         st.markdown("### Tickets corretivos")
-        show_inactive_corr = st.checkbox("Mostrar tickets inativos para auditoria", value=False, key="corr_show_inactive")
+        if can_manage_maintenance:
+            show_inactive_corr = st.checkbox("Mostrar tickets inativos para auditoria", value=False, key="corr_show_inactive")
+        else:
+            show_inactive_corr = False
         corr_df = query_df(
             conn,
             """
@@ -4920,7 +5009,9 @@ def page_manutencao(conn):
                     st.markdown("##### Histórico de status")
                     render_maintenance_status_history(conn, entity_type="corrective", entity_id=int(ticket["id"]))
             active_corr = corr_df[corr_df["is_active"].map(lambda value: True if is_blank(value) else truthy(value))]
-            active_ids = active_corr[~active_corr["status"].isin(["concluído", "cancelado"])] ["id"].tolist()
+            active_ids = active_corr[~active_corr["status"].isin(["concluído", "cancelado"])] ["id"].tolist() if can_manage_maintenance else []
+            if not can_manage_maintenance:
+                st.caption("Alteração de status de tickets corretivos é restrita a Gerente ou Administrador.")
             if active_ids:
                 c1, c2 = st.columns([1, 1])
                 with c1:
@@ -4952,30 +5043,34 @@ def page_manutencao(conn):
                         else:
                             st.error(msg)
 
-        st.markdown("### Editar ou inativar ticket corretivo")
-        corr_edit_df = query_df(
-            conn,
-            """
-            SELECT mc.*, e.equipment_code, e.equipment_name, e.location,
-                   u.full_name AS reporter
-            FROM maintenance_corrective mc
-            JOIN equipment e ON e.id = mc.equipment_id
-            LEFT JOIN users u ON u.id = mc.reporter_id
-            WHERE COALESCE(mc.is_active, 1) = 1
-            ORDER BY CASE mc.status
-                       WHEN 'aberto' THEN 0
-                       WHEN 'em análise' THEN 1
-                       WHEN 'aguardando peça' THEN 2
-                       WHEN 'enviado para fornecedor' THEN 3
-                       WHEN 'concluído' THEN 4
-                       WHEN 'cancelado' THEN 5
-                       ELSE 6
-                     END,
-                     mc.created_at DESC
-            """,
-        )
+        if can_manage_maintenance:
+            st.markdown("### Editar ou inativar ticket corretivo")
+            corr_edit_df = query_df(
+                conn,
+                """
+                SELECT mc.*, e.equipment_code, e.equipment_name, e.location,
+                       u.full_name AS reporter
+                FROM maintenance_corrective mc
+                JOIN equipment e ON e.id = mc.equipment_id
+                LEFT JOIN users u ON u.id = mc.reporter_id
+                WHERE COALESCE(mc.is_active, 1) = 1
+                ORDER BY CASE mc.status
+                           WHEN 'aberto' THEN 0
+                           WHEN 'em análise' THEN 1
+                           WHEN 'aguardando peça' THEN 2
+                           WHEN 'enviado para fornecedor' THEN 3
+                           WHEN 'concluído' THEN 4
+                           WHEN 'cancelado' THEN 5
+                           ELSE 6
+                         END,
+                         mc.created_at DESC
+                """,
+            )
+        else:
+            corr_edit_df = pd.DataFrame()
         if corr_edit_df.empty:
-            st.info("Nenhum ticket corretivo ativo para editar.")
+            if can_manage_maintenance:
+                st.info("Nenhum ticket corretivo ativo para editar.")
         else:
             corr_options = corr_edit_df.apply(
                 lambda r: (
@@ -6519,7 +6614,16 @@ def page_qrcodes(conn):
     hero()
     st.subheader("QR Codes físicos")
     st.caption("Gere QR Codes para fixar em equipamentos, embalagens, prateleiras ou armários. A ideia é reduzir atrito: escaneou, achou a ação certa.")
-    equipment = query_df(conn, "SELECT * FROM equipment WHERE active=1 ORDER BY equipment_code")
+    equipment = query_df(
+        conn,
+        """
+        SELECT *
+        FROM equipment
+        WHERE active=1
+          AND (operational_status IS NULL OR LOWER(TRIM(operational_status)) <> 'inactive')
+        ORDER BY equipment_code
+        """,
+    )
     supplies = query_df(conn, "SELECT * FROM supplies WHERE active=1 ORDER BY supply_name")
     base_url = st.text_input("URL pública do aplicativo", value="https://labcim-manager.streamlit.app", key="qr_base_url")
     base_url = base_url.rstrip("/")
