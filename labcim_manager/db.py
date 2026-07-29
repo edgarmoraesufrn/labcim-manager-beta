@@ -138,6 +138,9 @@ def init_db(conn: DatabaseConnection) -> None:
             pop_responsible TEXT,
             document_notes TEXT,
             notes TEXT,
+            inactive_reason TEXT,
+            inactive_by_id INTEGER,
+            inactive_at TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
@@ -494,6 +497,9 @@ def init_db(conn: DatabaseConnection) -> None:
     _add_column(conn, "equipment", "pop_updated_at", "TEXT")
     _add_column(conn, "equipment", "pop_responsible", "TEXT")
     _add_column(conn, "equipment", "document_notes", "TEXT")
+    _add_column(conn, "equipment", "inactive_reason", "TEXT")
+    _add_column(conn, "equipment", "inactive_by_id", "INTEGER")
+    _add_column(conn, "equipment", "inactive_at", "TEXT")
     _add_column(conn, "equipment", "updated_at", "TEXT")
     _add_column(conn, "users", "updated_at", "TEXT")
     _add_column(conn, "projects", "objective", "TEXT")
@@ -1537,7 +1543,11 @@ def create_booking(
         if int(eq["active"] or 0) != 1:
             conn.rollback()
             return False, "Este equipamento está inativo.", None
-        if eq["operational_status"] == "maintenance":
+        operational_status = str(eq["operational_status"] or "").strip().lower()
+        if operational_status == "inactive":
+            conn.rollback()
+            return False, "Este equipamento está inativo.", None
+        if operational_status == "maintenance":
             conn.rollback()
             return False, "Este equipamento está marcado como em manutenção.", None
         if int(eq["requires_operator"] or 0) == 1 and operator_id is None:
@@ -1773,11 +1783,23 @@ def update_equipment_master(
     pop_responsible: str | None,
     document_notes: str | None,
     notes: str | None,
+    inactive_reason: str | None = None,
+    inactive_by_id: int | None = None,
 ) -> tuple[bool, str]:
     equipment_code = equipment_code.strip()
     equipment_name = equipment_name.strip()
     if not equipment_code or not equipment_name:
         return False, "Informe código e nome do equipamento."
+    current = conn.execute("SELECT active FROM equipment WHERE id = ?", [equipment_id]).fetchone()
+    if not current:
+        conn.rollback()
+        return False, "Equipamento não encontrado."
+    was_active = int(current["active"] or 0) == 1
+    will_be_inactive = int(active or 0) == 0
+    is_inactivation = was_active and will_be_inactive
+    if is_inactivation and not str(inactive_reason or "").strip():
+        conn.rollback()
+        return False, "Informe o motivo da inativação do equipamento."
     try:
         conn.execute(
             """
@@ -1831,10 +1853,25 @@ def update_equipment_master(
                 equipment_id,
             ],
         )
+        if is_inactivation:
+            conn.execute(
+                """
+                UPDATE equipment
+                SET inactive_reason = ?,
+                    inactive_by_id = ?,
+                    inactive_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                [inactive_reason.strip(), inactive_by_id, equipment_id],
+            )
         conn.commit()
         return True, "Equipamento atualizado com sucesso."
     except _INTEGRITY_ERRORS:
+        conn.rollback()
         return False, "Já existe outro equipamento com este código."
+    except Exception as exc:
+        conn.rollback()
+        return False, f"Erro ao atualizar equipamento: {exc}"
 
 
 def create_user(
