@@ -96,6 +96,9 @@ CACHE_TTL_SECONDS = 120
 DB_CONNECTION_KEY = "labcim_db_connection"
 DB_CONNECTION_FINGERPRINT_KEY = "labcim_db_connection_fingerprint"
 PERF_EVENTS_KEY = "labcim_perf_events"
+APP_CACHE_GENERATION_KEY = "labcim_app_cache_generation"
+REPORT_EXCEL_BYTES_KEY = "labcim_report_excel_bytes"
+REPORT_EXCEL_SIGNATURE_KEY = "labcim_report_excel_signature"
 REPORT_CACHE_TABLES = (
     "bookings",
     "maintenance_preventive",
@@ -640,6 +643,10 @@ def get_conn():
 def clear_app_caches() -> None:
     try:
         st.cache_data.clear()
+    except Exception:
+        pass
+    try:
+        st.session_state[APP_CACHE_GENERATION_KEY] = int(st.session_state.get(APP_CACHE_GENERATION_KEY, 0) or 0) + 1
     except Exception:
         pass
 
@@ -5138,6 +5145,8 @@ def _supply_traceability_df(supply_movements: pd.DataFrame) -> pd.DataFrame:
 
 
 def _filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, pd.DataFrame]:
+    start_datetime_iso = datetime.combine(start_date, time.min).isoformat(timespec="minutes")
+    end_exclusive_datetime_iso = datetime.combine(end_date + timedelta(days=1), time.min).isoformat(timespec="minutes")
     bookings = query_df(
         conn,
         """
@@ -5156,10 +5165,11 @@ def _filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, 
         LEFT JOIN users perf ON perf.id=b.performed_by_id
         LEFT JOIN projects p ON p.id=b.project_id
         LEFT JOIN project_services ps ON ps.id=b.service_id
-        WHERE SUBSTR(b.start_datetime, 1, 10) BETWEEN ? AND ?
+        WHERE b.start_datetime >= ?
+          AND b.start_datetime < ?
         ORDER BY b.start_datetime
         """,
-        [start_date.isoformat(), end_date.isoformat()],
+        [start_datetime_iso, end_exclusive_datetime_iso],
     )
 
     preventive = query_df(
@@ -5223,7 +5233,8 @@ def _filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, 
         LEFT JOIN users u ON u.id=sm.user_id
         LEFT JOIN projects p ON p.id=sm.project_id
         LEFT JOIN project_services ps ON ps.id=sm.service_id
-        WHERE SUBSTR(sm.movement_date, 1, 10) BETWEEN ? AND ?
+        WHERE sm.movement_date >= ?
+          AND sm.movement_date <= ?
         ORDER BY sm.movement_date
         """,
         [start_date.isoformat(), end_date.isoformat()],
@@ -5344,16 +5355,40 @@ def _cached_filtered_reports_data(
         conn.close()
 
 
-def filtered_reports_data(conn, start_date: date, end_date: date) -> dict[str, pd.DataFrame]:
+def filtered_reports_data(
+    conn,
+    start_date: date,
+    end_date: date,
+    *,
+    data_fingerprint: str | None = None,
+) -> dict[str, pd.DataFrame]:
     database_url = _database_url()
+    data_fingerprint = data_fingerprint or _reports_data_fingerprint(conn)
     with perf_timer("Dados de relatórios"):
         return _cached_filtered_reports_data(
             _database_fingerprint(database_url),
             start_date.isoformat(),
             end_date.isoformat(),
-            _reports_data_fingerprint(conn),
+            data_fingerprint,
             _database_url_value=database_url,
         )
+
+
+def _reports_excel_signature(
+    start_date: date,
+    end_date: date,
+    database_fingerprint: str,
+    data_fingerprint: str,
+    cache_generation: int,
+) -> str:
+    raw = "|".join([
+        start_date.isoformat(),
+        end_date.isoformat(),
+        database_fingerprint,
+        data_fingerprint,
+        str(cache_generation),
+    ])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def _with_booking_duration(bookings: pd.DataFrame) -> pd.DataFrame:
@@ -5518,7 +5553,18 @@ def page_relatorios(conn):
             return
 
     period_text = _period_label(start_date, end_date)
-    data = filtered_reports_data(conn, start_date, end_date)
+    database_url = _database_url()
+    database_fingerprint = _database_fingerprint(database_url)
+    reports_data_fingerprint = _reports_data_fingerprint(conn)
+    cache_generation = int(st.session_state.get(APP_CACHE_GENERATION_KEY, 0) or 0)
+    excel_signature = _reports_excel_signature(
+        start_date,
+        end_date,
+        database_fingerprint,
+        reports_data_fingerprint,
+        cache_generation,
+    )
+    data = filtered_reports_data(conn, start_date, end_date, data_fingerprint=reports_data_fingerprint)
     bookings = _with_booking_duration(data["bookings"])
     preventive = data["preventive"]
     corrective = data["corrective"]
@@ -5541,15 +5587,24 @@ def page_relatorios(conn):
     k5.metric("Serviços", len(services))
     k6.metric("Mov. insumos", len(supply_movements))
 
-    excel_bytes = _reports_excel_bytes(period_text, data)
-    st.download_button(
-        "📥 Baixar relatório completo em Excel",
-        data=excel_bytes,
-        file_name=f"LabCim_Relatorio_{start_date.isoformat()}_{end_date.isoformat()}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="download_full_report_xlsx",
-        type="primary",
-    )
+    if st.button("Preparar Excel completo", type="primary", key="prepare_full_report_xlsx"):
+        st.session_state[REPORT_EXCEL_BYTES_KEY] = _reports_excel_bytes(period_text, data)
+        st.session_state[REPORT_EXCEL_SIGNATURE_KEY] = excel_signature
+
+    if (
+        st.session_state.get(REPORT_EXCEL_SIGNATURE_KEY) == excel_signature
+        and REPORT_EXCEL_BYTES_KEY in st.session_state
+    ):
+        st.download_button(
+            "Baixar relatório completo em Excel",
+            data=st.session_state[REPORT_EXCEL_BYTES_KEY],
+            file_name=f"LabCim_Relatorio_{start_date.isoformat()}_{end_date.isoformat()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_full_report_xlsx",
+            type="primary",
+        )
+    else:
+        st.caption("Prepare novamente o Excel para o período selecionado.")
 
     tab_overview, tab_bookings, tab_projects, tab_maintenance, tab_supplies, tab_tables = st.tabs(
         ["Resumo executivo", "Reservas e uso", "Projetos e serviços", "Manutenção", "Insumos", "Tabelas auditáveis"]
