@@ -1464,6 +1464,23 @@ def _select_index_by_code(equipment: pd.DataFrame, code: str | None) -> int:
     return codes.index(code) if code in codes else 0
 
 
+def _equipment_row_by_code(equipment: pd.DataFrame, code: str | None):
+    if not code or equipment.empty or "equipment_code" not in equipment.columns:
+        return None
+    code_text = str(code).strip().upper()
+    matches = equipment[equipment["equipment_code"].astype(str).str.strip().str.upper() == code_text]
+    if matches.empty:
+        return None
+    return matches.iloc[0]
+
+
+def _reservable_equipment(equipment: pd.DataFrame) -> pd.DataFrame:
+    if equipment.empty:
+        return equipment.copy()
+    status = equipment.get("operational_status", pd.Series("", index=equipment.index)).fillna("").astype(str).str.strip().str.lower()
+    return equipment[(equipment["active"] == 1) & (status != "inactive")].copy()
+
+
 def _user_options(users: pd.DataFrame) -> list[str]:
     return users.apply(lambda r: f"{clean_value(r.get('full_name'))} ({clean_value(r.get('department'), 'sem vínculo')})", axis=1).tolist()
 
@@ -1778,23 +1795,49 @@ def page_reservas(conn):
         st.warning("Cadastre/importe equipamentos e usuários antes de criar reservas.")
         return
 
-    active_equipment = equipment[equipment["active"] == 1].copy()
+    active_equipment = _reservable_equipment(equipment)
     active_users = users[users["active"] == 1].copy()
     active_projects = projects[projects["active"] == 1].copy()
     booking_user = current_user()
     current_user_id = _current_user_id()
     can_choose_requester = can_manage_master_data()
     if active_equipment.empty or active_users.empty:
-        st.warning("É necessário ter ao menos um equipamento e um usuário ativos.")
+        st.warning("É necessário ter ao menos um equipamento disponível para reserva e um usuário ativo.")
         return
 
     qr_eq = st.query_params.get("eq", None)
+    qr_issue = None
+    qr_selection_code = qr_eq
+    if qr_eq:
+        qr_row = _equipment_row_by_code(equipment, qr_eq)
+        if qr_row is None:
+            qr_issue = "QR Code aponta para equipamento não encontrado. Selecione o equipamento manualmente."
+            qr_selection_code = None
+        else:
+            qr_status = clean_input(qr_row.get("operational_status")).lower()
+            if not truthy(qr_row.get("active")) or qr_status == "inactive":
+                qr_issue = (
+                    "QR Code aponta para equipamento inativo. "
+                    f"{clean_value(qr_row.get('equipment_code'))} — {clean_value(qr_row.get('equipment_name'))} não está disponível para nova reserva."
+                )
+                qr_selection_code = None
+    if qr_issue:
+        st.warning(qr_issue)
+
     eq_labels = _equipment_options(active_equipment)
-    selected_index = _select_index_by_code(active_equipment, qr_eq)
+    manual_placeholder = "Selecione um equipamento"
+    selected_index = _select_index_by_code(active_equipment, qr_selection_code)
 
     top1, top2 = st.columns([2, 1])
     with top1:
-        eq_label = st.selectbox("Equipamento", eq_labels, index=selected_index, key="booking_eq_main")
+        if qr_issue:
+            eq_options = [manual_placeholder] + eq_labels
+            eq_label = st.selectbox("Equipamento", eq_options, index=0, key="booking_eq_manual_after_qr_issue")
+            if eq_label == manual_placeholder:
+                st.info("Selecione manualmente um equipamento disponível para continuar.")
+                return
+        else:
+            eq_label = st.selectbox("Equipamento", eq_labels, index=selected_index, key="booking_eq_main")
     equipment_id = _equipment_id_from_label(active_equipment, eq_label)
     selected_eq = active_equipment[active_equipment["id"] == equipment_id].iloc[0]
     operator_required = truthy(selected_eq.get("requires_operator"))
@@ -2461,7 +2504,7 @@ def page_projetos(conn):
 def page_equipamentos(conn):
     hero()
     st.subheader("Equipamentos")
-    st.caption("Cadastro operacional simples: status, capacidade, funcionalidades indisponíveis, documentação e localização. O cadastro mestre fica restrito ao administrador.")
+    st.caption("Cadastro operacional simples: status, capacidade, funcionalidades indisponíveis, documentação e localização. O cadastro mestre fica restrito a gerente/administrador.")
 
     equipment, _, _, _ = load_reference_data(conn)
     display_cols = [
@@ -2508,6 +2551,7 @@ def page_equipamentos(conn):
                         list(EQUIPMENT_STATUS_LABELS.values()),
                         index=list(EQUIPMENT_STATUS_LABELS.keys()).index(current_status) if current_status in EQUIPMENT_STATUS_LABELS else 0,
                     )
+                    st.caption("Uso restrito sinaliza limitação operacional, mas não bloqueia reserva automaticamente. Para inativar, use o cadastro mestre.")
                     location = st.text_input("Localização", value=clean_input(selected.get("location")), placeholder="Ex.: Lab Tecnológico, Sala de Raios X...")
                     technical_manager = st.text_input("Gestor técnico", value=clean_input(selected.get("technical_manager")) or clean_input(selected.get("responsible_name")))
                 with c2:
@@ -2516,6 +2560,7 @@ def page_equipamentos(conn):
                     max_sample_capacity = st.number_input("Capacidade máxima por reserva", min_value=0, value=initial_capacity, step=1)
                     capacity_unit = st.text_input("Unidade da capacidade", value=clean_value(selected.get("capacity_unit"), "amostras"))
                     capacity_enforced = st.checkbox("Bloquear acima da capacidade", value=truthy(selected.get("capacity_enforced")))
+                    st.caption("Capacidade usual apenas alerta; bloqueio rígido impede reserva acima da capacidade.")
                 with c3:
                     unavailable_functions = st.text_area(
                         "Funcionalidades indisponíveis",
@@ -2543,41 +2588,44 @@ def page_equipamentos(conn):
             if submitted:
                 old_status = clean_input(selected.get("operational_status")) or "available"
                 new_status = EQUIPMENT_STATUS_REVERSE[status_label]
-                update_equipment_operational_info(
-                    conn,
-                    equipment_id,
-                    location=location.strip() or None,
-                    operational_status=new_status,
-                    unavailable_functions=unavailable_functions.strip() or None,
-                    max_sample_capacity=int(max_sample_capacity) if max_sample_capacity else None,
-                    capacity_unit=capacity_unit.strip() or "amostras",
-                    capacity_enforced=int(capacity_enforced),
-                    technical_manager=technical_manager.strip() or None,
-                    pop_title=pop_title.strip() or None,
-                    pop_path=pop_path.strip() or None,
-                    pop_version=pop_version.strip() or None,
-                    pop_updated_at=pop_updated_at.strip() or None,
-                    pop_responsible=pop_responsible.strip() or None,
-                    document_notes=document_notes.strip() or None,
-                    notes=notes.strip() or None,
-                )
-                if new_status == "maintenance" and old_status != "maintenance":
-                    sent, total = notify_equipment_maintenance(
+                if new_status == "inactive":
+                    st.error("Para inativar equipamento, use o cadastro mestre e informe uma justificativa.")
+                else:
+                    update_equipment_operational_info(
                         conn,
-                        equipment_id=equipment_id,
-                        title="equipamento em manutenção",
-                        message=(
-                            "O equipamento foi marcado como EM MANUTENÇÃO no sistema.\n"
-                            f"Observações: {notes.strip() or unavailable_functions.strip() or 'Sem observações adicionais.'}"
-                        ),
-                        related_table="equipment",
-                        related_id=equipment_id,
+                        equipment_id,
+                        location=location.strip() or None,
+                        operational_status=new_status,
+                        unavailable_functions=unavailable_functions.strip() or None,
+                        max_sample_capacity=int(max_sample_capacity) if max_sample_capacity else None,
+                        capacity_unit=capacity_unit.strip() or "amostras",
+                        capacity_enforced=int(capacity_enforced),
+                        technical_manager=technical_manager.strip() or None,
+                        pop_title=pop_title.strip() or None,
+                        pop_path=pop_path.strip() or None,
+                        pop_version=pop_version.strip() or None,
+                        pop_updated_at=pop_updated_at.strip() or None,
+                        pop_responsible=pop_responsible.strip() or None,
+                        document_notes=document_notes.strip() or None,
+                        notes=notes.strip() or None,
                     )
-                    if total:
-                        st.info(f"Notificação de manutenção registrada para {total} destinatário(s). Enviadas: {sent}.")
-                st.success("Dados operacionais do equipamento atualizados.")
-                clear_app_caches()
-                st.rerun()
+                    if new_status == "maintenance" and old_status != "maintenance":
+                        sent, total = notify_equipment_maintenance(
+                            conn,
+                            equipment_id=equipment_id,
+                            title="equipamento em manutenção",
+                            message=(
+                                "O equipamento foi marcado como EM MANUTENÇÃO no sistema.\n"
+                                f"Observações: {notes.strip() or unavailable_functions.strip() or 'Sem observações adicionais.'}"
+                            ),
+                            related_table="equipment",
+                            related_id=equipment_id,
+                        )
+                        if total:
+                            st.info(f"Notificação de manutenção registrada para {total} destinatário(s). Enviadas: {sent}.")
+                    st.success("Dados operacionais do equipamento atualizados.")
+                    clear_app_caches()
+                    st.rerun()
 
     with tab_parts:
         st.markdown("### Peças de reposição associadas")
@@ -2621,6 +2669,7 @@ def page_equipamentos(conn):
                     responsible_phone = st.text_input("Telefone do responsável", value=clean_input(selected.get("responsible_phone")) if selected is not None else "")
                     technical_manager = st.text_input("Gestor técnico", value=clean_input(selected.get("technical_manager")) if selected is not None else "")
                     requires_operator = st.checkbox("Requer operador", value=truthy(selected.get("requires_operator")) if selected is not None else False)
+                    st.caption("Quando marcado, o operador passa a ser obrigatório na criação da reserva.")
                 with c3:
                     current_status = selected.get("operational_status") if selected is not None else "available"
                     status_label = st.selectbox(
@@ -2629,11 +2678,13 @@ def page_equipamentos(conn):
                         index=list(EQUIPMENT_STATUS_LABELS.keys()).index(current_status) if current_status in EQUIPMENT_STATUS_LABELS else 0,
                         key="equipment_master_status",
                     )
+                    st.caption("Uso restrito sinaliza limitação operacional, mas não bloqueia reserva automaticamente. Inativação deve corresponder ao campo ativo.")
                     raw_capacity = selected.get("max_sample_capacity") if selected is not None else None
                     initial_capacity = int(raw_capacity) if not is_blank(raw_capacity) and raw_capacity else 0
                     max_sample_capacity = st.number_input("Capacidade máxima", min_value=0, value=initial_capacity, step=1, key="equipment_master_capacity")
                     capacity_unit = st.text_input("Unidade da capacidade", value=clean_value(selected.get("capacity_unit"), "amostras") if selected is not None else "amostras")
                     capacity_enforced = st.checkbox("Bloquear acima da capacidade", value=truthy(selected.get("capacity_enforced")) if selected is not None else False, key="equipment_master_enforce")
+                    st.caption("Capacidade usual apenas alerta; bloqueio rígido impede reserva acima da capacidade.")
                     active = st.checkbox("Equipamento ativo", value=truthy(selected.get("active")) if selected is not None else True)
 
                 unavailable_functions = st.text_area("Funcionalidades indisponíveis", value=clean_input(selected.get("unavailable_functions")) if selected is not None else "")
@@ -2649,10 +2700,22 @@ def page_equipamentos(conn):
                 with d3:
                     pop_responsible = st.text_input("Responsável pelo POP", value=clean_input(selected.get("pop_responsible")) if selected is not None else "")
                     document_notes = st.text_area("Observações documentais", value=clean_input(selected.get("document_notes")) if selected is not None else "")
+                inactive_reason = ""
+                if mode == "Editar equipamento existente" and selected is not None and truthy(selected.get("active")):
+                    inactive_reason = st.text_area(
+                        "Motivo da inativação",
+                        value="",
+                        placeholder="Obrigatório se desmarcar Equipamento ativo.",
+                        key="equipment_inactive_reason",
+                    )
 
                 submitted = st.form_submit_button("Salvar equipamento", type="primary")
 
             if submitted:
+                new_operational_status = EQUIPMENT_STATUS_REVERSE[status_label]
+                is_inactivation = mode == "Editar equipamento existente" and selected is not None and truthy(selected.get("active")) and not active
+                if not active:
+                    new_operational_status = "inactive"
                 payload = dict(
                     equipment_code=equipment_code,
                     equipment_name=equipment_name,
@@ -2662,7 +2725,7 @@ def page_equipamentos(conn):
                     responsible_name=responsible_name.strip() or None,
                     responsible_phone=responsible_phone.strip() or None,
                     active=int(active),
-                    operational_status=EQUIPMENT_STATUS_REVERSE[status_label],
+                    operational_status=new_operational_status,
                     unavailable_functions=unavailable_functions.strip() or None,
                     max_sample_capacity=int(max_sample_capacity) if max_sample_capacity else None,
                     capacity_unit=capacity_unit.strip() or "amostras",
@@ -2680,7 +2743,18 @@ def page_equipamentos(conn):
                     ok, msg = create_equipment(conn, **payload)
                 else:
                     old_status = clean_input(selected.get("operational_status")) or "available"
-                    ok, msg = update_equipment_master(conn, int(equipment_id), **payload)
+                    if is_inactivation and not inactive_reason.strip():
+                        ok, msg = False, "Informe o motivo da inativação do equipamento."
+                    elif active and new_operational_status == "inactive":
+                        ok, msg = False, "Para usar status Inativo, desmarque Equipamento ativo e informe uma justificativa."
+                    else:
+                        ok, msg = update_equipment_master(
+                            conn,
+                            int(equipment_id),
+                            **payload,
+                            inactive_reason=inactive_reason.strip() or None,
+                            inactive_by_id=_current_user_id(),
+                        )
                     if ok and payload["operational_status"] == "maintenance" and old_status != "maintenance":
                         sent, total = notify_equipment_maintenance(
                             conn,
