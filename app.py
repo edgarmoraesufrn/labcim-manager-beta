@@ -29,6 +29,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from labcim_manager.db import (
+    change_booking_status,
     change_maintenance_status,
     connect,
     create_attachment,
@@ -51,6 +52,7 @@ from labcim_manager.db import (
     init_db,
     is_operational_database_empty,
     list_attachments,
+    list_booking_status_history,
     list_equipment_for_spare_part,
     list_maintenance_status_history,
     list_project_services,
@@ -62,7 +64,6 @@ from labcim_manager.db import (
     seed_default_pops,
     set_spare_part_equipment_links,
     table_counts,
-    update_booking_status,
     update_corrective_ticket,
     update_equipment_master,
     update_equipment_operational_info,
@@ -127,6 +128,7 @@ STATUS_LABELS = {
     "no_show": "Não compareceu",
 }
 STATUS_REVERSE = {v: k for k, v in STATUS_LABELS.items()}
+BOOKING_FINAL_STATUSES = {"done", "cancelled", "no_show"}
 
 EQUIPMENT_STATUS_LABELS = {
     "available": "Apto",
@@ -1220,6 +1222,46 @@ def _format_datetime(value: str | None) -> str:
         return str(value)
 
 
+def _booking_status_reason_required(current_status: str, new_status: str, *, is_manager: bool) -> bool:
+    current_status = clean_input(current_status)
+    new_status = clean_input(new_status)
+    if current_status == new_status:
+        return False
+    if new_status in {"cancelled", "no_show"}:
+        return True
+    return is_manager and current_status in BOOKING_FINAL_STATUSES and new_status != current_status
+
+
+def render_booking_status_history(conn, booking_id: int) -> None:
+    history = list_booking_status_history(conn, int(booking_id))
+    if history.empty:
+        st.info("Sem histórico registrado para esta reserva.")
+        return
+
+    display = history.copy()
+    display["changed_at"] = display["changed_at"].map(_format_datetime)
+    display["previous_status"] = display["previous_status"].map(lambda value: "Criação" if is_blank(value) else status_badge(str(value)))
+    display["new_status"] = display["new_status"].map(lambda value: status_badge(str(value)))
+    display["changed_by_name"] = display["changed_by_name"].map(lambda value: clean_value(value, "Usuário não informado"))
+    display["reason"] = display["reason"].map(lambda value: clean_value(value, "-"))
+    display["source"] = display["source"].map(lambda value: clean_value(value, "-"))
+    display = display.rename(
+        columns={
+            "changed_at": "Data/hora",
+            "previous_status": "Status anterior",
+            "new_status": "Novo status",
+            "changed_by_name": "Usuário",
+            "reason": "Observação/justificativa",
+            "source": "Origem",
+        }
+    )
+    st.dataframe(
+        display[["Data/hora", "Status anterior", "Novo status", "Usuário", "Observação/justificativa", "Origem"]],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
 def _date_input_value(value, default=None):
     if is_blank(value):
         return default
@@ -1994,6 +2036,7 @@ def page_reservas(conn):
                     end_iso=end_dt.isoformat(timespec="minutes"),
                     sample_count=int(sample_count) if sample_count else None,
                     purpose=purpose,
+                    changed_by_id=current_user_id,
                 )
                 if ok:
                     st.session_state["booking_confirmation"] = {
@@ -2010,6 +2053,9 @@ def page_reservas(conn):
 
     with tab_gerenciar:
         st.markdown("### Gerenciar reservas")
+        booking_status_feedback = st.session_state.pop("booking_status_feedback", None)
+        if booking_status_feedback:
+            st.success(booking_status_feedback)
         c1, c2 = st.columns([1, 1])
         with c1:
             status_label = st.selectbox("Filtrar por status", ["Todos"] + list(STATUS_LABELS.values()), key="manage_status_filter")
@@ -2038,34 +2084,58 @@ def page_reservas(conn):
             is_own_booking = current_user_id is not None and booking_owner_id == current_user_id
             can_cancel_own_booking = is_own_booking and booking_status == "scheduled"
 
+            status_reason = ""
+            if can_manage_any_booking or can_cancel_own_booking:
+                status_reason = st.text_area(
+                    "Observação/justificativa da mudança de status",
+                    placeholder="Obrigatória para cancelamento, não comparecimento e correções de reservas já finalizadas.",
+                    height=90,
+                    key=f"booking_status_reason_{booking_id}",
+                )
+
+            def _submit_booking_status_change(new_status: str) -> None:
+                reason = clean_input(status_reason)
+                if _booking_status_reason_required(booking_status, new_status, is_manager=can_manage_any_booking) and not reason:
+                    st.error("Informe uma justificativa para esta mudança de status.")
+                    return
+                ok, msg = change_booking_status(
+                    conn,
+                    int(booking_id),
+                    new_status,
+                    changed_by_id=current_user_id,
+                    reason=reason or None,
+                    source="ui",
+                )
+                if ok:
+                    st.session_state["booking_status_feedback"] = msg
+                    clear_app_caches()
+                    st.rerun()
+                else:
+                    st.error(msg)
+
             if can_manage_any_booking:
                 a1, a2, a3 = st.columns(3)
                 with a1:
                     if st.button("Marcar como concluída", key="booking_mark_done"):
-                        update_booking_status(conn, int(booking_id), "done")
-                        clear_app_caches()
-                        st.rerun()
+                        _submit_booking_status_change("done")
                 with a2:
                     if st.button("Cancelar reserva", key="booking_cancel"):
-                        update_booking_status(conn, int(booking_id), "cancelled")
-                        clear_app_caches()
-                        st.rerun()
+                        _submit_booking_status_change("cancelled")
                 with a3:
                     if st.button("Marcar como não compareceu", key="booking_no_show"):
-                        update_booking_status(conn, int(booking_id), "no_show")
-                        clear_app_caches()
-                        st.rerun()
+                        _submit_booking_status_change("no_show")
             elif is_own_booking:
                 st.caption("Você pode cancelar apenas suas próprias reservas agendadas. Conclusão e não comparecimento são ações de Gerente/Administrador.")
                 if can_cancel_own_booking:
                     if st.button("Cancelar minha reserva", key="booking_cancel_own"):
-                        update_booking_status(conn, int(booking_id), "cancelled")
-                        clear_app_caches()
-                        st.rerun()
+                        _submit_booking_status_change("cancelled")
                 else:
                     st.info("Esta reserva não está agendada e não pode ser cancelada por membro comum.")
             else:
                 st.info("Você pode consultar esta reserva, mas alterações de status são restritas ao solicitante ou a Gerente/Administrador.")
+
+            with st.expander("Histórico da reserva selecionada"):
+                render_booking_status_history(conn, int(booking_id))
 
 
 def page_table(conn, table_name: str, title: str):
