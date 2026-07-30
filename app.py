@@ -1196,6 +1196,8 @@ def sidebar(default_page: str | None = None):
     page_labels = list(PAGE_LABELS)
     if not can_import_base():
         page_labels = [label for label in page_labels if label != "Importar base"]
+    if not can_view_reports():
+        page_labels = [label for label in page_labels if label != "Relatórios"]
     selected_default = default_page or _initial_page_from_url()
     if selected_default not in page_labels:
         selected_default = "Painel inicial"
@@ -1231,6 +1233,22 @@ def can_manage_master_data() -> bool:
 
 
 def can_edit_operational_data() -> bool:
+    return current_access_role() in {"manager", "admin"}
+
+
+def can_view_reports() -> bool:
+    return current_access_role() in {"manager", "admin"}
+
+
+def can_export_reports() -> bool:
+    return current_access_role() in {"manager", "admin"}
+
+
+def can_view_users_directory() -> bool:
+    return current_access_role() in {"manager", "admin"}
+
+
+def can_manage_inventory_adjustments() -> bool:
     return current_access_role() in {"manager", "admin"}
 
 
@@ -2312,6 +2330,10 @@ def page_usuarios(conn):
     hero()
     st.subheader("Usuários")
     st.caption("Consulta de usuários, perfis de acesso, vínculo e treinamento. Criação, edição e alteração de perfil são restritas a Administrador.")
+
+    if not can_view_users_directory():
+        st.info("A consulta completa de usuários é restrita a Gerente ou Administrador.")
+        return
 
     _, users, _, _ = load_reference_data(conn)
     display_cols = ["full_name", "email", "phone_e164", "role", "lab_unit", "department", "advisor_name", "training_completed", "active", "notes"]
@@ -3827,7 +3849,7 @@ def page_insumos(conn):
     with tab_cadastro:
         st.markdown("### Cadastro de item de estoque")
         if not can_manage_master_data():
-            st.info("Membros podem registrar entrada, saída e descarte na aba **Movimentar estoque**. Cadastro/edição estrutural de insumos fica com Gerente ou Administrador.")
+            st.info("Seu perfil permite registrar apenas saída/consumo. Entradas, descartes e ajustes são restritos a Gerente ou Administrador.")
         mode = st.radio("Modo", ["Novo item", "Editar item existente"], horizontal=True, key="supply_edit_mode")
         selected_supply = None
         if mode == "Editar item existente":
@@ -4212,10 +4234,15 @@ def page_insumos(conn):
                 else:
                     st.caption("Selecione um projeto para vincular um serviço/análise.")
 
+            movement_type_options = ["entrada", "saída", "descarte", "ajuste positivo", "ajuste negativo"]
+            if not can_manage_inventory_adjustments():
+                movement_type_options = ["saída"]
+                st.info("Seu perfil permite registrar apenas saída/consumo. Entradas, descartes e ajustes são restritos a Gerente ou Administrador.")
+
             with st.form("form_supply_movement"):
                 c1, c2, c3 = st.columns(3)
                 with c1:
-                    movement_type = st.selectbox("Tipo de movimentação", ["entrada", "saída", "descarte", "ajuste positivo", "ajuste negativo"])
+                    movement_type = st.selectbox("Tipo de movimentação", movement_type_options)
                     movement_date = st.date_input("Data", value=date.today(), key="movement_date")
                 with c2:
                     quantity = st.number_input("Quantidade", min_value=0.0, value=0.0, step=1.0, key="movement_qty")
@@ -6325,6 +6352,9 @@ def _reports_excel_bytes(period_text: str, data: dict[str, pd.DataFrame]) -> byt
 
 
 def _download_table_button(df: pd.DataFrame, file_name: str, label: str, *, allow_empty: bool = False) -> None:
+    if not can_export_reports():
+        st.caption("Exportações são restritas a Gerente ou Administrador.")
+        return
     if df.empty and not allow_empty:
         st.caption("Sem dados para exportar nesta tabela.")
         return
@@ -6342,6 +6372,11 @@ def page_relatorios(conn):
     st.subheader("Relatórios semestrais e anuais")
     st.caption("Consolide uso de equipamentos, responsáveis, manutenções e insumos para acompanhamento interno, reuniões e registros da qualidade.")
 
+    if not can_view_reports():
+        st.info("Relatórios e exportações são restritos a Gerente ou Administrador.")
+        return
+
+    can_export = can_export_reports()
     today = date.today()
     current_year = today.year
     min_year = 2024
@@ -6416,12 +6451,13 @@ def page_relatorios(conn):
     k5.metric("Serviços", len(services))
     k6.metric("Mov. insumos", len(supply_movements))
 
-    if st.button("Preparar Excel completo", type="primary", key="prepare_full_report_xlsx"):
+    if can_export and st.button("Preparar Excel completo", type="primary", key="prepare_full_report_xlsx"):
         st.session_state[REPORT_EXCEL_BYTES_KEY] = _reports_excel_bytes(period_text, data)
         st.session_state[REPORT_EXCEL_SIGNATURE_KEY] = excel_signature
 
     if (
-        st.session_state.get(REPORT_EXCEL_SIGNATURE_KEY) == excel_signature
+        can_export
+        and st.session_state.get(REPORT_EXCEL_SIGNATURE_KEY) == excel_signature
         and REPORT_EXCEL_BYTES_KEY in st.session_state
     ):
         st.download_button(
