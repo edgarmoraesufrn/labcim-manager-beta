@@ -507,6 +507,14 @@ def setup_page() -> None:
             color: #FFFFFF !important;
             opacity: 1 !important;
         }}
+        @media (max-width: 768px) {{
+            section[data-testid="stSidebar"] {{
+                display: none !important;
+            }}
+            div[data-testid="collapsedControl"] {{
+                display: none !important;
+            }}
+        }}
 
         /* Tema claro robusto para widgets do Streamlit/BaseWeb */
         [data-testid="stSelectbox"] div[data-baseweb="select"],
@@ -1380,13 +1388,20 @@ def render_quick_navigation(selected_page: str) -> str:
 
     st.session_state[QUICK_NAVIGATION_LAST_PAGE_KEY] = selected_page
 
-    quick_page = st.selectbox(
-        "Ir para",
-        page_labels,
-        index=page_labels.index(selected_page),
-        key=QUICK_NAVIGATION_PAGE_KEY,
-    )
-    st.caption("Use este atalho no celular para navegar sem abrir a barra lateral.")
+    nav_col, logout_col = st.columns([4, 1])
+    with nav_col:
+        quick_page = st.selectbox(
+            "Ir para",
+            page_labels,
+            index=page_labels.index(selected_page),
+            key=QUICK_NAVIGATION_PAGE_KEY,
+        )
+        st.caption("Menu principal para uso em celular.")
+    with logout_col:
+        st.write("")
+        if st.button("Sair", key="quick_logout_button", use_container_width=True):
+            logout()
+            st.rerun()
     if quick_page != selected_page:
         st.session_state[SIDEBAR_PAGE_KEY] = quick_page
         st.rerun()
