@@ -826,6 +826,25 @@ def send_email(to_email: str, subject: str, body: str) -> tuple[bool, str]:
         return False, str(exc)
 
 
+def _auth_debug_codes_enabled() -> bool:
+    keys = ("LABCIM_AUTH_DEBUG_CODES", "auth_debug_codes")
+    for key in keys:
+        env_value = os.environ.get(key)
+        if clean_input(env_value):
+            return clean_input(env_value).lower() in {"1", "true", "sim", "yes", "y", "on"}
+        try:
+            if hasattr(st, "secrets") and key in st.secrets:
+                return clean_input(st.secrets[key]).lower() in {"1", "true", "sim", "yes", "y", "on"}
+        except Exception:
+            pass
+        try:
+            if hasattr(st, "secrets") and "auth" in st.secrets and key in st.secrets["auth"]:
+                return clean_input(st.secrets["auth"][key]).lower() in {"1", "true", "sim", "yes", "y", "on"}
+        except Exception:
+            pass
+    return False
+
+
 def _unique_emails(values) -> list[str]:
     seen = set()
     emails: list[str] = []
@@ -932,13 +951,27 @@ def _hash_access_code(code: str) -> str:
     return hashlib.sha256(code.encode("utf-8")).hexdigest()
 
 
+SESSION_ROLE_ALIASES = {
+    "admin": "admin",
+    "administrador": "admin",
+    "manager": "manager",
+    "gerente": "manager",
+    "operator": "manager",
+    "operador": "manager",
+    "member": "member",
+    "membro": "member",
+    "usuario": "member",
+    "usuário": "member",
+    "user": "member",
+}
+
+
+def _validated_session_role(role: str | None) -> str | None:
+    return SESSION_ROLE_ALIASES.get(clean_input(role).lower())
+
+
 def _normalize_session_role(role: str | None) -> str:
-    role = clean_input(role).lower()
-    if role in {"admin", "manager", "member"}:
-        return role
-    if role in {"operator", "operador", "gerente"}:
-        return "manager"
-    return "member"
+    return _validated_session_role(role) or "member"
 
 
 def is_authenticated() -> bool:
@@ -949,15 +982,47 @@ def current_user() -> dict:
     return st.session_state.get("auth_user", {})
 
 
-def _set_authenticated_user(row) -> None:
-    role = _normalize_session_role(row["role"])
+def _set_authenticated_user(row) -> bool:
+    role = _validated_session_role(row["role"])
+    if role is None:
+        logout()
+        return False
     st.session_state["auth_user"] = {
         "id": int(row["user_id"] if "user_id" in row.keys() else row["id"]),
         "full_name": str(row["full_name"]),
         "email": str(row["user_email"] if "user_email" in row.keys() else row["email"]),
         "role": role,
     }
-    st.session_state["access_role"] = role
+    st.session_state.pop("access_role", None)
+    return True
+
+
+def revalidate_authenticated_user(conn) -> dict | None:
+    user = current_user()
+    if not user:
+        logout()
+        return None
+
+    row = None
+    try:
+        user_id = int(user.get("id"))
+    except Exception:
+        user_id = None
+    if user_id is not None:
+        row = conn.execute("SELECT * FROM users WHERE id = ? LIMIT 1", [user_id]).fetchone()
+
+    if row is None:
+        email = clean_input(user.get("email")).lower()
+        if email:
+            row = get_active_user_by_email(conn, email)
+
+    if row is None or not truthy(row["active"]):
+        logout()
+        return None
+
+    if not _set_authenticated_user(row):
+        return None
+    return current_user()
 
 
 def logout() -> None:
@@ -988,21 +1053,36 @@ def request_access_code(conn, email: str) -> tuple[bool, str]:
         "LabCim Manager"
     )
     ok, msg = send_email(str(user["email"]), subject, body)
+    debug_codes_enabled = _auth_debug_codes_enabled()
     log_notification(
         conn,
         event_type="access_code",
         recipient_email=str(user["email"]),
         subject=subject,
-        body=body if not ok else "Código de acesso enviado por e-mail.",
-        status="sent" if ok else "beta_code_available",
+        body=(
+            "Código de acesso enviado por e-mail."
+            if ok
+            else "Falha ao enviar código de acesso; código não exibido."
+            if not debug_codes_enabled
+            else "Código de acesso disponibilizado em modo debug de desenvolvimento."
+        ),
+        status="sent" if ok else "failed" if not debug_codes_enabled else "debug_code_available",
         error_message=None if ok else msg,
         related_table="users",
         related_id=int(user["id"]),
     )
     st.session_state["pending_login_email"] = str(user["email"]).strip().lower()
     if not ok:
-        st.session_state["last_access_code"] = code
-        return True, "SMTP ainda não configurado. Modo beta: o código foi exibido na tela."
+        if debug_codes_enabled:
+            st.session_state["last_access_code"] = code
+            return True, "Modo debug de desenvolvimento: o código foi exibido na tela."
+        conn.execute(
+            "UPDATE access_codes SET used_at = CURRENT_TIMESTAMP WHERE user_id = ? AND code_hash = ? AND used_at IS NULL",
+            [int(user["id"]), _hash_access_code(code)],
+        )
+        conn.commit()
+        st.session_state.pop("last_access_code", None)
+        return False, "Não foi possível enviar o código de acesso. Verifique a configuração de e-mail ou contate o administrador."
     st.session_state.pop("last_access_code", None)
     return True, f"Código enviado para {user['email']}."
 
@@ -1026,8 +1106,8 @@ def page_login(conn) -> None:
 
         if st.session_state.get("last_access_code"):
             st.warning(
-                f"Modo beta local: código de teste **{st.session_state['last_access_code']}**. "
-                "Configure o SMTP para ocultar este código e enviar somente por e-mail."
+                f"Modo debug de desenvolvimento: código de teste **{st.session_state['last_access_code']}**. "
+                "Desative LABCIM_AUTH_DEBUG_CODES em produção."
             )
 
     with st.container(border=True):
@@ -1052,9 +1132,11 @@ def page_login(conn) -> None:
                 return
             ok, msg, row = verify_access_code_record(conn, email=pending_email, code_hash=_hash_access_code(code))
             if ok and row is not None:
-                _set_authenticated_user(row)
-                st.success("Acesso liberado.")
-                st.rerun()
+                if _set_authenticated_user(row):
+                    st.success("Acesso liberado.")
+                    st.rerun()
+                else:
+                    st.error("Perfil de acesso inválido. Contate o administrador.")
             else:
                 st.error(msg)
 
@@ -1112,7 +1194,7 @@ def sidebar(default_page: str | None = None):
         st.sidebar.image(str(LOGO_PATH), use_container_width=True)
     st.sidebar.markdown("### LabCim Manager")
     page_labels = list(PAGE_LABELS)
-    if not can_manage_master_data():
+    if not can_import_base():
         page_labels = [label for label in page_labels if label != "Importar base"]
     selected_default = default_page or _initial_page_from_url()
     if selected_default not in page_labels:
@@ -1136,8 +1218,6 @@ def sidebar(default_page: str | None = None):
 
 
 def current_access_role() -> str:
-    if st.session_state.get("access_role"):
-        return st.session_state.get("access_role", "member")
     user = current_user()
     return _normalize_session_role(user.get("role")) if user else "member"
 
@@ -1154,8 +1234,16 @@ def can_edit_operational_data() -> bool:
     return current_access_role() in {"manager", "admin"}
 
 
+def can_manage_users() -> bool:
+    return is_admin()
+
+
+def can_import_base() -> bool:
+    return is_admin()
+
+
 def admin_required_message(action: str = "alterar cadastros estruturais") -> None:
-    st.info(f"Para {action}, selecione perfil Gerente ou Administrador. Este bloqueio será ligado ao login na próxima etapa.")
+    st.info(f"Para {action}, use perfil Gerente ou Administrador.")
 
 
 def status_badge(value: str) -> str:
@@ -2223,7 +2311,7 @@ def page_table(conn, table_name: str, title: str):
 def page_usuarios(conn):
     hero()
     st.subheader("Usuários")
-    st.caption("Cadastro simples de usuários, perfil de acesso, vínculo e treinamento. A autenticação real virá na etapa da senha volátil.")
+    st.caption("Consulta de usuários, perfis de acesso, vínculo e treinamento. Criação, edição e alteração de perfil são restritas a Administrador.")
 
     _, users, _, _ = load_reference_data(conn)
     display_cols = ["full_name", "email", "phone_e164", "role", "lab_unit", "department", "advisor_name", "training_completed", "active", "notes"]
@@ -2232,8 +2320,8 @@ def page_usuarios(conn):
     else:
         st.dataframe(_display_df(users[[c for c in display_cols if c in users.columns]]), use_container_width=True, hide_index=True)
 
-    if not can_manage_master_data():
-        admin_required_message("incluir ou atualizar usuários")
+    if not can_manage_users():
+        st.info("Criação, edição, ativação/inativação e alteração de perfil são restritas a Administrador.")
         return
 
     st.markdown("### Incluir ou atualizar usuário")
@@ -6922,8 +7010,8 @@ def page_qrcodes(conn):
 def page_importar(conn):
     hero()
     st.subheader("Importar base inicial")
-    if not can_manage_master_data():
-        admin_required_message("importar ou reimportar a base inicial")
+    if not can_import_base():
+        st.info("Importação de base é restrita a Administrador.")
         return
     st.write("Use esta página para atualizar a base a partir do arquivo `LabCim_Base.xlsx`.")
     uploaded = st.file_uploader("Enviar arquivo Excel", type=["xlsx"])
@@ -6968,6 +7056,12 @@ def main():
     with perf_timer("get_conn"):
         conn = get_conn()
     if not is_authenticated():
+        with perf_timer("Página: Login"):
+            page_login(conn)
+        _render_perf_debug()
+        return
+    if revalidate_authenticated_user(conn) is None:
+        st.warning("Sua sessão não está mais válida. Faça login novamente.")
         with perf_timer("Página: Login"):
             page_login(conn)
         _render_perf_debug()
