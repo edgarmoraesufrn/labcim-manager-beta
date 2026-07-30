@@ -1256,6 +1256,10 @@ def can_export_inventory() -> bool:
     return current_access_role() in {"manager", "admin"}
 
 
+def can_export_qr_bulk() -> bool:
+    return current_access_role() in {"manager", "admin"}
+
+
 def can_manage_users() -> bool:
     return is_admin()
 
@@ -1488,6 +1492,31 @@ def load_reference_data(conn):
 
 def page_dashboard(conn):
     hero()
+    if current_access_role() == "member":
+        st.subheader("Painel operacional")
+        st.caption("Use o menu lateral para reservar equipamentos, consultar documentos, reportar problemas e registrar consumo de insumos.")
+
+        cards = [
+            ("Reservas", "Criar e acompanhar suas reservas de equipamentos."),
+            ("Equipamentos e documentos", "Consultar equipamentos, POPs e documentos operacionais disponíveis."),
+            ("Manutenção", "Reportar problemas observados nos equipamentos."),
+            ("Insumos", "Consultar itens, documentos e registrar saída/consumo."),
+        ]
+        cols = st.columns(2)
+        for idx, (title, description) in enumerate(cards):
+            with cols[idx % 2]:
+                st.markdown(
+                    f"""
+                    <div class="soft-card">
+                    <b>{title}</b><br>
+                    {description}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+        st.info("Relatórios, exportações e visão administrativa ficam disponíveis para Gerente ou Administrador.")
+        return
+
     st.subheader("Visão geral da base LabCim")
     counts = cached_table_counts(conn)
     metrics = [
@@ -4419,12 +4448,15 @@ def page_insumos(conn):
                     )
             if shown_movements == 0:
                 st.caption("Nenhum anexo cadastrado.")
-            st.download_button(
-                "Baixar histórico em CSV",
-                data=_display_df(hist).to_csv(index=False).encode("utf-8-sig"),
-                file_name="labcim_insumos_movimentacoes.csv",
-                mime="text/csv",
-            )
+            if can_export_inventory():
+                st.download_button(
+                    "Baixar histórico em CSV",
+                    data=_display_df(hist).to_csv(index=False).encode("utf-8-sig"),
+                    file_name="labcim_insumos_movimentacoes.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.caption("Exportação do histórico de movimentações é restrita a Gerente ou Administrador.")
 
 
 def page_manutencao(conn):
@@ -6995,25 +7027,28 @@ def page_qrcodes(conn):
                     )
 
             st.markdown("### Baixar todos os QR Codes de equipamentos")
-            st.caption("Gera um pacote ZIP com QR Codes de reserva, manutenção e POP quando houver documentação cadastrada.")
-            equipment_zip_signature = _equipment_qr_signature(equipment, base_url, pop_attachment_equipment_ids)
-            if st.button("Preparar ZIP - QR Codes de equipamentos", key="prepare_all_equipment_qr"):
-                st.session_state["equipment_qr_zip_bytes"] = _equipment_qr_zip_bytes(
-                    equipment,
-                    base_url,
-                    pop_attachment_equipment_ids,
-                )
-                st.session_state["equipment_qr_zip_signature"] = equipment_zip_signature
-            if st.session_state.get("equipment_qr_zip_signature") == equipment_zip_signature:
-                st.download_button(
-                    "Baixar ZIP - QR Codes de equipamentos",
-                    data=st.session_state["equipment_qr_zip_bytes"],
-                    file_name="LabCim_QRCodes_Equipamentos.zip",
-                    mime="application/zip",
-                    key="download_all_equipment_qr",
-                )
+            if can_export_qr_bulk():
+                st.caption("Gera um pacote ZIP com QR Codes de reserva, manutenção e POP quando houver documentação cadastrada.")
+                equipment_zip_signature = _equipment_qr_signature(equipment, base_url, pop_attachment_equipment_ids)
+                if st.button("Preparar ZIP - QR Codes de equipamentos", key="prepare_all_equipment_qr"):
+                    st.session_state["equipment_qr_zip_bytes"] = _equipment_qr_zip_bytes(
+                        equipment,
+                        base_url,
+                        pop_attachment_equipment_ids,
+                    )
+                    st.session_state["equipment_qr_zip_signature"] = equipment_zip_signature
+                if st.session_state.get("equipment_qr_zip_signature") == equipment_zip_signature:
+                    st.download_button(
+                        "Baixar ZIP - QR Codes de equipamentos",
+                        data=st.session_state["equipment_qr_zip_bytes"],
+                        file_name="LabCim_QRCodes_Equipamentos.zip",
+                        mime="application/zip",
+                        key="download_all_equipment_qr",
+                    )
+                else:
+                    st.caption("Prepare o ZIP para habilitar o download do pacote completo.")
             else:
-                st.caption("Prepare o ZIP para habilitar o download do pacote completo.")
+                st.caption("Geração de pacotes ZIP de QR Codes é restrita a Gerente ou Administrador.")
 
     with tab_sup:
         st.markdown("### QR Codes por insumo")
@@ -7043,20 +7078,23 @@ def page_qrcodes(conn):
                 st.code(url)
 
             st.markdown("### Baixar todos os QR Codes de insumos")
-            supply_zip_signature = _qr_dataframe_signature(supplies, base_url, ["id", "supply_name"])
-            if st.button("Preparar ZIP - QR Codes de insumos", key="prepare_all_supply_qr"):
-                st.session_state["supply_qr_zip_bytes"] = _supply_qr_zip_bytes(supplies, base_url)
-                st.session_state["supply_qr_zip_signature"] = supply_zip_signature
-            if st.session_state.get("supply_qr_zip_signature") == supply_zip_signature:
-                st.download_button(
-                    "Baixar ZIP - QR Codes de insumos",
-                    data=st.session_state["supply_qr_zip_bytes"],
-                    file_name="LabCim_QRCodes_Insumos.zip",
-                    mime="application/zip",
-                    key="download_all_supply_qr",
-                )
+            if can_export_qr_bulk():
+                supply_zip_signature = _qr_dataframe_signature(supplies, base_url, ["id", "supply_name"])
+                if st.button("Preparar ZIP - QR Codes de insumos", key="prepare_all_supply_qr"):
+                    st.session_state["supply_qr_zip_bytes"] = _supply_qr_zip_bytes(supplies, base_url)
+                    st.session_state["supply_qr_zip_signature"] = supply_zip_signature
+                if st.session_state.get("supply_qr_zip_signature") == supply_zip_signature:
+                    st.download_button(
+                        "Baixar ZIP - QR Codes de insumos",
+                        data=st.session_state["supply_qr_zip_bytes"],
+                        file_name="LabCim_QRCodes_Insumos.zip",
+                        mime="application/zip",
+                        key="download_all_supply_qr",
+                    )
+                else:
+                    st.caption("Prepare o ZIP para habilitar o download do pacote completo.")
             else:
-                st.caption("Prepare o ZIP para habilitar o download do pacote completo.")
+                st.caption("Geração de pacotes ZIP de QR Codes é restrita a Gerente ou Administrador.")
 
 
 def page_importar(conn):
