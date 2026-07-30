@@ -1,106 +1,47 @@
-# LabCim Manager
+# LabCim Manager v1.0
 
-Sistema de Gestão de Estoque, Equipamentos, Reservas e Manutenção do LabCim.
+Gestão integrada, rastreabilidade e governança operacional do LabCim.
 
-## Versão beta
+## Visão geral
 
-Esta versão inclui:
+O LabCim Manager é uma plataforma web para gestão operacional do laboratório. A aplicação integra equipamentos, documentos, reservas, manutenção, insumos, peças, lotes, projetos, serviços/análises e relatórios em um fluxo único e rastreável.
 
-- login por e-mail com senha volátil;
-- perfis `admin`, `manager` e `member`;
-- agenda visual de equipamentos;
-- reservas;
-- manutenção preventiva/corretiva;
-- POPs/documentos operacionais;
-- módulo de insumos/almoxarifado;
-- peças de reposição como itens de estoque associados a equipamentos;
-- QR Codes;
-- relatórios semestrais/anuais;
-- notificações por e-mail quando equipamento entra em manutenção.
+O foco da v1.0 é organizar a operação diária, reduzir dependência de controles dispersos e fortalecer a governança do polo com simplicidade operacional.
 
-## Rodar localmente
+## Principais módulos
 
-```powershell
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-streamlit run app.py
-```
+- Equipamentos e documentos/POPs.
+- QR Codes.
+- Reservas.
+- Manutenção preventiva e corretiva.
+- Insumos, peças de reposição e lotes.
+- Projetos e serviços/análises.
+- Relatórios e Excel profissional.
+- Perfis `member`, `manager` e `admin`.
 
-Sem `DATABASE_URL`, o app usa automaticamente SQLite local em `data/labcim_manager.db`. Esse arquivo é mutável, serve apenas para desenvolvimento local e não deve ser enviado ao GitHub.
+## Infraestrutura
 
-## Configurar e-mail
+- Streamlit Cloud como aplicação web.
+- PostgreSQL/Neon para persistência de dados em produção.
+- Cloudflare R2 para armazenamento persistente e privado de arquivos.
+- SQLite e armazenamento local para desenvolvimento.
+- Excel completo gerado sob demanda.
+- QR Codes e pacotes ZIP gerados sob demanda.
 
-Copie:
+## Documentação
 
-```text
-.streamlit/secrets.toml.example
-```
+- [Runbook de produção beta](docs/production_runbook.md)
+- [Pacote de demonstração v1.0 para auditoria](docs/v1_0_audit_demo_package.md)
+- [Release notes v1.0](docs/v1_0_release_notes.md)
+- [Documentação histórica](docs/archive/legacy_readmes/)
 
-para:
+## Status
 
-```text
-.streamlit/secrets.toml
-```
+Versão operacional v1.0, preparada para apresentação institucional e melhoria contínua.
 
-Preencha os dados SMTP. Para Gmail, use senha de app, não a senha normal da conta.
+## Roadmap
 
-## Observação sobre banco de dados
-
-O LabCim Manager escolhe o backend de banco no startup:
-
-- sem `DATABASE_URL`: usa SQLite local em `data/labcim_manager.db`;
-- com `DATABASE_URL`: usa PostgreSQL externo.
-
-Em produção/beta, configure `DATABASE_URL` nos Secrets do Streamlit Cloud ou como variável de ambiente. Não coloque a URL real, senha, token ou qualquer secret no código.
-
-Exemplo seguro para Secrets:
-
-```toml
-DATABASE_URL = "postgresql://USUARIO:SENHA@HOST:5432/NOME_DO_BANCO?sslmode=require"
-```
-
-O arquivo `data/labcim_manager.db` não deve ser versionado porque é um banco local mutável e pode conter dados operacionais de usuários. O `.gitignore` mantém esse arquivo fora do repositório.
-
-`data/LabCim_Base.xlsx` continua sendo usado apenas como seed inicial quando o banco operacional estiver vazio.
-
-Para testar persistência em produção:
-
-1. Configure `DATABASE_URL` apontando para um PostgreSQL externo.
-2. Faça deploy do app.
-3. Cadastre um usuário, uma reserva e um insumo ou movimentação de insumo.
-4. Reinicie ou redeploye o app.
-5. Confirme que os registros continuam aparecendo no sistema.
-
-## Peças de reposição
-
-Peças de reposição são tratadas como itens de estoque no módulo de Insumos/almoxarifado. Elas podem ter código interno, código do fabricante, fabricante, saldo, estoque mínimo, localização e modelo/família compatível.
-
-Uma peça pode ser associada a um ou mais equipamentos. Na tela de Equipamentos, a visão de peças associadas mostra rapidamente o saldo disponível, estoque mínimo, status de estoque e local de armazenamento para o equipamento selecionado.
-
-## Armazenamento de arquivos
-
-O banco PostgreSQL/SQLite guarda apenas metadados dos anexos. PDFs, imagens, planilhas e vídeos enviados pelos usuários não são armazenados no banco.
-
-Comportamento esperado:
-
-- sem `DATABASE_URL` e sem configuração R2: usa armazenamento local em `data/uploads`, apenas para desenvolvimento;
-- com `DATABASE_URL` e R2 completo: usa Cloudflare R2;
-- com `DATABASE_URL` e R2 ausente/incompleto: o app bloqueia uploads e mostra erro claro, para evitar perda silenciosa de arquivos em produção.
-
-Secrets/variáveis aceitos no formato top-level do Streamlit Cloud:
-
-```toml
-DATABASE_URL = "postgresql://USUARIO:SENHA@HOST:5432/NOME_DO_BANCO?sslmode=require"
-R2_ACCOUNT_ID = "SEU_ACCOUNT_ID"
-R2_ENDPOINT_URL = "https://SEU_ACCOUNT_ID.r2.cloudflarestorage.com"
-R2_ACCESS_KEY_ID = "SEU_ACCESS_KEY_ID"
-R2_SECRET_ACCESS_KEY = "SEU_SECRET_ACCESS_KEY"
-R2_BUCKET = "labcim-manager-arquivos"
-```
-
-Também são aceitas as seções `[database]` com `url` e `[r2]` com as mesmas chaves R2. Para uploads em produção, `R2_ENDPOINT_URL`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` e `R2_BUCKET` precisam estar configurados; `R2_ACCOUNT_ID` é mantido no exemplo para facilitar a conferência do endpoint.
-
-O bucket R2 deve permanecer privado. Downloads devem ser feitos pelo app via URL assinada temporária. Caminhos e links antigos nos campos `*_path` continuam tratados como modo legado, sem migração destrutiva.
-
-`data/uploads` não deve ser versionado porque contém arquivos enviados por usuários e é efêmero em deploys como Streamlit Cloud.
+- v1.1: senha individual com fallback para código volátil.
+- v1.1: dashboards gerenciais avançados.
+- v1.1: refinamentos a partir de uso real e auditoria.
+- v1.2: empacotamento Android/Google Play.
