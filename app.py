@@ -324,7 +324,12 @@ COLUMN_LABELS = {
 
 
 def setup_page() -> None:
-    st.set_page_config(page_title=APP_TITLE, page_icon="🔬", layout="wide")
+    st.set_page_config(
+        page_title=APP_TITLE,
+        page_icon="🔬",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
     st.markdown(
         f"""
         <style>
@@ -1381,7 +1386,7 @@ def render_quick_navigation(selected_page: str) -> str:
         index=page_labels.index(selected_page),
         key=QUICK_NAVIGATION_PAGE_KEY,
     )
-    st.caption("Atalho útil para uso em celular.")
+    st.caption("Use este atalho no celular para navegar sem abrir a barra lateral.")
     if quick_page != selected_page:
         st.session_state[SIDEBAR_PAGE_KEY] = quick_page
         st.rerun()
