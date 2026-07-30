@@ -90,7 +90,7 @@ from labcim_manager.storage import (
 )
 
 APP_TITLE = "LabCim Manager"
-APP_SUBTITLE = "Sistema de Gestão de Estoque, Equipamentos, Reservas e Manutenção do LabCim"
+APP_SUBTITLE = "Gestão integrada, rastreabilidade e governança operacional do LabCim"
 DB_PATH = Path("data/labcim_manager.db")
 BASE_XLSX = Path("data/LabCim_Base.xlsx")
 LOGO_PATH = Path("assets/logo_labcim.png")
@@ -178,6 +178,26 @@ PAGE_LABELS = [
     "Relatórios",
     "Importar base",
 ]
+SIDEBAR_PAGE_KEY = "labcim_active_sidebar_page"
+SIDEBAR_URL_PAGE_KEY = "labcim_sidebar_url_page"
+PAGE_ICONS = {
+    "Painel inicial": "🏠",
+    "Reservas": "📅",
+    "Equipamentos": "🔬",
+    "Insumos": "📦",
+    "Manutenção": "🛠",
+    "QR Codes": "🔳",
+    "Projetos": "📁",
+    "Relatórios": "📊",
+    "Usuários": "👥",
+    "Importar base": "⚙️",
+}
+NAVIGATION_SECTIONS = (
+    ("Painel", ("Painel inicial",)),
+    ("Operação", ("Reservas", "Equipamentos", "Insumos", "Manutenção", "QR Codes")),
+    ("Gestão", ("Projetos", "Relatórios")),
+    ("Administração", ("Usuários", "Importar base")),
+)
 
 COLUMN_LABELS = {
     "id": "ID",
@@ -418,6 +438,67 @@ def setup_page() -> None:
         .stButton>button:hover {{
             border-color: {LAB_BLUE} !important;
             filter: brightness(.98);
+        }}
+        [data-testid="stSidebar"] .sidebar-brand {{
+            font-weight: 900;
+            font-size: 1.05rem;
+            letter-spacing: 0;
+            color: {LAB_BLUE} !important;
+            margin: .25rem 0 .35rem 0;
+        }}
+        [data-testid="stSidebar"] .sidebar-nav-section {{
+            margin: 1rem 0 .3rem 0;
+            font-size: .72rem;
+            font-weight: 900;
+            text-transform: uppercase;
+            letter-spacing: .08em;
+            color: #627D98 !important;
+        }}
+        [data-testid="stSidebar"] .sidebar-user-card {{
+            background: #FFFFFF;
+            border: 1px solid #D9EAFB;
+            border-radius: 14px;
+            padding: .75rem .8rem;
+            margin: .7rem 0 .55rem 0;
+            box-shadow: 0 6px 16px rgba(16, 42, 67, .05);
+        }}
+        [data-testid="stSidebar"] .sidebar-user-name {{
+            font-weight: 850;
+            color: {LAB_DARK} !important;
+            margin-bottom: .15rem;
+        }}
+        [data-testid="stSidebar"] .sidebar-user-meta,
+        [data-testid="stSidebar"] .sidebar-user-role {{
+            font-size: .78rem;
+            color: #486581 !important;
+            line-height: 1.2rem;
+        }}
+        [data-testid="stSidebar"] .stButton > button {{
+            width: 100%;
+            justify-content: flex-start;
+            text-align: left;
+            border-radius: 12px !important;
+            padding: .5rem .7rem !important;
+            margin-bottom: .18rem;
+            border: 1px solid transparent !important;
+            background: #FFFFFF !important;
+            box-shadow: none !important;
+        }}
+        [data-testid="stSidebar"] .stButton > button:hover {{
+            border-color: #B9D7F2 !important;
+            background: #EEF7FF !important;
+        }}
+        [data-testid="stSidebar"] button[data-testid="stBaseButton-primary"],
+        [data-testid="stSidebar"] .stButton > button[kind="primary"] {{
+            background: {LAB_BLUE} !important;
+            color: #FFFFFF !important;
+            border-color: {LAB_BLUE} !important;
+            box-shadow: 0 8px 18px rgba(0, 51, 160, .18) !important;
+        }}
+        [data-testid="stSidebar"] button[data-testid="stBaseButton-primary"] *,
+        [data-testid="stSidebar"] .stButton > button[kind="primary"] * {{
+            color: #FFFFFF !important;
+            opacity: 1 !important;
         }}
 
         /* Tema claro robusto para widgets do Streamlit/BaseWeb */
@@ -1189,31 +1270,85 @@ def _initial_page_from_url() -> str:
     return "Painel inicial"
 
 
-def sidebar(default_page: str | None = None):
-    if LOGO_PATH.exists():
-        st.sidebar.image(str(LOGO_PATH), use_container_width=True)
-    st.sidebar.markdown("### LabCim Manager")
+def _allowed_sidebar_pages() -> list[str]:
     page_labels = list(PAGE_LABELS)
+    if not can_view_users_directory():
+        page_labels = [label for label in page_labels if label != "Usuários"]
     if not can_import_base():
         page_labels = [label for label in page_labels if label != "Importar base"]
     if not can_view_reports():
         page_labels = [label for label in page_labels if label != "Relatórios"]
-    selected_default = default_page or _initial_page_from_url()
-    if selected_default not in page_labels:
-        selected_default = "Painel inicial"
-    index = page_labels.index(selected_default) if selected_default in page_labels else 0
-    page = st.sidebar.radio("Navegação", page_labels, index=index)
+    return page_labels
+
+
+def _sidebar_button_key(page_label: str) -> str:
+    key = re.sub(r"[^a-z0-9]+", "_", page_label.lower(), flags=re.IGNORECASE).strip("_")
+    return f"nav_{key or 'page'}"
+
+
+def _sidebar_button_label(page_label: str) -> str:
+    return f"{PAGE_ICONS.get(page_label, '•')} {page_label}"
+
+
+def _sidebar_active_page(page_labels: list[str], default_page: str | None = None) -> str:
+    url_page = default_page or _initial_page_from_url()
+    previous_url_page = st.session_state.get(SIDEBAR_URL_PAGE_KEY)
+    if previous_url_page != url_page and url_page in page_labels:
+        st.session_state[SIDEBAR_PAGE_KEY] = url_page
+    st.session_state[SIDEBAR_URL_PAGE_KEY] = url_page
+
+    if SIDEBAR_PAGE_KEY not in st.session_state:
+        st.session_state[SIDEBAR_PAGE_KEY] = url_page if url_page in page_labels else "Painel inicial"
+
+    active_page = st.session_state.get(SIDEBAR_PAGE_KEY, "Painel inicial")
+    if active_page not in page_labels:
+        active_page = "Painel inicial"
+        st.session_state[SIDEBAR_PAGE_KEY] = active_page
+    return active_page
+
+
+def _render_sidebar_user(user: dict) -> None:
+    role = current_access_role()
+    st.sidebar.markdown(
+        f"""
+        <div class="sidebar-user-card">
+            <div class="sidebar-user-name">{escape(clean_value(user.get('full_name'), 'Usuário'))}</div>
+            <div class="sidebar-user-meta">{escape(clean_value(user.get('email'), 'E-mail não informado'))}</div>
+            <div class="sidebar-user-role">{escape(role_badge(role))}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def sidebar(default_page: str | None = None):
+    if LOGO_PATH.exists():
+        st.sidebar.image(str(LOGO_PATH), use_container_width=True)
+    st.sidebar.markdown('<div class="sidebar-brand">LabCim Manager</div>', unsafe_allow_html=True)
+    page_labels = _allowed_sidebar_pages()
+    page = _sidebar_active_page(page_labels, default_page)
+
+    for section, section_pages in NAVIGATION_SECTIONS:
+        visible_pages = [label for label in section_pages if label in page_labels]
+        if not visible_pages:
+            continue
+        st.sidebar.markdown(f'<div class="sidebar-nav-section">{escape(section)}</div>', unsafe_allow_html=True)
+        for page_label in visible_pages:
+            is_active = page_label == page
+            clicked = st.sidebar.button(
+                _sidebar_button_label(page_label),
+                key=_sidebar_button_key(page_label),
+                type="primary" if is_active else "secondary",
+                use_container_width=True,
+            )
+            if clicked and not is_active:
+                st.session_state[SIDEBAR_PAGE_KEY] = page_label
+                st.rerun()
+
     st.sidebar.markdown("---")
     user = current_user()
-    st.sidebar.markdown(f"**Usuário:** {clean_value(user.get('full_name'))}")
-    st.sidebar.caption(f"{clean_value(user.get('email'))} · {role_badge(user.get('role'))}")
-    if current_access_role() == "admin":
-        st.sidebar.success("Administrador")
-    elif current_access_role() == "manager":
-        st.sidebar.info("Gerente")
-    else:
-        st.sidebar.caption("Membro")
-    if st.sidebar.button("Sair"):
+    _render_sidebar_user(user)
+    if st.sidebar.button("Sair", key="sidebar_logout"):
         logout()
         st.rerun()
     return page
