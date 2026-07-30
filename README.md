@@ -30,7 +30,7 @@ O foco da v1.0 é organizar a operação diária, reduzir dependência de contro
 
 ## Documentação
 
-- [Runbook de produção beta](docs/production_runbook.md)
+- [Runbook de produção](docs/production_runbook.md)
 - [Pacote de demonstração v1.0 para auditoria](docs/v1_0_audit_demo_package.md)
 - [Release notes v1.0](docs/v1_0_release_notes.md)
 - [Documentação histórica](docs/archive/legacy_readmes/)

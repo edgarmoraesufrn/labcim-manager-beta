@@ -1,8 +1,8 @@
-# LabCim Manager — Runbook de Produção Beta
+# LabCim Manager — Runbook de Produção
 
 ## 1. Objetivo
 
-Este documento é um checklist operacional para liberar e acompanhar o LabCim Manager em produção beta controlada. Ele não substitui revisão técnica, mas organiza as conferências mínimas de ambiente, permissões, persistência, backup e recuperação.
+Este documento é um checklist operacional para liberar e acompanhar o LabCim Manager em produção controlada na versão operacional v1.0. Ele não substitui revisão técnica, mas organiza as conferências mínimas de ambiente, permissões, persistência, backup e recuperação.
 
 ## 2. Secrets obrigatórios
 
