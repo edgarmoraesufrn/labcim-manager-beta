@@ -22,7 +22,7 @@ O LabCim Manager v1.0 é a primeira versão operacional integrada para gestão, 
 - Excel profissional com identidade LabCim.
 - PostgreSQL/Neon para persistência de dados.
 - Cloudflare R2 para persistência de arquivos.
-- Runbook de produção beta.
+- Runbook de produção.
 
 ## 3. Governança e segurança
 
