@@ -2195,15 +2195,21 @@ def page_reservas(conn):
             st.rerun()
 
     st.markdown("#### Escolha uma ação")
-    tab_cal_sem, tab_cal_mes, tab_agenda, tab_nova, tab_gerenciar = st.tabs([
-        "Calendário semanal",
-        "Calendário mensal",
-        "Agenda linear",
-        "Nova reserva",
-        "Gerenciar reservas",
-    ])
+    booking_section = st.radio(
+        "Escolha uma ação",
+        [
+            "Calendário semanal",
+            "Calendário mensal",
+            "Agenda linear",
+            "Nova reserva",
+            "Gerenciar reservas",
+        ],
+        horizontal=True,
+        key="booking_section",
+        label_visibility="collapsed",
+    )
 
-    with tab_cal_sem:
+    if booking_section == "Calendário semanal":
         st.markdown("### Calendário semanal")
         c1, c2 = st.columns([1, 2])
         with c1:
@@ -2225,7 +2231,7 @@ def page_reservas(conn):
             with st.expander("Ver eventos da semana em tabela"):
                 st.dataframe(_display_df(week_events.drop(columns=[c for c in ["activity_type", "blocks_booking"] if c in week_events.columns])), use_container_width=True, hide_index=True)
 
-    with tab_cal_mes:
+    elif booking_section == "Calendário mensal":
         st.markdown("### Calendário mensal")
         c1, c2 = st.columns([1, 2])
         with c1:
@@ -2247,7 +2253,7 @@ def page_reservas(conn):
         st.caption(f"{month_start.strftime('%m/%Y')} · {len(month_events)} evento(s) no mês para este equipamento.")
         st.markdown(_render_month_calendar(month_events, selected_eq, selected_month_day), unsafe_allow_html=True)
 
-    with tab_agenda:
+    elif booking_section == "Agenda linear":
         st.markdown("### Agenda linear")
         st.caption("Visual técnico complementar, útil quando há muitos eventos no mesmo período.")
         c1, c2, c3 = st.columns([1, 1, 1])
@@ -2288,7 +2294,7 @@ def page_reservas(conn):
             st.plotly_chart(fig, use_container_width=True)
             st.dataframe(_display_df(agenda_df), use_container_width=True, hide_index=True)
 
-    with tab_nova:
+    elif booking_section == "Nova reserva":
         st.markdown("### Criar reserva")
         project_id = None
         service_id = None
@@ -2390,7 +2396,7 @@ def page_reservas(conn):
                 else:
                     st.error(msg)
 
-    with tab_gerenciar:
+    elif booking_section == "Gerenciar reservas":
         st.markdown("### Gerenciar reservas")
         booking_status_feedback = st.session_state.pop("booking_status_feedback", None)
         if booking_status_feedback:
@@ -4798,13 +4804,18 @@ def page_manutencao(conn):
                     render_maintenance_status_history(conn, entity_type="corrective", entity_id=int(selected_ticket["id"]))
         return
 
-    tab_prev, tab_corr, tab_dash = st.tabs([
-        "Preventiva e calibração",
-        "Corretiva e suporte",
-        "Indicadores e histórico",
-    ])
+    maintenance_section = st.radio(
+        "Escolha uma seção",
+        [
+            "Preventiva e calibração",
+            "Corretiva e suporte",
+            "Indicadores e histórico",
+        ],
+        horizontal=True,
+        key="maintenance_section",
+    )
 
-    with tab_prev:
+    if maintenance_section == "Preventiva e calibração":
         st.markdown("### Manutenção preventiva e calibração")
         st.write("Registro de atividades planejadas, periódicas e obrigatórias: preventiva, calibração interna/externa e inspeções.")
         if not can_manage_maintenance:
@@ -5257,7 +5268,7 @@ def page_manutencao(conn):
             with st.expander("Preventivas/calibrações inativas para auditoria", expanded=False):
                 st.dataframe(_display_df(inactive_prev_df), use_container_width=True, hide_index=True)
 
-    with tab_corr:
+    elif maintenance_section == "Corretiva e suporte":
         st.markdown("### Manutenção corretiva e suporte")
         st.write("Tickets abertos por usuários quando há falha, quebra, ruído, anomalia operacional ou necessidade de suporte.")
         if qr_maintenance_message:
@@ -5714,7 +5725,7 @@ def page_manutencao(conn):
                     else:
                         st.error(msg)
 
-    with tab_dash:
+    elif maintenance_section == "Indicadores e histórico":
         st.markdown("### Indicadores de manutenção")
         corr = query_df(conn, "SELECT * FROM maintenance_corrective WHERE COALESCE(is_active, 1) = 1")
         prev = query_df(conn, "SELECT * FROM maintenance_preventive WHERE COALESCE(is_active, 1) = 1")
