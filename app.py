@@ -4298,13 +4298,17 @@ def page_insumos(conn):
 
 def page_manutencao(conn):
     hero()
-    st.subheader("Manutenção e suporte")
-    st.caption("Controle preventivo/calibração e tickets corretivos com edição, histórico de status e inativação auditável.")
+    can_manage_maintenance = can_edit_operational_data()
+    if can_manage_maintenance:
+        st.subheader("Manutenção e suporte")
+        st.caption("Controle preventivo/calibração e tickets corretivos com edição, histórico de status e inativação auditável.")
+    else:
+        st.subheader("Reportar problema em equipamento")
+        st.caption("Use esta tela para registrar falhas, ruídos, quebras, mensagens de erro ou necessidade de suporte. A equipe do laboratório acompanhará o ticket.")
     equipment, users, _, _ = load_reference_data(conn)
     if equipment.empty:
         st.warning("Cadastre/importe equipamentos antes de registrar manutenções.")
         return
-    can_manage_maintenance = can_edit_operational_data()
     qr_view = clean_input(st.query_params.get("view")).lower()
     qr_equipment_code = st.query_params.get("eq") if qr_view == "manutencao" else None
     qr_maintenance_equipment_id = None
@@ -4324,6 +4328,177 @@ def page_manutencao(conn):
             else:
                 qr_maintenance_equipment_id = int(qr_row["id"])
                 qr_maintenance_message = "QR de manutenção aberto. Registre abaixo o problema observado neste equipamento."
+
+    if not can_manage_maintenance:
+        if qr_maintenance_message:
+            st.info(qr_maintenance_message)
+        elif qr_maintenance_issue:
+            st.warning(qr_maintenance_issue)
+
+        st.caption("Manutenção preventiva, calibração e edição de registros são gerenciadas por Gerente ou Administrador.")
+        st.markdown("### Reportar problema")
+        with st.container(border=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                equipment_options = _equipment_options(equipment)
+                manual_placeholder = "Selecione um equipamento"
+                corr_select_options = equipment_options
+                corr_equipment_index = 0
+                if qr_maintenance_equipment_id is not None:
+                    equipment_ids = equipment["id"].astype(int).tolist()
+                    if qr_maintenance_equipment_id in equipment_ids:
+                        corr_equipment_index = equipment_ids.index(qr_maintenance_equipment_id)
+                elif qr_maintenance_issue:
+                    corr_select_options = [manual_placeholder] + equipment_options
+                eq_label = st.selectbox("Equipamento", corr_select_options, index=corr_equipment_index, key="member_corr_eq")
+                equipment_id = None
+                selected = pd.Series(dtype=object)
+                if eq_label == manual_placeholder:
+                    st.info("Selecione manualmente um equipamento para abrir o ticket.")
+                else:
+                    equipment_id = _equipment_id_from_label(equipment, eq_label)
+                    selected = equipment[equipment["id"] == equipment_id].iloc[0]
+                    st.info(f"**Local:** {clean_value(selected.get('location'))}  \n**Patrimônio/código:** {clean_value(selected.get('equipment_code'))}")
+                reporter_id = _current_user_id()
+                st.caption(f"Ticket registrado por: {clean_value(current_user().get('full_name'))}")
+                title = st.text_input("Resumo do problema", placeholder="Ex.: Microscópio não liga", key="member_corr_title")
+                occurrence_date = st.date_input("Data da ocorrência", value=date.today(), key="member_corr_occurrence_date")
+                occurrence_time = st.time_input("Hora da ocorrência", value=datetime.now().time().replace(second=0, microsecond=0), step=timedelta(minutes=15), key="member_corr_occurrence_time")
+            with c2:
+                description = st.text_area("Descrição do problema *", placeholder="Explique a falha, mensagem de erro, contexto de uso, sintomas observados...", key="member_corr_desc")
+                priority = st.selectbox("Prioridade sugerida", ["alta", "média", "baixa"], index=2, key="member_corr_priority")
+                attachment = st.file_uploader("Anexo opcional (foto, vídeo, print)", type=["png", "jpg", "jpeg", "pdf", "mp4", "mov"], key="member_corr_attach")
+
+            st.markdown("#### Peças de reposição associadas ao equipamento")
+            if equipment_id is None:
+                st.caption("Selecione um equipamento para consultar peças associadas.")
+            else:
+                render_equipment_spare_parts(list_spare_parts_for_equipment(conn, equipment_id))
+
+            if st.button("Abrir ticket corretivo", type="primary", disabled=equipment_id is None, key="member_open_corrective"):
+                if equipment_id is None:
+                    st.error("Selecione um equipamento para abrir o ticket.")
+                elif not title.strip() or not description.strip():
+                    st.error("Informe o resumo e a descrição do problema.")
+                elif not _ensure_storage_ready_for_upload(attachment):
+                    pass
+                else:
+                    occurrence_dt = datetime.combine(occurrence_date, occurrence_time).isoformat(timespec="minutes")
+                    ticket_id = create_corrective_ticket(
+                        conn,
+                        equipment_id=equipment_id,
+                        reporter_id=reporter_id,
+                        title=title.strip(),
+                        description=description.strip(),
+                        occurrence_datetime=occurrence_dt,
+                        impact="baixo",
+                        priority=priority,
+                        attachment_path=None,
+                        assigned_to=clean_input(selected.get("responsible_name")),
+                        initial_diagnosis=None,
+                        probable_cause=None,
+                        operator_trained="não informado",
+                        external_supplier_needed=0,
+                        corrective_action=None,
+                        replaced_parts=None,
+                        costs=None,
+                        downtime_hours=None,
+                        conclusion_date=None,
+                        status="aberto",
+                        notify_technical=1,
+                        notify_manager=1,
+                        notify_supplier=0,
+                        notify_reporter=1,
+                    )
+                    if attachment is not None:
+                        attachment_ref = _save_upload(
+                            conn,
+                            attachment,
+                            entity_type="maintenance_corrective",
+                            entity_id=ticket_id,
+                            attachment_role="corrective_attachment",
+                        )
+                        update_legacy_attachment_path(
+                            conn,
+                            table="maintenance_corrective",
+                            row_id=ticket_id,
+                            column="attachment_path",
+                            value=attachment_ref,
+                        )
+                    st.success("Ticket corretivo registrado.")
+                    clear_app_caches()
+                    st.rerun()
+
+        st.markdown("### Tickets corretivos")
+        corr_df = query_df(
+            conn,
+            """
+            SELECT mc.id, mc.equipment_id, e.equipment_code, e.equipment_name, e.location,
+                   u.full_name AS reporter, mc.title, mc.priority,
+                   mc.status, mc.occurrence_datetime, mc.created_at, mc.attachment_path
+            FROM maintenance_corrective mc
+            JOIN equipment e ON e.id = mc.equipment_id
+            LEFT JOIN users u ON u.id = mc.reporter_id
+            WHERE COALESCE(mc.is_active, 1) = 1
+            ORDER BY CASE mc.status WHEN 'aberto' THEN 0 WHEN 'em análise' THEN 1 WHEN 'aguardando peça' THEN 2 ELSE 3 END,
+                     mc.created_at DESC
+            """,
+        )
+        if corr_df.empty:
+            st.info("Nenhum ticket corretivo registrado.")
+        else:
+            member_ticket_cols = [
+                "id", "equipment_code", "equipment_name", "location",
+                "reporter", "title", "priority", "status",
+                "occurrence_datetime", "created_at",
+            ]
+            st.dataframe(_display_df(corr_df[[c for c in member_ticket_cols if c in corr_df.columns]]), use_container_width=True, hide_index=True)
+            st.markdown("#### Detalhes do ticket")
+            ticket_options = [None] + corr_df["id"].astype(int).tolist()
+            ticket_labels = {
+                int(ticket["id"]): (
+                    f"Ticket #{int(ticket['id'])} · "
+                    f"{clean_value(ticket.get('equipment_code'))} · "
+                    f"{clean_value(ticket.get('title'))}"
+                )
+                for _, ticket in corr_df.iterrows()
+            }
+            selected_ticket_id = st.selectbox(
+                "Ver detalhes do ticket",
+                ticket_options,
+                format_func=lambda ticket_id: (
+                    "Selecione um ticket"
+                    if ticket_id is None
+                    else ticket_labels.get(int(ticket_id), f"Ticket #{ticket_id}")
+                ),
+                key="member_ticket_detail_id",
+            )
+            if selected_ticket_id is None:
+                st.caption("Selecione um ticket para consultar anexos, peças associadas e histórico.")
+            else:
+                selected_ticket = corr_df[corr_df["id"].astype(int) == int(selected_ticket_id)].iloc[0]
+                with st.container(border=True):
+                    legacy_path = selected_ticket.get("attachment_path")
+                    st.caption(
+                        f"{clean_value(selected_ticket.get('equipment_code'))} · "
+                        f"{clean_value(selected_ticket.get('equipment_name'))} · "
+                        f"Status: {clean_value(selected_ticket.get('status'))}"
+                    )
+                    render_attachment_list(
+                        conn,
+                        entity_type="maintenance_corrective",
+                        entity_id=int(selected_ticket["id"]),
+                        attachment_role="corrective_attachment",
+                        legacy_path=legacy_path,
+                        key_prefix=f"member_corrective_{int(selected_ticket['id'])}",
+                        title="Anexo",
+                        empty_message="Nenhum anexo cadastrado.",
+                    )
+                    st.markdown("##### Peças de reposição associadas ao equipamento")
+                    render_equipment_spare_parts(list_spare_parts_for_equipment(conn, int(selected_ticket["equipment_id"])))
+                    st.markdown("##### Histórico de status")
+                    render_maintenance_status_history(conn, entity_type="corrective", entity_id=int(selected_ticket["id"]))
+        return
 
     tab_prev, tab_corr, tab_dash = st.tabs([
         "Preventiva e calibração",
