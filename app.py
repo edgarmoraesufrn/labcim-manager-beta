@@ -1252,6 +1252,10 @@ def can_manage_inventory_adjustments() -> bool:
     return current_access_role() in {"manager", "admin"}
 
 
+def can_export_inventory() -> bool:
+    return current_access_role() in {"manager", "admin"}
+
+
 def can_manage_users() -> bool:
     return is_admin()
 
@@ -3839,333 +3843,337 @@ def page_insumos(conn):
                 "lot", "expiration_date", "location", "responsible_name", "active"
             ]
             st.dataframe(_display_df(supplies[[c for c in cols if c in supplies.columns]]), use_container_width=True, hide_index=True)
-            st.download_button(
-                "Baixar estoque em CSV",
-                data=_display_df(supplies).to_csv(index=False).encode("utf-8-sig"),
-                file_name="labcim_insumos_estoque.csv",
-                mime="text/csv",
-            )
+            if can_export_inventory():
+                st.download_button(
+                    "Baixar estoque em CSV",
+                    data=_display_df(supplies).to_csv(index=False).encode("utf-8-sig"),
+                    file_name="labcim_insumos_estoque.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.caption("Exportação completa do estoque é restrita a Gerente ou Administrador.")
 
     with tab_cadastro:
         st.markdown("### Cadastro de item de estoque")
         if not can_manage_master_data():
-            st.info("Seu perfil permite registrar apenas saída/consumo. Entradas, descartes e ajustes são restritos a Gerente ou Administrador.")
-        mode = st.radio("Modo", ["Novo item", "Editar item existente"], horizontal=True, key="supply_edit_mode")
-        selected_supply = None
-        if mode == "Editar item existente":
-            if supplies.empty:
-                st.info("Cadastre um item de estoque antes de editar.")
-                return
-            label = st.selectbox("Selecionar item", _supply_options(supplies), key="supply_edit_select")
-            selected_supply = supplies[supplies["id"] == _supply_id_from_label(supplies, label)].iloc[0]
+            st.info("Cadastro, edição estrutural, lotes, certificados e associação de peças são restritos a Gerente ou Administrador.")
+        else:
+            mode = st.radio("Modo", ["Novo item", "Editar item existente"], horizontal=True, key="supply_edit_mode")
+            selected_supply = None
+            if mode == "Editar item existente":
+                if supplies.empty:
+                    st.info("Cadastre um item de estoque antes de editar.")
+                    return
+                label = st.selectbox("Selecionar item", _supply_options(supplies), key="supply_edit_select")
+                selected_supply = supplies[supplies["id"] == _supply_id_from_label(supplies, label)].iloc[0]
 
-        current_supply_type = _supply_type_value(selected_supply)
-        supply_type_key = f"supply_type_{mode}_{int(selected_supply['id']) if selected_supply is not None else 'new'}"
-        supply_type = st.radio(
-            "Tipo de item",
-            SUPPLY_TYPES,
-            index=SUPPLY_TYPES.index(current_supply_type),
-            horizontal=True,
-            key=supply_type_key,
-        )
-        is_spare_part = supply_type == "Peça de reposição"
-        selected_equipment_ids: list[int] = []
-        current_item_is_spare_part = _is_spare_part(selected_supply)
+            current_supply_type = _supply_type_value(selected_supply)
+            supply_type_key = f"supply_type_{mode}_{int(selected_supply['id']) if selected_supply is not None else 'new'}"
+            supply_type = st.radio(
+                "Tipo de item",
+                SUPPLY_TYPES,
+                index=SUPPLY_TYPES.index(current_supply_type),
+                horizontal=True,
+                key=supply_type_key,
+            )
+            is_spare_part = supply_type == "Peça de reposição"
+            selected_equipment_ids: list[int] = []
+            current_item_is_spare_part = _is_spare_part(selected_supply)
 
-        with st.form("form_supply"):
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                supply_name = st.text_input(
-                    "Nome da peça *" if is_spare_part else "Nome do insumo *",
-                    value=clean_input(selected_supply.get("supply_name")) if selected_supply is not None else "",
-                    placeholder="Ex.: rotor, vedação, filtro" if is_spare_part else "Ex.: Cimento Portland Classe G",
-                )
-                supply_code = clean_input(selected_supply.get("supply_code")) if selected_supply is not None else ""
-                manufacturer_code = clean_input(selected_supply.get("manufacturer_code")) if selected_supply is not None else ""
-                compatible_model_family = clean_input(selected_supply.get("compatible_model_family")) if selected_supply is not None else ""
-                if is_spare_part:
-                    supply_code = st.text_input("Código interno", value=supply_code, placeholder="Ex.: PR-0001")
-                commercial_name = st.text_input("Nome comercial", value=clean_input(selected_supply.get("commercial_name")) if selected_supply is not None else "")
-                manufacturer = st.text_input("Fabricante", value=clean_input(selected_supply.get("manufacturer")) if selected_supply is not None else "")
-                if is_spare_part:
-                    manufacturer_code = st.text_input("Código do fabricante", value=manufacturer_code, placeholder="Ex.: part number, SKU ou referência do fabricante")
-                    category = st.text_input(
-                        "Categoria",
-                        value=clean_input(selected_supply.get("category")) if selected_supply is not None else "",
-                        placeholder="Ex.: filtro, vedação, sensor, placa eletrônica",
+            with st.form("form_supply"):
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    supply_name = st.text_input(
+                        "Nome da peça *" if is_spare_part else "Nome do insumo *",
+                        value=clean_input(selected_supply.get("supply_name")) if selected_supply is not None else "",
+                        placeholder="Ex.: rotor, vedação, filtro" if is_spare_part else "Ex.: Cimento Portland Classe G",
                     )
-                else:
-                    category = st.selectbox(
-                        "Categoria",
-                        ["Cimento", "Aditivo", "Sal", "Polímero", "Pozolana", "Carga mineral", "Lavador/espaçador", "Reagente", "Consumível", "Outro"],
-                        index=0,
-                        key="supply_category",
-                    )
-                    if selected_supply is not None and clean_input(selected_supply.get("category")):
-                        category = st.text_input("Categoria cadastrada", value=clean_input(selected_supply.get("category")))
-            with c2:
-                if is_spare_part:
-                    physical_state = clean_input(selected_supply.get("physical_state")) if current_item_is_spare_part and selected_supply is not None else ""
-                    physical_state = physical_state or "Não se aplica"
-                    application_function = clean_input(selected_supply.get("application_function")) if current_item_is_spare_part and selected_supply is not None else ""
-                    addition_mode = clean_input(selected_supply.get("addition_mode")) if current_item_is_spare_part and selected_supply is not None else ""
-                    addition_mode = addition_mode or "Não se aplica"
-                    compatible_model_family = st.text_input("Modelo/família compatível", value=compatible_model_family, placeholder="Ex.: Reômetro modelo X, Autoclave série Y")
-                    unit = clean_input(selected_supply.get("unit")) if current_item_is_spare_part and selected_supply is not None else ""
-                    unit = unit or "unidade"
-                else:
-                    physical_state = st.selectbox("Estado físico", ["Sólido", "Líquido", "Gás", "Pasta/suspensão", "Outro"], key="supply_state")
-                    if selected_supply is not None and clean_input(selected_supply.get("physical_state")):
-                        physical_state = st.text_input("Estado físico cadastrado", value=clean_input(selected_supply.get("physical_state")))
-                    application_function = st.text_input("Função/aplicação", value=clean_input(selected_supply.get("application_function")) if selected_supply is not None else "", placeholder="Ex.: retardador, expansivo, salmoura, cimento base")
-                    addition_mode = st.selectbox("Modo de adição", ["Não se aplica", "Misturado a seco", "Água de mistura", "Solução", "Outro"], key="supply_addition")
-                    if selected_supply is not None and clean_input(selected_supply.get("addition_mode")):
-                        addition_mode = st.text_input("Modo de adição cadastrado", value=clean_input(selected_supply.get("addition_mode")))
-                    unit = st.selectbox("Unidade de controle", ["kg", "g", "L", "mL", "unidade", "frasco", "saco"], key="supply_unit")
-                    if selected_supply is not None and clean_input(selected_supply.get("unit")):
-                        unit = st.text_input("Unidade cadastrada", value=clean_input(selected_supply.get("unit")))
-            with c3:
-                initial_qty_default = float(selected_supply.get("current_quantity") or 0) if selected_supply is not None else 0.0
-                current_quantity = st.number_input("Saldo inicial/atual", min_value=0.0, value=initial_qty_default, step=1.0, disabled=(mode == "Editar item existente"), help="Depois do cadastro, o saldo deve ser alterado por movimentações.")
-                min_qty_default = float(selected_supply.get("minimum_quantity") or 0) if selected_supply is not None else 0.0
-                minimum_quantity = st.number_input("Estoque mínimo", min_value=0.0, value=min_qty_default, step=1.0)
-                lot = st.text_input("Lote", value=clean_input(selected_supply.get("lot")) if selected_supply is not None else "")
-                expiration_date = _date_input_value(selected_supply.get("expiration_date")) if is_spare_part and selected_supply is not None else None
-                if not is_spare_part:
-                    expiration_date = st.date_input(
-                        "Validade",
-                        value=None if selected_supply is None or is_blank(selected_supply.get("expiration_date")) else datetime.fromisoformat(str(selected_supply.get("expiration_date"))).date(),
-                        key="supply_expiration",
-                    )
-                location = st.text_input("Localização", value=clean_input(selected_supply.get("location")) if selected_supply is not None else "", placeholder="Ex.: Almoxarifado 1, armário A")
-                responsible_name = st.text_input("Responsável", value=clean_input(selected_supply.get("responsible_name")) if selected_supply is not None else "")
-
-            density = selected_supply.get("density") if selected_supply is not None else None
-            recommended_concentration = clean_input(selected_supply.get("recommended_concentration")) if selected_supply is not None else ""
-            recommended_temperature = clean_input(selected_supply.get("recommended_temperature")) if selected_supply is not None else ""
-            characterization_summary = clean_input(selected_supply.get("characterization_summary")) if selected_supply is not None else ""
-            safety_doc_path = clean_input(selected_supply.get("safety_doc_path")) if selected_supply is not None else ""
-            technical_doc_path = clean_input(selected_supply.get("technical_doc_path")) if selected_supply is not None else ""
-            safety_upload = None
-            technical_upload = None
-            if not is_spare_part:
-                st.markdown("#### Dados técnicos opcionais")
-                t1, t2, t3 = st.columns(3)
-                with t1:
-                    density_default = float(selected_supply.get("density") or 0) if selected_supply is not None and not is_blank(selected_supply.get("density")) else 0.0
-                    density = st.number_input("Massa específica", min_value=0.0, value=density_default, step=0.01)
-                    recommended_concentration = st.text_input("Faixa de concentração", value=recommended_concentration, placeholder="Ex.: 0,5–3,0% BWOC")
-                with t2:
-                    recommended_temperature = st.text_input("Faixa de temperatura", value=recommended_temperature, placeholder="Ex.: 25–90 °C")
-                    characterization_summary = st.text_area("Caracterização resumida", value=characterization_summary, placeholder="Ex.: FRX/DRX realizados; arquivo anexado...")
-                with t3:
-                    safety_doc_path = st.text_input("FDS/FISPQ existente ou link", value=safety_doc_path)
-                    technical_doc_path = st.text_input("Ficha técnica/caracterização existente ou link", value=technical_doc_path)
-                    safety_upload = st.file_uploader("Anexar FDS/FISPQ", type=["pdf", "png", "jpg", "jpeg"], key="safety_doc_upload")
-                    technical_upload = st.file_uploader("Anexar ficha/caracterização", type=["pdf", "png", "jpg", "jpeg", "xlsx"], key="technical_doc_upload")
-
-            if is_spare_part:
-                st.markdown("#### Equipamentos associados")
-                if equipment.empty:
-                    st.info("Cadastre equipamentos antes de associar peças de reposição.")
-                else:
-                    linked_equipment = (
-                        list_equipment_for_spare_part(conn, int(selected_supply["id"]))
-                        if selected_supply is not None
-                        else pd.DataFrame()
-                    )
-                    linked_ids = set(linked_equipment["id"].astype(int).tolist()) if not linked_equipment.empty else set()
-                    equipment_options = _equipment_options(equipment)
-                    default_equipment_labels = [
-                        label for label in equipment_options
-                        if _equipment_id_from_label(equipment, label) in linked_ids
-                    ]
-                    selected_equipment_labels = st.multiselect(
-                        "Equipamentos associados",
-                        equipment_options,
-                        default=default_equipment_labels,
-                        key=f"spare_equipment_links_{int(selected_supply['id']) if selected_supply is not None else 'new'}",
-                    )
-                    selected_equipment_ids = _equipment_ids_from_labels(equipment, selected_equipment_labels)
-
-            notes = st.text_area("Observações", value=clean_input(selected_supply.get("notes")) if selected_supply is not None else "")
-            active = st.checkbox("Item ativo", value=True if selected_supply is None else truthy(selected_supply.get("active")))
-            submitted = st.form_submit_button("Salvar insumo", type="primary")
-
-        if selected_supply is not None and not is_spare_part:
-            st.markdown("#### Documentos cadastrados")
-            a1, a2 = st.columns(2)
-            with a1:
-                render_attachment_list(
-                    conn,
-                    entity_type="supply",
-                    entity_id=int(selected_supply["id"]),
-                    attachment_role="safety_doc",
-                    legacy_path=selected_supply.get("safety_doc_path"),
-                    key_prefix=f"supply_{int(selected_supply['id'])}_safety_doc",
-                    title="FDS/FISPQ",
-                    empty_message="Nenhuma FDS/FISPQ cadastrada.",
-                )
-            with a2:
-                render_attachment_list(
-                    conn,
-                    entity_type="supply",
-                    entity_id=int(selected_supply["id"]),
-                    attachment_role="technical_doc",
-                    legacy_path=selected_supply.get("technical_doc_path"),
-                    key_prefix=f"supply_{int(selected_supply['id'])}_technical_doc",
-                    title="Ficha técnica/caracterização",
-                    empty_message="Nenhuma ficha técnica/caracterização cadastrada.",
-                )
-
-        if selected_supply is not None:
-            render_supply_lots_section(conn, selected_supply, supply_lots)
-
-        if submitted:
-            if not can_manage_master_data():
-                st.error("Cadastro/edição estrutural de insumos exige perfil Gerente ou Administrador.")
-            elif not supply_name.strip():
-                st.error("Informe o nome do item.")
-            elif not _ensure_storage_ready_for_upload(safety_upload, technical_upload):
-                pass
-            else:
-                if mode == "Novo item":
-                    supply_id = create_supply(
-                        conn,
-                        supply_type=supply_type,
-                        supply_name=supply_name.strip(),
-                        supply_code=supply_code.strip() or None,
-                        commercial_name=commercial_name.strip() or None,
-                        manufacturer=manufacturer.strip() or None,
-                        manufacturer_code=manufacturer_code.strip() or None,
-                        category=category.strip() or None,
-                        physical_state=physical_state.strip() or None,
-                        application_function=application_function.strip() or None,
-                        addition_mode=addition_mode.strip() or None,
-                        compatible_model_family=compatible_model_family.strip() or None,
-                        unit=unit.strip() or "kg",
-                        current_quantity=0.0,
-                        minimum_quantity=float(minimum_quantity),
-                        lot=lot.strip() or None,
-                        expiration_date=expiration_date.isoformat() if expiration_date else None,
-                        location=location.strip() or None,
-                        responsible_name=responsible_name.strip() or None,
-                        safety_doc_path=safety_doc_path.strip() or None,
-                        technical_doc_path=technical_doc_path.strip() or None,
-                        density=float(density) if density else None,
-                        recommended_concentration=recommended_concentration.strip() or None,
-                        recommended_temperature=recommended_temperature.strip() or None,
-                        characterization_summary=characterization_summary.strip() or None,
-                        notes=notes.strip() or None,
-                    )
+                    supply_code = clean_input(selected_supply.get("supply_code")) if selected_supply is not None else ""
+                    manufacturer_code = clean_input(selected_supply.get("manufacturer_code")) if selected_supply is not None else ""
+                    compatible_model_family = clean_input(selected_supply.get("compatible_model_family")) if selected_supply is not None else ""
                     if is_spare_part:
+                        supply_code = st.text_input("Código interno", value=supply_code, placeholder="Ex.: PR-0001")
+                    commercial_name = st.text_input("Nome comercial", value=clean_input(selected_supply.get("commercial_name")) if selected_supply is not None else "")
+                    manufacturer = st.text_input("Fabricante", value=clean_input(selected_supply.get("manufacturer")) if selected_supply is not None else "")
+                    if is_spare_part:
+                        manufacturer_code = st.text_input("Código do fabricante", value=manufacturer_code, placeholder="Ex.: part number, SKU ou referência do fabricante")
+                        category = st.text_input(
+                            "Categoria",
+                            value=clean_input(selected_supply.get("category")) if selected_supply is not None else "",
+                            placeholder="Ex.: filtro, vedação, sensor, placa eletrônica",
+                        )
+                    else:
+                        category = st.selectbox(
+                            "Categoria",
+                            ["Cimento", "Aditivo", "Sal", "Polímero", "Pozolana", "Carga mineral", "Lavador/espaçador", "Reagente", "Consumível", "Outro"],
+                            index=0,
+                            key="supply_category",
+                        )
+                        if selected_supply is not None and clean_input(selected_supply.get("category")):
+                            category = st.text_input("Categoria cadastrada", value=clean_input(selected_supply.get("category")))
+                with c2:
+                    if is_spare_part:
+                        physical_state = clean_input(selected_supply.get("physical_state")) if current_item_is_spare_part and selected_supply is not None else ""
+                        physical_state = physical_state or "Não se aplica"
+                        application_function = clean_input(selected_supply.get("application_function")) if current_item_is_spare_part and selected_supply is not None else ""
+                        addition_mode = clean_input(selected_supply.get("addition_mode")) if current_item_is_spare_part and selected_supply is not None else ""
+                        addition_mode = addition_mode or "Não se aplica"
+                        compatible_model_family = st.text_input("Modelo/família compatível", value=compatible_model_family, placeholder="Ex.: Reômetro modelo X, Autoclave série Y")
+                        unit = clean_input(selected_supply.get("unit")) if current_item_is_spare_part and selected_supply is not None else ""
+                        unit = unit or "unidade"
+                    else:
+                        physical_state = st.selectbox("Estado físico", ["Sólido", "Líquido", "Gás", "Pasta/suspensão", "Outro"], key="supply_state")
+                        if selected_supply is not None and clean_input(selected_supply.get("physical_state")):
+                            physical_state = st.text_input("Estado físico cadastrado", value=clean_input(selected_supply.get("physical_state")))
+                        application_function = st.text_input("Função/aplicação", value=clean_input(selected_supply.get("application_function")) if selected_supply is not None else "", placeholder="Ex.: retardador, expansivo, salmoura, cimento base")
+                        addition_mode = st.selectbox("Modo de adição", ["Não se aplica", "Misturado a seco", "Água de mistura", "Solução", "Outro"], key="supply_addition")
+                        if selected_supply is not None and clean_input(selected_supply.get("addition_mode")):
+                            addition_mode = st.text_input("Modo de adição cadastrado", value=clean_input(selected_supply.get("addition_mode")))
+                        unit = st.selectbox("Unidade de controle", ["kg", "g", "L", "mL", "unidade", "frasco", "saco"], key="supply_unit")
+                        if selected_supply is not None and clean_input(selected_supply.get("unit")):
+                            unit = st.text_input("Unidade cadastrada", value=clean_input(selected_supply.get("unit")))
+                with c3:
+                    initial_qty_default = float(selected_supply.get("current_quantity") or 0) if selected_supply is not None else 0.0
+                    current_quantity = st.number_input("Saldo inicial/atual", min_value=0.0, value=initial_qty_default, step=1.0, disabled=(mode == "Editar item existente"), help="Depois do cadastro, o saldo deve ser alterado por movimentações.")
+                    min_qty_default = float(selected_supply.get("minimum_quantity") or 0) if selected_supply is not None else 0.0
+                    minimum_quantity = st.number_input("Estoque mínimo", min_value=0.0, value=min_qty_default, step=1.0)
+                    lot = st.text_input("Lote", value=clean_input(selected_supply.get("lot")) if selected_supply is not None else "")
+                    expiration_date = _date_input_value(selected_supply.get("expiration_date")) if is_spare_part and selected_supply is not None else None
+                    if not is_spare_part:
+                        expiration_date = st.date_input(
+                            "Validade",
+                            value=None if selected_supply is None or is_blank(selected_supply.get("expiration_date")) else datetime.fromisoformat(str(selected_supply.get("expiration_date"))).date(),
+                            key="supply_expiration",
+                        )
+                    location = st.text_input("Localização", value=clean_input(selected_supply.get("location")) if selected_supply is not None else "", placeholder="Ex.: Almoxarifado 1, armário A")
+                    responsible_name = st.text_input("Responsável", value=clean_input(selected_supply.get("responsible_name")) if selected_supply is not None else "")
+
+                density = selected_supply.get("density") if selected_supply is not None else None
+                recommended_concentration = clean_input(selected_supply.get("recommended_concentration")) if selected_supply is not None else ""
+                recommended_temperature = clean_input(selected_supply.get("recommended_temperature")) if selected_supply is not None else ""
+                characterization_summary = clean_input(selected_supply.get("characterization_summary")) if selected_supply is not None else ""
+                safety_doc_path = clean_input(selected_supply.get("safety_doc_path")) if selected_supply is not None else ""
+                technical_doc_path = clean_input(selected_supply.get("technical_doc_path")) if selected_supply is not None else ""
+                safety_upload = None
+                technical_upload = None
+                if not is_spare_part:
+                    st.markdown("#### Dados técnicos opcionais")
+                    t1, t2, t3 = st.columns(3)
+                    with t1:
+                        density_default = float(selected_supply.get("density") or 0) if selected_supply is not None and not is_blank(selected_supply.get("density")) else 0.0
+                        density = st.number_input("Massa específica", min_value=0.0, value=density_default, step=0.01)
+                        recommended_concentration = st.text_input("Faixa de concentração", value=recommended_concentration, placeholder="Ex.: 0,5–3,0% BWOC")
+                    with t2:
+                        recommended_temperature = st.text_input("Faixa de temperatura", value=recommended_temperature, placeholder="Ex.: 25–90 °C")
+                        characterization_summary = st.text_area("Caracterização resumida", value=characterization_summary, placeholder="Ex.: FRX/DRX realizados; arquivo anexado...")
+                    with t3:
+                        safety_doc_path = st.text_input("FDS/FISPQ existente ou link", value=safety_doc_path)
+                        technical_doc_path = st.text_input("Ficha técnica/caracterização existente ou link", value=technical_doc_path)
+                        safety_upload = st.file_uploader("Anexar FDS/FISPQ", type=["pdf", "png", "jpg", "jpeg"], key="safety_doc_upload")
+                        technical_upload = st.file_uploader("Anexar ficha/caracterização", type=["pdf", "png", "jpg", "jpeg", "xlsx"], key="technical_doc_upload")
+
+                if is_spare_part:
+                    st.markdown("#### Equipamentos associados")
+                    if equipment.empty:
+                        st.info("Cadastre equipamentos antes de associar peças de reposição.")
+                    else:
+                        linked_equipment = (
+                            list_equipment_for_spare_part(conn, int(selected_supply["id"]))
+                            if selected_supply is not None
+                            else pd.DataFrame()
+                        )
+                        linked_ids = set(linked_equipment["id"].astype(int).tolist()) if not linked_equipment.empty else set()
+                        equipment_options = _equipment_options(equipment)
+                        default_equipment_labels = [
+                            label for label in equipment_options
+                            if _equipment_id_from_label(equipment, label) in linked_ids
+                        ]
+                        selected_equipment_labels = st.multiselect(
+                            "Equipamentos associados",
+                            equipment_options,
+                            default=default_equipment_labels,
+                            key=f"spare_equipment_links_{int(selected_supply['id']) if selected_supply is not None else 'new'}",
+                        )
+                        selected_equipment_ids = _equipment_ids_from_labels(equipment, selected_equipment_labels)
+
+                notes = st.text_area("Observações", value=clean_input(selected_supply.get("notes")) if selected_supply is not None else "")
+                active = st.checkbox("Item ativo", value=True if selected_supply is None else truthy(selected_supply.get("active")))
+                submitted = st.form_submit_button("Salvar insumo", type="primary")
+
+            if selected_supply is not None and not is_spare_part:
+                st.markdown("#### Documentos cadastrados")
+                a1, a2 = st.columns(2)
+                with a1:
+                    render_attachment_list(
+                        conn,
+                        entity_type="supply",
+                        entity_id=int(selected_supply["id"]),
+                        attachment_role="safety_doc",
+                        legacy_path=selected_supply.get("safety_doc_path"),
+                        key_prefix=f"supply_{int(selected_supply['id'])}_safety_doc",
+                        title="FDS/FISPQ",
+                        empty_message="Nenhuma FDS/FISPQ cadastrada.",
+                    )
+                with a2:
+                    render_attachment_list(
+                        conn,
+                        entity_type="supply",
+                        entity_id=int(selected_supply["id"]),
+                        attachment_role="technical_doc",
+                        legacy_path=selected_supply.get("technical_doc_path"),
+                        key_prefix=f"supply_{int(selected_supply['id'])}_technical_doc",
+                        title="Ficha técnica/caracterização",
+                        empty_message="Nenhuma ficha técnica/caracterização cadastrada.",
+                    )
+
+            if selected_supply is not None:
+                render_supply_lots_section(conn, selected_supply, supply_lots)
+
+            if submitted:
+                if not can_manage_master_data():
+                    st.error("Cadastro/edição estrutural de insumos exige perfil Gerente ou Administrador.")
+                elif not supply_name.strip():
+                    st.error("Informe o nome do item.")
+                elif not _ensure_storage_ready_for_upload(safety_upload, technical_upload):
+                    pass
+                else:
+                    if mode == "Novo item":
+                        supply_id = create_supply(
+                            conn,
+                            supply_type=supply_type,
+                            supply_name=supply_name.strip(),
+                            supply_code=supply_code.strip() or None,
+                            commercial_name=commercial_name.strip() or None,
+                            manufacturer=manufacturer.strip() or None,
+                            manufacturer_code=manufacturer_code.strip() or None,
+                            category=category.strip() or None,
+                            physical_state=physical_state.strip() or None,
+                            application_function=application_function.strip() or None,
+                            addition_mode=addition_mode.strip() or None,
+                            compatible_model_family=compatible_model_family.strip() or None,
+                            unit=unit.strip() or "kg",
+                            current_quantity=0.0,
+                            minimum_quantity=float(minimum_quantity),
+                            lot=lot.strip() or None,
+                            expiration_date=expiration_date.isoformat() if expiration_date else None,
+                            location=location.strip() or None,
+                            responsible_name=responsible_name.strip() or None,
+                            safety_doc_path=safety_doc_path.strip() or None,
+                            technical_doc_path=technical_doc_path.strip() or None,
+                            density=float(density) if density else None,
+                            recommended_concentration=recommended_concentration.strip() or None,
+                            recommended_temperature=recommended_temperature.strip() or None,
+                            characterization_summary=characterization_summary.strip() or None,
+                            notes=notes.strip() or None,
+                        )
+                        if is_spare_part:
+                            set_spare_part_equipment_links(
+                                conn,
+                                supply_id=supply_id,
+                                equipment_ids=selected_equipment_ids,
+                            )
+                        if current_quantity:
+                            create_supply_movement(
+                                conn,
+                                supply_id=supply_id,
+                                movement_type="entrada",
+                                movement_date=date.today().isoformat(),
+                                quantity=float(current_quantity),
+                                user_id=None,
+                                project_id=None,
+                                purpose="Saldo inicial cadastrado.",
+                                document_path=None,
+                            )
+                        if safety_upload is not None:
+                            safety_ref = _save_upload(
+                                conn,
+                                safety_upload,
+                                entity_type="supply",
+                                entity_id=supply_id,
+                                attachment_role="safety_doc",
+                            )
+                            update_legacy_attachment_path(
+                                conn,
+                                table="supplies",
+                                row_id=supply_id,
+                                column="safety_doc_path",
+                                value=safety_ref,
+                            )
+                        if technical_upload is not None:
+                            technical_ref = _save_upload(
+                                conn,
+                                technical_upload,
+                                entity_type="supply",
+                                entity_id=supply_id,
+                                attachment_role="technical_doc",
+                            )
+                            update_legacy_attachment_path(
+                                conn,
+                                table="supplies",
+                                row_id=supply_id,
+                                column="technical_doc_path",
+                                value=technical_ref,
+                            )
+                        st.success("Item cadastrado com sucesso.")
+                        clear_app_caches()
+                        st.rerun()
+                    else:
+                        supply_id = int(selected_supply["id"])
+                        safety_final = safety_doc_path.strip() or None
+                        technical_final = technical_doc_path.strip() or None
+                        if safety_upload is not None:
+                            safety_final = _save_upload(
+                                conn,
+                                safety_upload,
+                                entity_type="supply",
+                                entity_id=supply_id,
+                                attachment_role="safety_doc",
+                            )
+                        if technical_upload is not None:
+                            technical_final = _save_upload(
+                                conn,
+                                technical_upload,
+                                entity_type="supply",
+                                entity_id=supply_id,
+                                attachment_role="technical_doc",
+                            )
+                        update_supply(
+                            conn,
+                            supply_id,
+                            supply_type=supply_type,
+                            supply_name=supply_name.strip(),
+                            supply_code=supply_code.strip() or None,
+                            commercial_name=commercial_name.strip() or None,
+                            manufacturer=manufacturer.strip() or None,
+                            manufacturer_code=manufacturer_code.strip() or None,
+                            category=category.strip() or None,
+                            physical_state=physical_state.strip() or None,
+                            application_function=application_function.strip() or None,
+                            addition_mode=addition_mode.strip() or None,
+                            compatible_model_family=compatible_model_family.strip() or None,
+                            unit=unit.strip() or "kg",
+                            minimum_quantity=float(minimum_quantity),
+                            lot=lot.strip() or None,
+                            expiration_date=expiration_date.isoformat() if expiration_date else None,
+                            location=location.strip() or None,
+                            responsible_name=responsible_name.strip() or None,
+                            safety_doc_path=safety_final,
+                            technical_doc_path=technical_final,
+                            density=float(density) if density else None,
+                            recommended_concentration=recommended_concentration.strip() or None,
+                            recommended_temperature=recommended_temperature.strip() or None,
+                            characterization_summary=characterization_summary.strip() or None,
+                            active=int(active),
+                            notes=notes.strip() or None,
+                        )
                         set_spare_part_equipment_links(
                             conn,
                             supply_id=supply_id,
-                            equipment_ids=selected_equipment_ids,
+                            equipment_ids=selected_equipment_ids if is_spare_part else [],
                         )
-                    if current_quantity:
-                        create_supply_movement(
-                            conn,
-                            supply_id=supply_id,
-                            movement_type="entrada",
-                            movement_date=date.today().isoformat(),
-                            quantity=float(current_quantity),
-                            user_id=None,
-                            project_id=None,
-                            purpose="Saldo inicial cadastrado.",
-                            document_path=None,
-                        )
-                    if safety_upload is not None:
-                        safety_ref = _save_upload(
-                            conn,
-                            safety_upload,
-                            entity_type="supply",
-                            entity_id=supply_id,
-                            attachment_role="safety_doc",
-                        )
-                        update_legacy_attachment_path(
-                            conn,
-                            table="supplies",
-                            row_id=supply_id,
-                            column="safety_doc_path",
-                            value=safety_ref,
-                        )
-                    if technical_upload is not None:
-                        technical_ref = _save_upload(
-                            conn,
-                            technical_upload,
-                            entity_type="supply",
-                            entity_id=supply_id,
-                            attachment_role="technical_doc",
-                        )
-                        update_legacy_attachment_path(
-                            conn,
-                            table="supplies",
-                            row_id=supply_id,
-                            column="technical_doc_path",
-                            value=technical_ref,
-                        )
-                    st.success("Item cadastrado com sucesso.")
-                    clear_app_caches()
-                    st.rerun()
-                else:
-                    supply_id = int(selected_supply["id"])
-                    safety_final = safety_doc_path.strip() or None
-                    technical_final = technical_doc_path.strip() or None
-                    if safety_upload is not None:
-                        safety_final = _save_upload(
-                            conn,
-                            safety_upload,
-                            entity_type="supply",
-                            entity_id=supply_id,
-                            attachment_role="safety_doc",
-                        )
-                    if technical_upload is not None:
-                        technical_final = _save_upload(
-                            conn,
-                            technical_upload,
-                            entity_type="supply",
-                            entity_id=supply_id,
-                            attachment_role="technical_doc",
-                        )
-                    update_supply(
-                        conn,
-                        supply_id,
-                        supply_type=supply_type,
-                        supply_name=supply_name.strip(),
-                        supply_code=supply_code.strip() or None,
-                        commercial_name=commercial_name.strip() or None,
-                        manufacturer=manufacturer.strip() or None,
-                        manufacturer_code=manufacturer_code.strip() or None,
-                        category=category.strip() or None,
-                        physical_state=physical_state.strip() or None,
-                        application_function=application_function.strip() or None,
-                        addition_mode=addition_mode.strip() or None,
-                        compatible_model_family=compatible_model_family.strip() or None,
-                        unit=unit.strip() or "kg",
-                        minimum_quantity=float(minimum_quantity),
-                        lot=lot.strip() or None,
-                        expiration_date=expiration_date.isoformat() if expiration_date else None,
-                        location=location.strip() or None,
-                        responsible_name=responsible_name.strip() or None,
-                        safety_doc_path=safety_final,
-                        technical_doc_path=technical_final,
-                        density=float(density) if density else None,
-                        recommended_concentration=recommended_concentration.strip() or None,
-                        recommended_temperature=recommended_temperature.strip() or None,
-                        characterization_summary=characterization_summary.strip() or None,
-                        active=int(active),
-                        notes=notes.strip() or None,
-                    )
-                    set_spare_part_equipment_links(
-                        conn,
-                        supply_id=supply_id,
-                        equipment_ids=selected_equipment_ids if is_spare_part else [],
-                    )
-                    st.success("Item atualizado com sucesso.")
-                    clear_app_caches()
-                    st.rerun()
+                        st.success("Item atualizado com sucesso.")
+                        clear_app_caches()
+                        st.rerun()
 
     with tab_mov:
         st.markdown("### Movimentar estoque")
@@ -4239,6 +4247,7 @@ def page_insumos(conn):
                 movement_type_options = ["saída"]
                 st.info("Seu perfil permite registrar apenas saída/consumo. Entradas, descartes e ajustes são restritos a Gerente ou Administrador.")
 
+            movement_user_id = None
             with st.form("form_supply_movement"):
                 c1, c2, c3 = st.columns(3)
                 with c1:
@@ -4246,7 +4255,12 @@ def page_insumos(conn):
                     movement_date = st.date_input("Data", value=date.today(), key="movement_date")
                 with c2:
                     quantity = st.number_input("Quantidade", min_value=0.0, value=0.0, step=1.0, key="movement_qty")
-                    user_label = st.selectbox("Responsável pela movimentação", ["Não informado"] + _user_options(users), key="movement_user")
+                    if can_manage_inventory_adjustments():
+                        user_label = st.selectbox("Responsável pela movimentação", ["Não informado"] + _user_options(users), key="movement_user")
+                        movement_user_id = _user_id_from_label(users, user_label)
+                    else:
+                        movement_user_id = _current_user_id()
+                        st.caption(f"Responsável pela movimentação: {clean_value(current_user().get('full_name'), 'usuário autenticado')}")
                 with c3:
                     purpose = st.text_area("Finalidade/observação", placeholder="Ex.: preparo de pasta; recebimento de material; descarte por vencimento...")
                     movement_doc = st.file_uploader("Anexo da movimentação", type=["pdf", "png", "jpg", "jpeg", "xlsx"], key="movement_doc")
@@ -4315,7 +4329,9 @@ def page_insumos(conn):
             if move_submitted:
                 negative_movement = movement_type in {"saída", "descarte", "ajuste negativo"}
                 lot_balance = float(selected_lot.get("current_quantity") or 0) if selected_lot is not None else None
-                if selected_lot is not None and negative_movement and float(quantity) > float(lot_balance or 0) + 1e-9:
+                if not can_manage_inventory_adjustments() and movement_user_id is None:
+                    st.error("Não foi possível identificar o usuário autenticado. Faça login novamente.")
+                elif selected_lot is not None and negative_movement and float(quantity) > float(lot_balance or 0) + 1e-9:
                     st.error(f"Saldo insuficiente no lote. Saldo atual do lote: {float(lot_balance or 0):g} {clean_value(selected_lot.get('unit'), clean_value(selected_movement_supply.get('unit'), ''))}.")
                 elif _ensure_storage_ready_for_upload(movement_doc):
                     ok, msg, movement_id = create_supply_movement(
@@ -4325,7 +4341,7 @@ def page_insumos(conn):
                         movement_type=movement_type,
                         movement_date=movement_date.isoformat(),
                         quantity=float(quantity),
-                        user_id=_user_id_from_label(users, user_label),
+                        user_id=movement_user_id,
                         project_id=movement_project_id,
                         service_id=movement_service_id,
                         purpose=purpose.strip() or None,
