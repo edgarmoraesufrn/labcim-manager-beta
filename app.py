@@ -1534,7 +1534,6 @@ def render_mobile_menu_navigation(selected_page: str) -> str:
             index=page_labels.index(active_page),
             format_func=lambda label: f"{PAGE_ICONS.get(label, '📄')} {label}",
             key=MOBILE_MENU_PAGE_KEY,
-            help="Menu principal para uso em celular.",
             on_change=_on_mobile_navigation_change,
         )
 
