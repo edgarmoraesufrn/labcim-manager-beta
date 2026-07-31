@@ -182,6 +182,7 @@ PAGE_LABELS = [
 SIDEBAR_PAGE_KEY = "labcim_active_sidebar_page"
 SIDEBAR_URL_PAGE_KEY = "labcim_sidebar_url_page"
 SCROLL_TO_TOP_PAGE_KEY = "labcim_scroll_to_top_page"
+MOBILE_MENU_PAGE_KEY = "mobile_menu_navigation_page"
 PAGE_ICONS = {
     "Painel inicial": "🏠",
     "Reservas": "📅",
@@ -1393,6 +1394,7 @@ def sidebar(default_page: str | None = None):
             )
             if clicked and not is_active:
                 st.session_state[SIDEBAR_PAGE_KEY] = page_label
+                st.session_state[MOBILE_MENU_PAGE_KEY] = page_label
                 st.rerun()
 
     st.sidebar.markdown("---")
@@ -1404,31 +1406,43 @@ def sidebar(default_page: str | None = None):
     return page
 
 
+
+def _on_mobile_navigation_change() -> None:
+    mobile_page = st.session_state.get(MOBILE_MENU_PAGE_KEY)
+    if mobile_page in _allowed_sidebar_pages():
+        st.session_state[SIDEBAR_PAGE_KEY] = mobile_page
+
+
 def render_mobile_menu_navigation(selected_page: str) -> str:
     page_labels = _allowed_sidebar_pages()
     if selected_page not in page_labels:
         selected_page = "Painel inicial"
         st.session_state[SIDEBAR_PAGE_KEY] = selected_page
 
+    active_page = st.session_state.get(SIDEBAR_PAGE_KEY, selected_page)
+    if active_page not in page_labels:
+        active_page = selected_page
+        st.session_state[SIDEBAR_PAGE_KEY] = active_page
+
+    if st.session_state.get(MOBILE_MENU_PAGE_KEY) != active_page:
+        st.session_state[MOBILE_MENU_PAGE_KEY] = active_page
+
     with st.container(key="labcim_mobile_navigation"):
-        mobile_page = st.selectbox(
+        st.selectbox(
             "☰ Menu",
             page_labels,
-            index=page_labels.index(selected_page),
+            index=page_labels.index(active_page),
             format_func=lambda label: f"{PAGE_ICONS.get(label, '📄')} {label}",
-            key="mobile_menu_navigation_page",
+            key=MOBILE_MENU_PAGE_KEY,
             help="Menu principal para uso em celular.",
+            on_change=_on_mobile_navigation_change,
         )
-
-        if mobile_page != selected_page:
-            st.session_state[SIDEBAR_PAGE_KEY] = mobile_page
-            st.rerun()
 
         if st.button("Sair", key="mobile_menu_logout", use_container_width=True):
             logout()
             st.rerun()
 
-    return mobile_page
+    return st.session_state.get(SIDEBAR_PAGE_KEY, active_page)
 
 
 def scroll_to_top_on_page_change(page: str) -> None:
