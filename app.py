@@ -567,12 +567,12 @@ def setup_page() -> None:
             pointer-events: none !important;
         }}
 
-        /* O menu mobile existe no código, mas fica invisível no desktop. */
+        /* O menu mobile existe no código, mas fica invisível em desktop amplo. */
         .st-key-labcim_mobile_navigation {{
             display: none !important;
         }}
 
-        @media (max-width: 768px) {{
+        @media (max-width: 1100px) {{
             section[data-testid="stSidebar"] {{
                 display: none !important;
             }}
