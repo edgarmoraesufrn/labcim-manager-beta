@@ -180,8 +180,6 @@ PAGE_LABELS = [
 ]
 SIDEBAR_PAGE_KEY = "labcim_active_sidebar_page"
 SIDEBAR_URL_PAGE_KEY = "labcim_sidebar_url_page"
-QUICK_NAVIGATION_PAGE_KEY = "quick_navigation_page"
-QUICK_NAVIGATION_LAST_PAGE_KEY = "quick_navigation_last_page"
 PAGE_ICONS = {
     "Painel inicial": "🏠",
     "Reservas": "📅",
@@ -1361,36 +1359,39 @@ def sidebar(default_page: str | None = None):
     return page
 
 
-def render_quick_navigation(selected_page: str) -> str:
+def render_mobile_menu_navigation(selected_page: str) -> str:
     page_labels = _allowed_sidebar_pages()
     if selected_page not in page_labels:
         selected_page = "Painel inicial"
         st.session_state[SIDEBAR_PAGE_KEY] = selected_page
 
-    previous_rendered_page = st.session_state.get(QUICK_NAVIGATION_LAST_PAGE_KEY)
-    quick_state_page = st.session_state.get(QUICK_NAVIGATION_PAGE_KEY)
-    if quick_state_page not in page_labels:
-        st.session_state[QUICK_NAVIGATION_PAGE_KEY] = selected_page
-    elif quick_state_page != selected_page:
-        if previous_rendered_page == selected_page:
-            st.session_state[SIDEBAR_PAGE_KEY] = quick_state_page
-            st.session_state[QUICK_NAVIGATION_LAST_PAGE_KEY] = quick_state_page
+    with st.expander("☰ Menu", expanded=False):
+        st.caption("Menu compacto para navegação em celular.")
+        for section, section_pages in NAVIGATION_SECTIONS:
+            visible_pages = [label for label in section_pages if label in page_labels]
+            if not visible_pages:
+                continue
+            st.markdown(f"**{section}**")
+            for page_label in visible_pages:
+                is_active = page_label == selected_page
+                label = _sidebar_button_label(page_label)
+                if is_active:
+                    label = f"{label} · atual"
+                clicked = st.button(
+                    label,
+                    key=f"mobile_{_sidebar_button_key(page_label)}",
+                    type="primary" if is_active else "secondary",
+                    use_container_width=True,
+                )
+                if clicked and not is_active:
+                    st.session_state[SIDEBAR_PAGE_KEY] = page_label
+                    st.rerun()
+
+        st.markdown("---")
+        if st.button("Sair", key="mobile_menu_logout", use_container_width=True):
+            logout()
             st.rerun()
-        st.session_state[QUICK_NAVIGATION_PAGE_KEY] = selected_page
-
-    st.session_state[QUICK_NAVIGATION_LAST_PAGE_KEY] = selected_page
-
-    quick_page = st.selectbox(
-        "Ir para",
-        page_labels,
-        index=page_labels.index(selected_page),
-        key=QUICK_NAVIGATION_PAGE_KEY,
-    )
-    st.caption("Use este atalho no celular para navegar sem abrir a barra lateral.")
-    if quick_page != selected_page:
-        st.session_state[SIDEBAR_PAGE_KEY] = quick_page
-        st.rerun()
-    return quick_page
+    return selected_page
 
 
 def current_access_role() -> str:
@@ -7343,7 +7344,7 @@ def main():
         return
     apply_url_params_hint()
     page = sidebar()
-    page = render_quick_navigation(page)
+    page = render_mobile_menu_navigation(page)
     with perf_timer(f"Página: {page}"):
         if page == "Painel inicial":
             page_dashboard(conn)
