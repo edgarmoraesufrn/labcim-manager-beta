@@ -25,7 +25,6 @@ import pandas as pd
 import plotly.express as px
 import qrcode
 import streamlit as st
-import streamlit.components.v1 as components
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -181,9 +180,6 @@ PAGE_LABELS = [
 ]
 SIDEBAR_PAGE_KEY = "labcim_active_sidebar_page"
 SIDEBAR_URL_PAGE_KEY = "labcim_sidebar_url_page"
-MOBILE_SIDEBAR_COLLAPSE_KEY = "mobile_sidebar_should_collapse"
-QUICK_NAVIGATION_PAGE_KEY = "quick_navigation_page"
-QUICK_NAVIGATION_LAST_PAGE_KEY = "quick_navigation_last_page"
 PAGE_ICONS = {
     "Painel inicial": "🏠",
     "Reservas": "📅",
@@ -508,26 +504,6 @@ def setup_page() -> None:
         [data-testid="stSidebar"] .stButton > button[kind="primary"] * {{
             color: #FFFFFF !important;
             opacity: 1 !important;
-        }}
-        @media (max-width: 768px) {{
-            div[data-testid="collapsedControl"] {{
-                top: .75rem !important;
-                left: .75rem !important;
-            }}
-            div[data-testid="collapsedControl"] button {{
-                min-width: 5.4rem !important;
-                min-height: 2.45rem !important;
-                border-radius: 999px !important;
-                border: 1px solid #D9EAFB !important;
-                background: #FFFFFF !important;
-                box-shadow: 0 8px 20px rgba(16, 42, 67, .12) !important;
-            }}
-            div[data-testid="collapsedControl"] button::after {{
-                content: "Menu";
-                color: {LAB_BLUE};
-                font-weight: 850;
-                margin-left: .35rem;
-            }}
         }}
 
         /* Tema claro robusto para widgets do Streamlit/BaseWeb */
@@ -1372,7 +1348,6 @@ def sidebar(default_page: str | None = None):
             )
             if clicked and not is_active:
                 st.session_state[SIDEBAR_PAGE_KEY] = page_label
-                st.session_state[MOBILE_SIDEBAR_COLLAPSE_KEY] = True
                 st.rerun()
 
     st.sidebar.markdown("---")
@@ -1384,77 +1359,39 @@ def sidebar(default_page: str | None = None):
     return page
 
 
-def render_mobile_sidebar_auto_collapse() -> None:
-    if not st.session_state.pop(MOBILE_SIDEBAR_COLLAPSE_KEY, False):
-        return
-    components.html(
-        """
-        <script>
-        // Collapse the native Streamlit sidebar after mobile sidebar navigation.
-        const isMobile = window.parent && window.parent.innerWidth <= 768;
-        if (isMobile) {
-            setTimeout(() => {
-                const buttons = window.parent.document.querySelectorAll('button');
-                for (const btn of buttons) {
-                    const label = (btn.getAttribute('aria-label') || '').toLowerCase();
-                    const title = (btn.getAttribute('title') || '').toLowerCase();
-                    const text = (btn.innerText || '').toLowerCase();
-                    const canCollapse = (
-                        label.includes('close sidebar') ||
-                        label.includes('collapse sidebar') ||
-                        title.includes('close sidebar') ||
-                        title.includes('collapse sidebar') ||
-                        label.includes('fechar') ||
-                        label.includes('recolher') ||
-                        title.includes('fechar') ||
-                        title.includes('recolher') ||
-                        text.includes('fechar') ||
-                        text.includes('recolher')
-                    );
-                    if (canCollapse) {
-                        btn.click();
-                        break;
-                    }
-                }
-            }, 150);
-        }
-        </script>
-        """,
-        height=0,
-        width=0,
-    )
-
-
-def render_quick_navigation(selected_page: str) -> str:
+def render_mobile_menu_navigation(selected_page: str) -> str:
     page_labels = _allowed_sidebar_pages()
     if selected_page not in page_labels:
         selected_page = "Painel inicial"
         st.session_state[SIDEBAR_PAGE_KEY] = selected_page
 
-    previous_rendered_page = st.session_state.get(QUICK_NAVIGATION_LAST_PAGE_KEY)
-    quick_state_page = st.session_state.get(QUICK_NAVIGATION_PAGE_KEY)
-    if quick_state_page not in page_labels:
-        st.session_state[QUICK_NAVIGATION_PAGE_KEY] = selected_page
-    elif quick_state_page != selected_page:
-        if previous_rendered_page == selected_page:
-            st.session_state[SIDEBAR_PAGE_KEY] = quick_state_page
-            st.session_state[QUICK_NAVIGATION_LAST_PAGE_KEY] = quick_state_page
+    with st.expander("☰ Menu", expanded=False):
+        st.caption("Menu compacto para navegação em celular.")
+        for section, section_pages in NAVIGATION_SECTIONS:
+            visible_pages = [label for label in section_pages if label in page_labels]
+            if not visible_pages:
+                continue
+            st.markdown(f"**{section}**")
+            for page_label in visible_pages:
+                is_active = page_label == selected_page
+                label = _sidebar_button_label(page_label)
+                if is_active:
+                    label = f"{label} · atual"
+                clicked = st.button(
+                    label,
+                    key=f"mobile_{_sidebar_button_key(page_label)}",
+                    type="primary" if is_active else "secondary",
+                    use_container_width=True,
+                )
+                if clicked and not is_active:
+                    st.session_state[SIDEBAR_PAGE_KEY] = page_label
+                    st.rerun()
+
+        st.markdown("---")
+        if st.button("Sair", key="mobile_menu_logout", use_container_width=True):
+            logout()
             st.rerun()
-        st.session_state[QUICK_NAVIGATION_PAGE_KEY] = selected_page
-
-    st.session_state[QUICK_NAVIGATION_LAST_PAGE_KEY] = selected_page
-
-    quick_page = st.selectbox(
-        "Ir para",
-        page_labels,
-        index=page_labels.index(selected_page),
-        key=QUICK_NAVIGATION_PAGE_KEY,
-    )
-    st.caption("Atalho alternativo para troca rápida de página.")
-    if quick_page != selected_page:
-        st.session_state[SIDEBAR_PAGE_KEY] = quick_page
-        st.rerun()
-    return quick_page
+    return selected_page
 
 
 def current_access_role() -> str:
@@ -7407,8 +7344,7 @@ def main():
         return
     apply_url_params_hint()
     page = sidebar()
-    render_mobile_sidebar_auto_collapse()
-    page = render_quick_navigation(page)
+    page = render_mobile_menu_navigation(page)
     with perf_timer(f"Página: {page}"):
         if page == "Painel inicial":
             page_dashboard(conn)
