@@ -184,6 +184,7 @@ SIDEBAR_PAGE_KEY = "labcim_active_sidebar_page"
 SIDEBAR_URL_PAGE_KEY = "labcim_sidebar_url_page"
 SCROLL_TO_TOP_PAGE_KEY = "labcim_scroll_to_top_page"
 MOBILE_MENU_PAGE_KEY = "mobile_menu_navigation_page"
+INSTALL_APP_HELP_KEY = "labcim_show_install_app_help"
 PAGE_ICONS = {
     "Painel inicial": "🏠",
     "Reservas": "📅",
@@ -1529,13 +1530,32 @@ def render_mobile_menu_navigation(selected_page: str) -> str:
 
     with st.container(key="labcim_mobile_navigation"):
         st.selectbox(
-            "☰ Menu",
+            "Navegação principal",
             page_labels,
             index=page_labels.index(active_page),
             format_func=lambda label: f"{PAGE_ICONS.get(label, '📄')} {label}",
             key=MOBILE_MENU_PAGE_KEY,
+            label_visibility="collapsed",
             on_change=_on_mobile_navigation_change,
         )
+
+        if st.button("Instalar app", key="mobile_install_app_button", use_container_width=True):
+            st.session_state[INSTALL_APP_HELP_KEY] = not st.session_state.get(INSTALL_APP_HELP_KEY, False)
+
+        if st.session_state.get(INSTALL_APP_HELP_KEY, False):
+            st.markdown(
+                """
+                <div class="soft-card" style="margin: .35rem 0 .7rem 0;">
+                    <strong>Instalar app</strong><br>
+                    Para criar o acesso do LabCim Manager na tela inicial do celular:<br>
+                    1. Toque no menu do navegador, geralmente <strong>☰</strong> ou <strong>⋮</strong>.<br>
+                    2. Selecione <strong>Instalar app</strong>.<br>
+                    3. Em alguns aparelhos, a opção pode aparecer como <strong>Adicionar à tela inicial</strong>.<br>
+                    4. Confirme a instalação.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
         if st.button("Sair", key="mobile_menu_logout", use_container_width=True):
             logout()
