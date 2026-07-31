@@ -1446,24 +1446,100 @@ def render_mobile_menu_navigation(selected_page: str) -> str:
 
 
 def scroll_to_top_on_page_change(page: str) -> None:
-    if st.session_state.get(SCROLL_TO_TOP_PAGE_KEY) == page:
-        return
+    """Force the main Streamlit viewport to top on initial load, page changes and tab clicks."""
+    page_token = repr(str(page))
+    should_scroll = st.session_state.get(SCROLL_TO_TOP_PAGE_KEY) != page
+    if should_scroll:
+        st.session_state[SCROLL_TO_TOP_PAGE_KEY] = page
 
-    st.session_state[SCROLL_TO_TOP_PAGE_KEY] = page
     components.html(
-        """
+        f"""
         <script>
-        const scrollToTop = () => {
-            const target = window.parent || window;
-            target.scrollTo({ top: 0, left: 0, behavior: "instant" });
-        };
-        requestAnimationFrame(scrollToTop);
-        setTimeout(scrollToTop, 80);
+        (function() {{
+            const pageToken = {page_token};
+            const shouldScrollNow = {str(should_scroll).lower()};
+            let win = window;
+            let doc = document;
+
+            try {{
+                if (window.parent && window.parent !== window) {{
+                    win = window.parent;
+                    doc = window.parent.document;
+                }}
+            }} catch (error) {{
+                win = window;
+                doc = document;
+            }}
+
+            const scrollOne = (target) => {{
+                if (!target) return;
+                try {{
+                    if (target === win) {{
+                        target.scrollTo({{ top: 0, left: 0, behavior: "auto" }});
+                        return;
+                    }}
+                    if (typeof target.scrollTo === "function") {{
+                        target.scrollTo({{ top: 0, left: 0, behavior: "auto" }});
+                    }}
+                    if ("scrollTop" in target) {{
+                        target.scrollTop = 0;
+                    }}
+                }} catch (error) {{}}
+            }};
+
+            const scrollToTop = () => {{
+                const targets = [
+                    win,
+                    doc.scrollingElement,
+                    doc.documentElement,
+                    doc.body,
+                    doc.querySelector("[data-testid='stAppViewContainer']"),
+                    doc.querySelector("[data-testid='stMain']"),
+                    doc.querySelector("section.main"),
+                    doc.querySelector(".main")
+                ];
+                targets.forEach(scrollOne);
+            }};
+
+            const delayedScrollToTop = () => {{
+                [0, 50, 150, 300, 600, 1000].forEach((delay) => {{
+                    setTimeout(scrollToTop, delay);
+                }});
+                try {{
+                    win.requestAnimationFrame(scrollToTop);
+                }} catch (error) {{}}
+            }};
+
+            if (shouldScrollNow) {{
+                delayedScrollToTop();
+            }}
+
+            try {{
+                if (!doc.__labcimScrollToTopHandlersInstalled) {{
+                    doc.__labcimScrollToTopHandlersInstalled = true;
+                    doc.addEventListener(
+                        "click",
+                        function(event) {{
+                            const tab = event.target.closest(
+                                "button[role='tab'], [data-baseweb='tab'], [data-testid='stTabs'] button"
+                            );
+                            if (tab) {{
+                                [80, 180, 350, 700].forEach((delay) => {{
+                                    setTimeout(scrollToTop, delay);
+                                }});
+                            }}
+                        }},
+                        true
+                    );
+                }}
+            }} catch (error) {{}}
+        }})();
         </script>
         """,
         height=0,
         width=0,
     )
+
 
 def current_access_role() -> str:
     user = current_user()
