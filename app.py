@@ -25,6 +25,7 @@ import pandas as pd
 import plotly.express as px
 import qrcode
 import streamlit as st
+import streamlit.components.v1 as components
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -180,6 +181,7 @@ PAGE_LABELS = [
 ]
 SIDEBAR_PAGE_KEY = "labcim_active_sidebar_page"
 SIDEBAR_URL_PAGE_KEY = "labcim_sidebar_url_page"
+SCROLL_TO_TOP_PAGE_KEY = "labcim_scroll_to_top_page"
 PAGE_ICONS = {
     "Painel inicial": "🏠",
     "Reservas": "📅",
@@ -506,6 +508,31 @@ def setup_page() -> None:
             opacity: 1 !important;
         }}
 
+        /* Limpeza do "chrome" nativo do Streamlit/Streamlit Cloud */
+        #MainMenu {{
+            visibility: hidden !important;
+        }}
+        footer {{
+            visibility: hidden !important;
+            display: none !important;
+        }}
+        header[data-testid="stHeader"],
+        [data-testid="stHeader"],
+        [data-testid="stToolbar"],
+        [data-testid="stDecoration"],
+        [data-testid="stStatusWidget"],
+        [data-testid="manage-app-button"],
+        [data-testid="stDeployButton"] {{
+            visibility: hidden !important;
+            display: none !important;
+            height: 0 !important;
+        }}
+
+        /* O menu mobile existe no código, mas fica invisível no desktop. */
+        .st-key-labcim_mobile_navigation {{
+            display: none !important;
+        }}
+
         @media (max-width: 768px) {{
             section[data-testid="stSidebar"] {{
                 display: none !important;
@@ -513,6 +540,14 @@ def setup_page() -> None:
 
             div[data-testid="collapsedControl"] {{
                 display: none !important;
+            }}
+
+            .st-key-labcim_mobile_navigation {{
+                display: block !important;
+            }}
+
+            .block-container {{
+                padding-top: .75rem !important;
             }}
         }}
 
@@ -1375,26 +1410,46 @@ def render_mobile_menu_navigation(selected_page: str) -> str:
         selected_page = "Painel inicial"
         st.session_state[SIDEBAR_PAGE_KEY] = selected_page
 
-    mobile_page = st.selectbox(
-        "☰ Menu",
-        page_labels,
-        index=page_labels.index(selected_page),
-        format_func=lambda label: f"{PAGE_ICONS.get(label, '📄')} {label}",
-        key="mobile_menu_navigation_page",
-        help="Menu principal para uso em celular.",
-    )
-    st.caption("Menu principal para uso em celular.")
+    with st.container(key="labcim_mobile_navigation"):
+        mobile_page = st.selectbox(
+            "☰ Menu",
+            page_labels,
+            index=page_labels.index(selected_page),
+            format_func=lambda label: f"{PAGE_ICONS.get(label, '📄')} {label}",
+            key="mobile_menu_navigation_page",
+            help="Menu principal para uso em celular.",
+        )
 
-    if mobile_page != selected_page:
-        st.session_state[SIDEBAR_PAGE_KEY] = mobile_page
-        st.rerun()
+        if mobile_page != selected_page:
+            st.session_state[SIDEBAR_PAGE_KEY] = mobile_page
+            st.rerun()
 
-    if st.button("Sair", key="mobile_menu_logout", use_container_width=True):
-        logout()
-        st.rerun()
+        if st.button("Sair", key="mobile_menu_logout", use_container_width=True):
+            logout()
+            st.rerun()
 
     return mobile_page
 
+
+def scroll_to_top_on_page_change(page: str) -> None:
+    if st.session_state.get(SCROLL_TO_TOP_PAGE_KEY) == page:
+        return
+
+    st.session_state[SCROLL_TO_TOP_PAGE_KEY] = page
+    components.html(
+        """
+        <script>
+        const scrollToTop = () => {
+            const target = window.parent || window;
+            target.scrollTo({ top: 0, left: 0, behavior: "instant" });
+        };
+        requestAnimationFrame(scrollToTop);
+        setTimeout(scrollToTop, 80);
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
 
 def current_access_role() -> str:
     user = current_user()
@@ -7347,6 +7402,7 @@ def main():
     apply_url_params_hint()
     page = sidebar()
     page = render_mobile_menu_navigation(page)
+    scroll_to_top_on_page_change(page)
     with perf_timer(f"Página: {page}"):
         if page == "Painel inicial":
             page_dashboard(conn)
