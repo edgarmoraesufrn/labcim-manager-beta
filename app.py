@@ -520,13 +520,51 @@ def setup_page() -> None:
         header[data-testid="stHeader"],
         [data-testid="stHeader"],
         [data-testid="stToolbar"],
+        [data-testid="stToolbarActions"],
         [data-testid="stDecoration"],
         [data-testid="stStatusWidget"],
         [data-testid="manage-app-button"],
-        [data-testid="stDeployButton"] {{
+        [data-testid="stDeployButton"],
+        [data-testid="stAppDeployButton"],
+        [data-testid="stAppShareButton"],
+        [data-testid="stAppGithubButton"],
+        [data-testid="stGithubButton"],
+        [data-testid="viewerBadge"],
+        [data-testid="stHostedBadge"],
+        [data-testid="stCloudBadge"] {{
             visibility: hidden !important;
             display: none !important;
             height: 0 !important;
+            width: 0 !important;
+            min-height: 0 !important;
+            max-height: 0 !important;
+            overflow: hidden !important;
+        }}
+
+        /* Remove badge/atribuição inferior do Streamlit Cloud. */
+        [class^="viewerBadge"],
+        [class*="viewerBadge"],
+        [class^="ViewerBadge"],
+        [class*="ViewerBadge"],
+        [class*="viewer-badge"],
+        [class*="streamlit-cloud"],
+        [class*="StreamlitCloud"],
+        [class*="stCloud"],
+        [class*="stAppFooter"],
+        [class*="stAppCreator"],
+        a[href*="streamlit.io/cloud"],
+        a[href*="share.streamlit.io"],
+        a[href*="github.com/edgarmoraesufrn/labcim-manager-beta"],
+        a[href*="github.com/edgarmoraesufrn"],
+        img[src*="avatars.githubusercontent.com/u/29822154"] {{
+            visibility: hidden !important;
+            display: none !important;
+            height: 0 !important;
+            width: 0 !important;
+            min-height: 0 !important;
+            max-height: 0 !important;
+            overflow: hidden !important;
+            pointer-events: none !important;
         }}
 
         /* O menu mobile existe no código, mas fica invisível no desktop. */
