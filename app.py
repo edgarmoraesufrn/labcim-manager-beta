@@ -325,6 +325,64 @@ COLUMN_LABELS = {
 }
 
 
+def inject_pwa_metadata() -> None:
+    """Inject PWA launcher metadata for Android home-screen shortcuts."""
+    components.html(
+        """
+        <script>
+        (function() {
+            let doc = document;
+            try {
+                if (window.parent && window.parent !== window) {
+                    doc = window.parent.document;
+                }
+            } catch (error) {
+                doc = document;
+            }
+
+            const head = doc.head || doc.getElementsByTagName("head")[0];
+            if (!head) return;
+
+            const removeInjected = () => {
+                Array.from(head.querySelectorAll("[data-labcim-pwa='true']")).forEach((el) => el.remove());
+            };
+
+            const addLink = (rel, href, attrs = {}) => {
+                const link = doc.createElement("link");
+                link.setAttribute("rel", rel);
+                link.setAttribute("href", href);
+                link.setAttribute("data-labcim-pwa", "true");
+                Object.entries(attrs).forEach(([key, value]) => link.setAttribute(key, value));
+                head.appendChild(link);
+            };
+
+            const addMeta = (name, content) => {
+                const meta = doc.createElement("meta");
+                meta.setAttribute("name", name);
+                meta.setAttribute("content", content);
+                meta.setAttribute("data-labcim-pwa", "true");
+                head.appendChild(meta);
+            };
+
+            removeInjected();
+
+            addLink("manifest", "app/static/manifest.json");
+            addLink("icon", "app/static/app-icon-192.png", {"type": "image/png", "sizes": "192x192"});
+            addLink("apple-touch-icon", "app/static/apple-touch-icon.png", {"sizes": "180x180"});
+
+            addMeta("theme-color", "#0033A0");
+            addMeta("mobile-web-app-capable", "yes");
+            addMeta("apple-mobile-web-app-capable", "yes");
+            addMeta("apple-mobile-web-app-title", "LabCim");
+            addMeta("application-name", "LabCim Manager");
+        })();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
 def setup_page() -> None:
     st.set_page_config(
         page_title=APP_TITLE,
@@ -332,6 +390,7 @@ def setup_page() -> None:
         layout="wide",
         initial_sidebar_state="collapsed",
     )
+    inject_pwa_metadata()
     st.markdown(
         f"""
         <style>
