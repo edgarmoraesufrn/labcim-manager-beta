@@ -506,6 +506,16 @@ def setup_page() -> None:
             opacity: 1 !important;
         }}
 
+        @media (max-width: 768px) {{
+            section[data-testid="stSidebar"] {{
+                display: none !important;
+            }}
+
+            div[data-testid="collapsedControl"] {{
+                display: none !important;
+            }}
+        }}
+
         /* Tema claro robusto para widgets do Streamlit/BaseWeb */
         [data-testid="stSelectbox"] div[data-baseweb="select"],
         [data-testid="stMultiSelect"] div[data-baseweb="select"],
@@ -1365,33 +1375,25 @@ def render_mobile_menu_navigation(selected_page: str) -> str:
         selected_page = "Painel inicial"
         st.session_state[SIDEBAR_PAGE_KEY] = selected_page
 
-    with st.expander("☰ Menu", expanded=False):
-        st.caption("Menu compacto para navegação em celular.")
-        for section, section_pages in NAVIGATION_SECTIONS:
-            visible_pages = [label for label in section_pages if label in page_labels]
-            if not visible_pages:
-                continue
-            st.markdown(f"**{section}**")
-            for page_label in visible_pages:
-                is_active = page_label == selected_page
-                label = _sidebar_button_label(page_label)
-                if is_active:
-                    label = f"{label} · atual"
-                clicked = st.button(
-                    label,
-                    key=f"mobile_{_sidebar_button_key(page_label)}",
-                    type="primary" if is_active else "secondary",
-                    use_container_width=True,
-                )
-                if clicked and not is_active:
-                    st.session_state[SIDEBAR_PAGE_KEY] = page_label
-                    st.rerun()
+    mobile_page = st.selectbox(
+        "☰ Menu",
+        page_labels,
+        index=page_labels.index(selected_page),
+        format_func=lambda label: f"{PAGE_ICONS.get(label, '📄')} {label}",
+        key="mobile_menu_navigation_page",
+        help="Menu principal para uso em celular.",
+    )
+    st.caption("Menu principal para uso em celular.")
 
-        st.markdown("---")
-        if st.button("Sair", key="mobile_menu_logout", use_container_width=True):
-            logout()
-            st.rerun()
-    return selected_page
+    if mobile_page != selected_page:
+        st.session_state[SIDEBAR_PAGE_KEY] = mobile_page
+        st.rerun()
+
+    if st.button("Sair", key="mobile_menu_logout", use_container_width=True):
+        logout()
+        st.rerun()
+
+    return mobile_page
 
 
 def current_access_role() -> str:
