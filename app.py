@@ -95,6 +95,7 @@ APP_SUBTITLE = "Gestão integrada, rastreabilidade e governança operacional do 
 DB_PATH = Path("data/labcim_manager.db")
 BASE_XLSX = Path("data/LabCim_Base.xlsx")
 LOGO_PATH = Path("assets/logo_labcim.png")
+APP_ICON_PATH = Path("assets/app_icon.png")
 POP_DIR = Path("assets/pops")
 ACCESS_CODE_TTL_MINUTES = 10
 CACHE_TTL_SECONDS = 120
@@ -327,7 +328,7 @@ COLUMN_LABELS = {
 def setup_page() -> None:
     st.set_page_config(
         page_title=APP_TITLE,
-        page_icon="🔬",
+        page_icon=str(APP_ICON_PATH) if APP_ICON_PATH.exists() else "🔬",
         layout="wide",
         initial_sidebar_state="collapsed",
     )
