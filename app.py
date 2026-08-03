@@ -578,7 +578,6 @@ def setup_page() -> None:
             visibility: hidden !important;
             display: none !important;
         }}
-        [data-testid="stToolbar"],
         [data-testid="stToolbarActions"],
         [data-testid="stDecoration"],
         [data-testid="stStatusWidget"],
@@ -615,6 +614,14 @@ def setup_page() -> None:
             opacity: 1 !important;
             pointer-events: auto !important;
             z-index: 999999 !important;
+        }}
+
+        [data-testid="stToolbar"] {{
+            visibility: visible !important;
+            display: flex !important;
+            background: transparent !important;
+            pointer-events: auto !important;
+            z-index: 999998 !important;
         }}
 
         /* Remove badge/atribuição inferior do Streamlit Cloud. */
