@@ -578,8 +578,6 @@ def setup_page() -> None:
             visibility: hidden !important;
             display: none !important;
         }}
-        header[data-testid="stHeader"],
-        [data-testid="stHeader"],
         [data-testid="stToolbar"],
         [data-testid="stToolbarActions"],
         [data-testid="stDecoration"],
@@ -600,6 +598,23 @@ def setup_page() -> None:
             min-height: 0 !important;
             max-height: 0 !important;
             overflow: hidden !important;
+        }}
+
+        /* Mantém o controle nativo para reabrir a sidebar no desktop. */
+        header[data-testid="stHeader"],
+        [data-testid="stHeader"] {{
+            visibility: visible !important;
+            display: block !important;
+            background: transparent !important;
+            box-shadow: none !important;
+        }}
+
+        div[data-testid="collapsedControl"] {{
+            visibility: visible !important;
+            display: flex !important;
+            opacity: 1 !important;
+            pointer-events: auto !important;
+            z-index: 999999 !important;
         }}
 
         /* Remove badge/atribuição inferior do Streamlit Cloud. */
@@ -636,6 +651,14 @@ def setup_page() -> None:
         @media (max-width: 1100px) {{
             section[data-testid="stSidebar"] {{
                 display: none !important;
+            }}
+
+            header[data-testid="stHeader"],
+            [data-testid="stHeader"] {{
+                display: none !important;
+                height: 0 !important;
+                min-height: 0 !important;
+                overflow: hidden !important;
             }}
 
             div[data-testid="collapsedControl"] {{
