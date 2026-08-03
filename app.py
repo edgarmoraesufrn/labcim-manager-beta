@@ -389,7 +389,7 @@ def setup_page() -> None:
         page_title=APP_TITLE,
         page_icon=str(APP_ICON_PATH) if APP_ICON_PATH.exists() else "🔬",
         layout="wide",
-        initial_sidebar_state="collapsed",
+        initial_sidebar_state="expanded",
     )
     inject_pwa_metadata()
     st.markdown(
