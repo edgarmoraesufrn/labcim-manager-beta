@@ -231,7 +231,7 @@ No branch deletion is needed to begin M1. Branch cleanup can be a later, separat
 - Change: 12 added CSS lines in `app.py` that make BaseWeb multiselect tags LabCim blue with white text/icons.
 - Patch identity: `git cherry main hotfix-spare-part-form-ux` reports `+`; the exact patch is not present in `main`.
 - Current-state comparison: current `main` retains generic multiselect styling but not the branch's tag-specific blue/white selectors.
-- Assessment: **unresolved orphaned hotfix tail**, not a missing equipment or spare-parts feature sprint. Its UI intent should be confirmed with the product owner. Do not merge the old branch wholesale; if desired, port and test the small change on a fresh branch from canonical `main`.
+- M0.2 disposition: **ACCEPT**. This is not a missing equipment or spare-parts feature sprint; it is an isolated visual readability/accessibility correction. The patch was applied separately as `bd57350` after classification and validation. The old branch was not merged.
 
 ### 7.2 `2ce7100` — hide sidebar on mobile
 
@@ -354,3 +354,59 @@ Before M1 starts:
 - record the final starting hash and re-run the M0 preflight on that exact clean state.
 
 Do not deploy from `main` until the existing M0 blockers are resolved and validated in staging. This audit does not authorize M1 implementation or deployment.
+
+## 13. M0.2 canonical baseline freeze
+
+M0.2 completed the repository freeze without starting M1 implementation.
+
+### Canonical and frozen hashes
+
+| Item | Hash / state |
+|---|---|
+| Canonical M0/M0.1 application baseline | `1ffe702ff3753c95ac12c78f8b20547b04b3f84d` |
+| Accepted isolated contrast commit | `bd57350931f8a4ebcde930dc482a7554f271a1ef` (`Improve multiselect chip contrast`) |
+| M0/M0.1 audit artifact commit | `164a3605827291062955c6e7e34462fae22f9b5f` |
+| Final clean M1 branch-creation baseline | `164a3605827291062955c6e7e34462fae22f9b5f` |
+| M1 branch | `m1-ufrn-production-hardening` |
+| Exact M1 branch creation parent | `164a3605827291062955c6e7e34462fae22f9b5f` |
+| Fetched `origin/main` | `1ffe702ff3753c95ac12c78f8b20547b04b3f84d` |
+| Push status | Required to publish the two approved local commits; not performed |
+
+The repository-state documentation commit that records this table is documentation-only and occurs on the new M1 branch after its creation. It does not change the frozen application baseline or count as M1 implementation.
+
+### `da58c82` disposition
+
+Decision: **ACCEPT**.
+
+- Files changed: only `app.py`.
+- Size: 12 inserted CSS lines; no deletions.
+- Behavior: selected Streamlit/BaseWeb multiselect chips use `LAB_BLUE` (`#0033A0`) for background/border and white for label, icon, and remove-button foreground.
+- Scope: purely visual; no Python control flow, data, authentication, persistence, storage, navigation, or infrastructure behavior changes.
+- Accessibility/readability: white on LabCim blue measures approximately `10.60:1`, exceeding WCAG AA and AAA normal-text contrast thresholds. The explicit foreground/background pair removes dependence on BaseWeb's default tag colors.
+- Equivalent behavior in canonical `main`: absent. The existing generic multiselect rule forced dark foreground colors but did not set a tag-specific background/foreground pair.
+- Regression risk: low but non-zero. The selectors depend on Streamlit/BaseWeb internal `data-testid`/`data-baseweb` markup, and the rule affects every multiselect chip. Risk is limited to theming/selector compatibility; it does not affect application logic.
+- Integration: the patch applied cleanly and was committed separately as `bd57350`; `python -m compileall -q app.py` passed.
+
+### Superseded alternatives
+
+- `2ce7100` remains classified as a superseded mobile-sidebar alternative.
+- `5a18336` remains classified as a superseded mobile-menu alternative.
+
+Neither commit was merged, cherry-picked, deleted, or otherwise changed. The later merged sprint 12 navigation line remains authoritative.
+
+### M0/M0.1 worktree review and commit
+
+Before the audit artifact commit, the worktree contained only:
+
+- production-readiness and migration documentation;
+- README and historical runbook warnings/links;
+- the offline, read-only `scripts/production_preflight.py` checker;
+- this repository-state audit.
+
+The preflight tool reads repository files and optional environment metadata, performs no network/database/write operation, and withholds secret values. No unintended application file was staged with the audit artifacts. The nine approved files were committed separately as `164a360` with message `docs: add UFRN production readiness audits`.
+
+### Freeze conclusion
+
+The M1 branch was created from a clean `164a360` worktree. At branch creation, local `main` was two commits ahead of `origin/main`: the accepted isolated contrast commit and the M0/M0.1 audit artifact commit. A push is required to publish those commits and the new branch, but no push was performed during M0.2.
+
+M1 implementation was **not started**.
