@@ -1,5 +1,7 @@
 # LabCim Manager — Runbook de Produção
 
+> **Atenção:** este runbook descreve o ambiente histórico Streamlit Cloud + Neon + R2. Ele não autoriza nem cobre a implantação na VM UFRN. Para a migração institucional, consulte `PRODUCTION_READINESS.md` e `UFRN_DEPLOYMENT_PLAN.md`. O status M0 é **NO-GO**.
+
 ## 1. Objetivo
 
 Este documento é um checklist operacional para liberar e acompanhar o LabCim Manager em produção controlada na versão operacional v1.0. Ele não substitui revisão técnica, mas organiza as conferências mínimas de ambiente, permissões, persistência, backup e recuperação.

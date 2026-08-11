@@ -21,15 +21,17 @@ O foco da v1.0 é organizar a operação diária, reduzir dependência de contro
 
 ## Infraestrutura
 
-- Streamlit Cloud como aplicação web.
-- PostgreSQL/Neon para persistência de dados em produção.
-- Cloudflare R2 para armazenamento persistente e privado de arquivos.
-- SQLite e armazenamento local para desenvolvimento.
-- Excel completo gerado sob demanda.
-- QR Codes e pacotes ZIP gerados sob demanda.
+O código atual suporta Streamlit, PostgreSQL via `DATABASE_URL`, SQLite local, Cloudflare R2 e armazenamento local de desenvolvimento. A infraestrutura histórica era Streamlit Cloud + Neon + R2.
+
+A migração institucional para Nginx + Streamlit em `/manager/` + PostgreSQL na UFRN está em preparação. A auditoria M0 classificou o estado atual como **NO-GO para produção** até que os blockers documentados sejam resolvidos e validados em staging. Nenhum deploy UFRN foi executado.
 
 ## Documentação
 
+- [Prontidão para produção UFRN — M0](docs/PRODUCTION_READINESS.md)
+- [Plano de implantação UFRN](docs/UFRN_DEPLOYMENT_PLAN.md)
+- [Plano de migração do banco](docs/DATABASE_MIGRATION_PLAN.md)
+- [Plano de migração de arquivos](docs/FILE_STORAGE_MIGRATION_PLAN.md)
+- [Template de ambiente de produção](docs/PRODUCTION_ENV_TEMPLATE.md)
 - [Runbook de produção](docs/production_runbook.md)
 - [Pacote de demonstração v1.0 para auditoria](docs/v1_0_audit_demo_package.md)
 - [Release notes v1.0](docs/v1_0_release_notes.md)
@@ -37,7 +39,7 @@ O foco da v1.0 é organizar a operação diária, reduzir dependência de contro
 
 ## Status
 
-Versão operacional v1.0, preparada para apresentação institucional e melhoria contínua.
+Versão operacional v1.0 para o ambiente histórico. Migração de produção UFRN em fase de auditoria/hardening; consulte o documento de prontidão antes de qualquer implantação.
 
 ## Roadmap
 
