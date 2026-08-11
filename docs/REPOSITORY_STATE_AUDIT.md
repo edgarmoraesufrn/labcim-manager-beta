@@ -363,16 +363,23 @@ M0.2 completed the repository freeze without starting M1 implementation.
 
 | Item | Hash / state |
 |---|---|
-| Canonical M0/M0.1 application baseline | `1ffe702ff3753c95ac12c78f8b20547b04b3f84d` |
+| Canonical application snapshot (audited original product state) | `1ffe702ff3753c95ac12c78f8b20547b04b3f84d` |
 | Accepted isolated contrast commit | `bd57350931f8a4ebcde930dc482a7554f271a1ef` (`Improve multiselect chip contrast`) |
 | M0/M0.1 audit artifact commit | `164a3605827291062955c6e7e34462fae22f9b5f` |
-| Final clean M1 branch-creation baseline | `164a3605827291062955c6e7e34462fae22f9b5f` |
+| M1 branch creation point | `164a3605827291062955c6e7e34462fae22f9b5f` |
 | M1 branch | `m1-ufrn-production-hardening` |
 | Exact M1 branch creation parent | `164a3605827291062955c6e7e34462fae22f9b5f` |
 | Fetched `origin/main` | `1ffe702ff3753c95ac12c78f8b20547b04b3f84d` |
 | Push status | Required to publish the two approved local commits; not performed |
 
 The repository-state documentation commit that records this table is documentation-only and occurs on the new M1 branch after its creation. It does not change the frozen application baseline or count as M1 implementation.
+
+### Terminology normalized in M0.3
+
+- **Canonical application snapshot** means the audited original product state before M0 documentation and hardening work: `1ffe702ff3753c95ac12c78f8b20547b04b3f84d`.
+- **M1 implementation baseline** means the final clean tip of `m1-ufrn-production-hardening` after all approved M0 bookkeeping commits and immediately before the first functional M1 change. It includes the accepted visual fix and approved M0/M0.1/M0.2 documentation ancestry.
+
+The exact M1 implementation-baseline hash is the commit containing this M0.3 terminology normalization. A Git commit cannot embed its own final object ID without changing that ID; therefore the immutable hash is recorded by the branch ref, the Git log, and the M0.3 final provenance report after this documentation-only commit is created.
 
 ### `da58c82` disposition
 
