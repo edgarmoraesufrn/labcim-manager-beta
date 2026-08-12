@@ -475,16 +475,28 @@ def check_source_gates(repo_root: Path, report: Report) -> None:
     app_path = repo_root / "app.py"
     app_source = read_text(app_path)
     database_source = read_text(repo_root / "labcim_manager" / "db.py")
-    init_source = function_source(app_path, "ensure_database_initialized")
-    if any(token in init_source for token in ("init_db(", "import_base_xlsx(", "seed_default_pops(")):
+    startup_source = function_source(app_path, "ensure_database_compatible")
+    mutating_tokens = (
+        "init_db(",
+        "import_base_xlsx(",
+        "seed_default_pops(",
+        "ALTER TABLE",
+        "CREATE INDEX",
+        "UPDATE ",
+    )
+    if (
+        not startup_source
+        or "verify_database_target(" not in startup_source
+        or any(token in startup_source for token in mutating_tokens)
+    ):
         report.code_blocker(
             "database.startup_mutation",
-            "Startup still invokes schema/data initialization or seeding.",
+            "Startup is not demonstrably limited to opening and verifying an existing schema.",
         )
     else:
         report.passed(
             "database.startup_mutation",
-            "No known schema/data mutation call remains in startup initialization.",
+            "Web startup opens an existing database and performs a read-only compatibility check.",
         )
 
     if "https://labcim-manager.streamlit.app" in app_source:
@@ -569,21 +581,46 @@ def check_source_gates(repo_root: Path, report: Report) -> None:
 
 
 def check_migrations(repo_root: Path, report: Report) -> None:
-    candidates = (repo_root / "migrations", repo_root / "alembic")
-    has_migrations = any(
-        path.is_dir() and any(item.is_file() for item in path.rglob("*"))
-        for path in candidates
+    migration_dir = repo_root / "labcim_manager" / "migrations"
+    schema_path = repo_root / "labcim_manager" / "schema.py"
+    cli_path = repo_root / "labcim_manager" / "db_migrate.py"
+    migration_files = sorted(migration_dir.glob("v[0-9][0-9][0-9]_*.py"))
+    versions = [
+        int(match.group(1))
+        for path in migration_files
+        if (match := re.fullmatch(r"v([0-9]{3})_.+\.py", path.name))
+    ]
+    ordered = bool(versions) and versions == list(range(1, max(versions) + 1))
+    schema_source = read_text(schema_path) if schema_path.is_file() else ""
+    cli_source = read_text(cli_path) if cli_path.is_file() else ""
+    required_schema_markers = (
+        "labcim_schema_migrations",
+        "LATEST_SCHEMA_VERSION",
+        "checksum",
+        "baseline_existing_schema",
+        "pg_try_advisory_xact_lock",
+        "BEGIN IMMEDIATE",
     )
-    has_config = (repo_root / "alembic.ini").is_file()
-    if has_migrations or has_config:
+    required_commands = (
+        '"status"',
+        '"verify"',
+        '"upgrade"',
+        '"initialize"',
+        '"baseline-existing"',
+    )
+    if (
+        ordered
+        and all(marker in schema_source for marker in required_schema_markers)
+        and all(command in cli_source for command in required_commands)
+    ):
         report.passed(
             "database.migrations",
-            "A migration artifact exists; content still requires release review.",
+            f"Ordered migrations 1..{versions[-1]}, version ledger, locking and administrative CLI are present.",
         )
     else:
         report.code_blocker(
             "database.migrations",
-            "No versioned database migration artifacts were found.",
+            "The ordered migration, version-ledger, locking or administrative CLI contract is incomplete.",
         )
 
 
@@ -717,7 +754,9 @@ def check_required_files(repo_root: Path, report: Report) -> None:
         ".streamlit/config.toml",
         "labcim_manager/config.py",
         "labcim_manager/db.py",
+        "labcim_manager/db_migrate.py",
         "labcim_manager/errors.py",
+        "labcim_manager/schema.py",
         "labcim_manager/storage.py",
         "static/manifest.json",
         "docs/PRODUCTION_READINESS.md",
@@ -726,6 +765,7 @@ def check_required_files(repo_root: Path, report: Report) -> None:
         "docs/FILE_STORAGE_MIGRATION_PLAN.md",
         "docs/PRODUCTION_ENV_TEMPLATE.md",
         "docs/LOCAL_STAGING_GUIDE.md",
+        "docs/DATABASE_SCHEMA_LIFECYCLE.md",
     )
     missing = [relative for relative in required if not (repo_root / relative).is_file()]
     if missing:
@@ -734,7 +774,7 @@ def check_required_files(repo_root: Path, report: Report) -> None:
             f"Missing {len(missing)} required foundation file(s): {', '.join(missing)}.",
         )
     else:
-        report.passed("repository.required_files", "All required M1A foundation files are present.")
+        report.passed("repository.required_files", "All required M1A/M1B foundation files are present.")
 
     for secret_path in (repo_root / ".streamlit" / "secrets.toml", repo_root / ".env"):
         if secret_path.exists():

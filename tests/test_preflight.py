@@ -73,7 +73,7 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertNotIn(sentinel, result.stdout)
         self.assertNotIn("[ENVIRONMENT REQUIRED", result.stdout)
-        self.assertIn("3 code blocker(s)", result.stdout)
+        self.assertIn("1 code blocker(s)", result.stdout)
         self.assertIn("5 deployment pending", result.stdout)
 
 
