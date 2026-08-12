@@ -353,7 +353,20 @@ def _migration_rows(conn: DatabaseConnection) -> list[dict[str, object]]:
 
 
 def inspect_schema(conn: DatabaseConnection) -> SchemaStatus:
-    tables = _table_names(conn)
+    try:
+        tables = _table_names(conn)
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return SchemaStatus(
+            SchemaState.UNKNOWN,
+            None,
+            LATEST_SCHEMA_VERSION,
+            (),
+            ("schema ilegível ou corrompido",),
+        )
     if not tables:
         return SchemaStatus(
             SchemaState.MISSING,

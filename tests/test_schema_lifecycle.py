@@ -395,6 +395,26 @@ class SchemaLifecycleTests(unittest.TestCase):
             finally:
                 future.close()
 
+    def test_corrupt_migration_metadata_is_unknown_and_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "unknown.db"
+            conn = connect(path)
+            try:
+                initialize_schema(conn)
+                conn.execute(
+                    f"UPDATE {MIGRATION_TABLE} SET checksum = 'tampered' WHERE version = 2"
+                )
+                conn.commit()
+                before = conn.raw_conn.total_changes
+                status = inspect_schema(conn)
+                self.assertEqual(status.state, SchemaState.UNKNOWN)
+                self.assertTrue(any("checksum" in issue for issue in status.issues))
+                with self.assertRaises(SchemaCompatibilityError):
+                    verify_schema_compatible(conn)
+                self.assertEqual(before, conn.raw_conn.total_changes)
+            finally:
+                conn.close()
+
     def test_empty_production_target_is_not_created_by_startup_connection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "missing.db"

@@ -243,7 +243,7 @@ O Streamlit documenta `server.baseUrlPath`, CORS/XSRF e configuração por vari�
 | Linter/type checker configurado | Não encontrado |
 | Teste PostgreSQL real | Não executado: não havia driver/servidor PostgreSQL no runtime de auditoria |
 | Import/startup completo do Streamlit | M1A validou runtime limpo; M1B adicionou regressão estática do caminho de startup e testes de compatibilidade efêmeros |
-| Testes M1B | PASS: 39 testes totais; 18 cobrem schema/CLI/startup/seed/locks/falha-retry |
+| Testes M1B | PASS: 40 testes totais; 19 cobrem schema/CLI/startup/seed/locks/falha-retry |
 | Streamlit AppTest com schema atual | PASS em cópia efêmera, sem erros; um aviso de depreciação conhecido |
 | Paridade estrutural com `init_db()` histórico | PASS: mesmas 16 tabelas, colunas e 23 índices, além do ledger |
 
