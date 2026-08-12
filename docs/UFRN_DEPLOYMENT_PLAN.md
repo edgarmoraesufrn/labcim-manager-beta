@@ -1,6 +1,8 @@
 # LabCim Manager — plano de implantação UFRN
 
-Status: fundação de código M1A preparada; **não executar sem aprovação de uma sprint de implantação**.
+Status: fundações de código M1A/M1B preparadas; **não executar sem aprovação de uma sprint de implantação**.
+
+M1B adicionou migrations versionadas e startup não mutante. Isso não significa que o PostgreSQL UFRN esteja pronto: nenhum host/banco real foi acessado, e criação/adoção/upgrade ainda precisam de ensaio em staging. Procedimentos e estados estão em `DATABASE_SCHEMA_LIFECYCLE.md`.
 
 Dependência: todos os blockers de `PRODUCTION_READINESS.md` resolvidos em staging.
 
@@ -51,7 +53,7 @@ Antes do staging:
 - disponibilizar Python 3.12.13, conforme `.python-version`;
 - instalar somente pelo `requirements.txt`, que exige o `requirements.lock` com hashes;
 - construir virtualenv limpo;
-- executar compile, testes SQLite/PostgreSQL e smoke de startup;
+- executar compile, testes, `db_migrate status/verify` e smoke de startup;
 - registrar commit, Python, lock e checksums dos artefatos.
 
 O M1A validou instalação limpa e testes locais com Python 3.12.13. Isso ainda não substitui a homologação no Linux/Ubuntu alvo.
@@ -89,7 +91,7 @@ A unidade final deve conter, no mínimo:
 - `ReadWritePaths` apenas para diretórios persistentes/temporários escolhidos;
 - logs em stdout/stderr capturados pelo journald.
 
-Não adicionar `ExecStartPre` que chame `init_db()` enquanto o startup ainda altera schema/dados. Migração deve ser uma etapa administrativa separada, com backup e aprovação.
+Não adicionar migration/seed ao `ExecStartPre`. Em M1B, o startup é somente verificador e falha fechado. `python -m labcim_manager.db_migrate ...` deve permanecer uma etapa administrativa separada, com backup e aprovação, antes de iniciar/reiniciar a unidade.
 
 ## 7. Nginx — desenho de referência
 
@@ -137,6 +139,9 @@ Não aplicar CSP/HSTS ou headers de frame de forma cega. Streamlit usa iframes p
 
 ## 8. PostgreSQL
 
+- antes do primeiro start, executar `db_migrate status`; para banco novo usar `initialize`; para restore sem ledger usar a inspeção de `baseline-existing`, confirmar somente após revisão, depois `upgrade` e `verify`;
+- capturar versões/resultado sem registrar a `DATABASE_URL`; nunca passá-la em linha de comando ou log;
+- se o banco estiver atrasado, adiantado, desconhecido ou sem versão, não iniciar o Streamlit;
 - banco e role dedicados;
 - senha somente no arquivo de ambiente ou autenticação local aprovada;
 - privilégios mínimos após a migração;
@@ -190,12 +195,12 @@ Nenhum deploy será aprovado apenas porque o backup “rodou”; um restore comp
 ## 12. Sequência de implantação
 
 1. **M1A — fundação reproduzível:** runtime, lock, configuração, storage e subpath preparados no repositório.
-2. **M1B — banco/startup:** implementar migrações versionadas e remover mutações do startup.
+2. **M1B — banco/startup (concluído no repositório):** migrations versionadas, adoção validada, seeds explícitos e startup não mutante.
 3. **Hardening dedicado:** autenticação pública, uploads e revisão de HTML/erros restantes.
 4. **Build reproduzível:** gerar ambiente Linux limpo e SBOM/lista de versões.
 5. **Staging isolado:** PostgreSQL e storage sem dados reais ou com cópia sanitizada.
 6. **Teste `/manager/`:** executar a matriz de `PRODUCTION_READINESS.md` e perfis `member/manager/admin`.
-7. **Ensaio de migração:** backup, carga, reconciliação, restore e rollback.
+7. **Ensaio de migração:** em staging autorizado, `status`, adoção/upgrade/verify, backup, carga, reconciliação, restore e rollback.
 8. **Revisão institucional:** segurança, DNS/TLS, e-mail, backup e janela de mudança.
 9. **Cutover aprovado:** somente em sprint própria, com responsáveis, comunicação e rollback.
 10. **Pós-cutover:** smoke funcional, observação de logs/métricas e confirmação de backup.

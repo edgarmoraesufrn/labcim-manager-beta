@@ -42,7 +42,7 @@ Interpretação:
 - `WARNING`: risco/revisão não conclusiva;
 - `PASS`: invariante efetivamente observado.
 
-O resultado M1A continua NO-GO por migrações ausentes, startup mutante e uploader genérico sem allowlist.
+Após M1B, migrations e startup não mutante passam nos gates locais. O resultado continua NO-GO pelo uploader genérico sem allowlist, autenticação/hardening e validações institucionais pendentes.
 
 ## 4. Gates de staging
 
@@ -56,19 +56,44 @@ O resultado M1A continua NO-GO por migrações ausentes, startup mutante e uploa
 - SMTP autorizado e debug de OTP desativado;
 - backup completo e restore ensaiado antes do cutover.
 
-## 5. Smoke funcional obrigatório
+## 5. Procedimento administrativo de schema
+
+Nunca anexar migration ou seed ao `ExecStartPre`. Com o serviço parado e backup identificado, carregar o ambiente restrito sem ecoar valores e executar:
+
+```bash
+python -m labcim_manager.db_migrate status
+python -m labcim_manager.db_migrate verify
+```
+
+Para PostgreSQL realmente vazio, `initialize` cria apenas o schema e o ledger; não importa dados. Para schema versionado atrasado, usar `upgrade`. Para restore compatível sem ledger:
+
+```bash
+python -m labcim_manager.db_migrate baseline-existing
+# revisar contrato e aprovação; o comando acima não grava
+python -m labcim_manager.db_migrate baseline-existing --confirm-compatible-schema
+python -m labcim_manager.db_migrate upgrade
+python -m labcim_manager.db_migrate verify
+```
+
+Interromper se o estado for `ahead`, `unknown`, parcial ou se a validação divergir. Não marcar manualmente a versão, não editar o ledger e não tentar DDL improvisado. Os locks recusam um segundo migrador concorrente. Falha transacional faz rollback; preservar o erro no journal, manter o serviço parado, reinspecionar com `status` e só repetir após corrigir a causa.
+
+Seed de workbook/POPs só pode ser executado por decisão explícita em banco adequado; nunca faz parte de initialize, upgrade ou startup. Produção restaurada não deve receber seed.
+
+Rollback de release que alterou schema é restore coordenado do backup compatível de banco e storage. Não há comando de downgrade.
+
+## 6. Smoke funcional obrigatório
 
 Validar health e UI em `/manager/`, assets/PWA sem requests na raiz, WebSocket, login/logout, perfis `member`/`manager`/`admin`, reservas, manutenção, insumos/lotes, relatórios, QR, upload/download e persistência após restart. Para QR, confirmar destino `https://labcim.quimica.ufrn.br/manager/?...`; para PWA, confirmar que instalação abre o Manager e não o site institucional.
 
-## 6. Falhas e apresentação segura
+## 7. Falhas e apresentação segura
 
 O usuário deve receber mensagem curta e referência de evento. Usar essa referência no journal; não copiar traceback, connection string, OTP, segredo ou URL assinada para navegador/ticket. `APP_LOG_LEVEL=INFO` é o default. Um operador pode habilitar diagnóstico detalhado somente em desenvolvimento isolado.
 
-## 7. Backup, restore e rollback
+## 8. Backup, restore e rollback
 
 Banco e anexos são um conjunto lógico. Registrar RPO/RTO, destino fora da VM, criptografia, retenção, monitoramento e sequência. Restaurar em ambiente isolado, reconciliar contagens/hashes e executar smoke antes de aprovar. Manter release/origem anterior imutável durante a janela; não apagar órfãos nem reverter schema por DDL improvisado.
 
-## 8. Registro de liberação futura
+## 9. Registro de liberação futura
 
 - data/janela:
 - commit e checksum do lock:

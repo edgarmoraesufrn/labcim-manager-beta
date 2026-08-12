@@ -16,6 +16,8 @@ Este documento contém apenas nomes, finalidades e valores fictícios. Segredos 
 
 Em produção, `APP_BASE_URL` deve usar HTTPS, não pode apontar para localhost/IP privado e deve terminar exatamente em `/manager/`. Caminhos locais relativos são aceitos somente em development/test e são resolvidos a partir da raiz do projeto, nunca do CWD do processo.
 
+Não existe variável que autorize migration ou seed no startup. `DATABASE_URL` é lida também pela CLI `python -m labcim_manager.db_migrate`, mas nunca é impressa por ela. Na ausência de `DATABASE_URL`, a CLI usa o SQLite do projeto (`data/labcim_manager.db`) ou um `--sqlite-path` explícito. Em staging/produção, fornecer secrets por ambiente/arquivo restrito, executar `status`/`verify` administrativamente e iniciar o serviço somente com schema compatível.
+
 ## R2, somente quando selecionado
 
 | Variável | Obrigatoriedade | Finalidade | Exemplo seguro | Ambiente |

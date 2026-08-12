@@ -28,7 +28,24 @@ python -m pip install -r requirements.txt
 
 ## A. SQLite + storage local na raiz
 
-O default de development é SQLite em `data/labcim_manager.db` e arquivos em `data/uploads`, ambos ancorados na raiz do projeto. Para executar no caminho raiz, sobrescreva o default `/manager/` somente nessa invocação:
+O default de development é SQLite em `data/labcim_manager.db` e arquivos em `data/uploads`, ambos ancorados na raiz do projeto. O startup não cria mais o arquivo. Inicialize explicitamente uma vez e verifique antes de executar:
+
+```bash
+python -m labcim_manager.db_migrate status
+python -m labcim_manager.db_migrate initialize
+python -m labcim_manager.db_migrate verify
+```
+
+Para um arquivo descartável, informe a opção global antes do subcomando: `python -m labcim_manager.db_migrate --sqlite-path /tmp/labcim.db initialize`.
+
+Seed é opcional e separado. Para popular deliberadamente um banco operacional vazio:
+
+```bash
+python -m labcim_manager.db_migrate seed-base --workbook data/LabCim_Base.xlsx
+python -m labcim_manager.db_migrate seed-pops
+```
+
+Nenhum desses dados é importado ao iniciar o Streamlit. Para executar no caminho raiz, sobrescreva o default `/manager/` somente nessa invocação:
 
 ```bash
 APP_ENV=development STORAGE_BACKEND=local \
@@ -95,6 +112,10 @@ R2_BUCKET=labcim-staging-files
 ```
 
 Esses exemplos são placeholders e não devem ser usados como credenciais. `DATABASE_URL` nunca implica R2.
+
+Antes de iniciar uma simulação PostgreSQL, use o mesmo ambiente restrito e execute `python -m labcim_manager.db_migrate status`. Em banco novo, `initialize` e `verify`; em snapshot restaurado sem ledger, execute `baseline-existing` sem confirmação, revise as divergências e só então repita com `--confirm-compatible-schema`, seguido de `upgrade` e `verify`. Não use a adoção para um schema parcial.
+
+Se o banco estiver atrás, à frente, corrompido/desconhecido ou ausente, a UI se recusa a iniciar e não tenta repará-lo. Essa política é igual em development, staging e production; a conveniência local fica no comando explícito `initialize`.
 
 ## Validação local
 

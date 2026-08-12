@@ -1,6 +1,14 @@
 # LabCim Manager — plano de migração de banco para UFRN
 
-Status: planejamento M0; nenhuma migração executada.
+Status: ciclo de schema M1B implementado e validado localmente; migração de dados reais e ensaio UFRN continuam pendentes.
+
+## Atualização M1B — schema antes da migração de dados
+
+O repositório agora possui migrations forward-only em `labcim_manager/migrations/`, ledger `labcim_schema_migrations` e CLI administrativa em `python -m labcim_manager.db_migrate`. A versão atual é 2. O startup web apenas abre um banco existente e verifica versão, checksums e contrato estrutural; não cria/repara schema, não executa transformações de dados e não importa a planilha/POPs.
+
+Alembic não foi adotado porque o projeto usa SQL direto centralizado, sem ORM, e possui apenas dois dialetos tratados pelo adaptador existente. O migrador pequeno torna as duas versões reais legíveis e evita uma segunda pilha de engine/metadata. Estratégia, estados, comandos, adoção, locks, falha/retry e procedimentos completos estão em `DATABASE_SCHEMA_LIFECYCLE.md`.
+
+Esta entrega resolve o mecanismo de evolução do **schema**; não escolhe fonte autoritativa, não implementa transporte SQLite→PostgreSQL, não reconcilia dados e não executa qualquer banco real. As rotas e gates abaixo continuam obrigatórios para essa etapa futura.
 
 ## 1. Estado atual
 
@@ -32,7 +40,7 @@ notification_log
 
 Há índices para serviços, reservas, históricos, lotes, movimentos e anexos. Há FKs em parte das relações, mas não existem ações `ON DELETE`, constraints de status/booleanos/quantidades ou unicidade de e-mail. Datas e horas são armazenadas como `TEXT`.
 
-Não há Alembic, tabela de versão, DDL versionado ou ferramenta de migração. `init_db()` é o mecanismo atual de criação/evolução e roda no startup.
+No snapshot M0, não havia ferramenta de migração e `init_db()` rodava no startup. Desde M1B, essa DDL foi retirada de `db.py` e convertida nas versões 1 e 2; a aplicação recusa schema ausente, atrasado, adiantado ou desconhecido sem mutá-lo.
 
 ## 2. Decisão obrigatória: fonte autoritativa
 
@@ -55,7 +63,7 @@ Esta é a rota preferida se Neon for a fonte autoritativa:
 3. Preservar dump bruto, checksum e log fora do repositório.
 4. Restaurar primeiro em staging UFRN ou ambiente equivalente.
 5. Usar role owner controlado e evitar restaurar privilégios/owners cloud que não existam localmente.
-6. Não iniciar o app antes de separar `init_db()` do startup.
+6. Executar `db_migrate status`, adotar/atualizar explicitamente e obter `db_migrate verify` verde antes de iniciar o app.
 7. Comparar schema restaurado com o schema versionado aprovado para a release.
 8. Reconciliar dados conforme a seção 7.
 9. Executar testes funcionais com storage correspondente.
@@ -65,7 +73,7 @@ Não usar `data/LabCim_Base.xlsx` para “completar” um restore PostgreSQL.
 
 ## 4. Rota B — SQLite para PostgreSQL UFRN
 
-Se SQLite for a fonte autoritativa, criar uma ferramenta de migração dedicada e testada. Não apontar o app ao banco vazio esperando que o startup faça a conversão; ele apenas cria/atualiza o banco selecionado e importa três domínios da planilha seed.
+Se SQLite for a fonte autoritativa, ainda será necessário criar uma ferramenta de **transporte de dados** dedicada e testada. Não apontar o app a um banco vazio: o startup M1B não cria schema, não converte dialeto e não importa seed.
 
 Ordem de carga recomendada, preservando IDs:
 
@@ -95,16 +103,18 @@ Depois da carga, ajustar as sequences/identities PostgreSQL para `max(id)+1`. Co
 
 O migrador deve ter `--dry-run`, transação única ou checkpoints documentados, relatório JSON/CSV sem dados sensíveis e nunca apagar a origem.
 
-## 5. Schema versionado antes da carga
+## 5. Schema versionado antes da carga — concluído em M1B
 
-M1 deve introduzir:
+M1B introduziu:
 
 - uma tabela de versão ou ferramenta de migração consolidada;
 - baseline PostgreSQL derivada e revisada do schema atual;
 - migrations forward-only, pequenas e transacionais quando possível;
 - comando administrativo explícito;
 - aplicação web que somente verifica compatibilidade;
-- testes de banco novo, upgrade de snapshot anterior e rollback operacional por restore.
+- testes de banco novo, adoção/upgrade de snapshot anterior, falha/retry e rollback operacional por restore.
+
+O PostgreSQL real/efêmero não estava disponível nesta estação. Tradução DDL, placeholders e advisory lock foram testados deterministicamente, mas `initialize`, adoção e `upgrade` devem ser executados primeiro num PostgreSQL de staging autorizado. Isso permanece `DEPLOYMENT PENDING`, não um PASS de equivalência real.
 
 Não transformar automaticamente todas as colunas `TEXT` de data em `timestamptz` na mesma janela do primeiro cutover. Primeiro inventariar valores inválidos e definir semântica de timezone.
 
@@ -208,8 +218,8 @@ Não executar downgrade destrutivo de schema em produção.
 
 - [ ] fonte autoritativa declarada;
 - [ ] backup final e restore testados;
-- [ ] migrations versionadas;
-- [ ] app não altera schema/dados no startup;
+- [x] migrations versionadas e verificadas em SQLite efêmero;
+- [x] app não altera schema/dados no startup;
 - [ ] contagens e relações reconciliadas;
 - [ ] e-mails ativos únicos;
 - [ ] testes concorrentes PostgreSQL aprovados;

@@ -1,4 +1,4 @@
-# LabCim Manager — prontidão para produção UFRN (M0 + fundação M1A)
+# LabCim Manager — prontidão para produção UFRN (M0 + fundações M1A/M1B)
 
 Data do levantamento: 2026-08-11
 
@@ -7,6 +7,20 @@ Escopo: auditoria estática e validação local não destrutiva
 Decisão atual: **NO-GO para produção**
 
 Esta decisão não significa que os fluxos funcionais do LabCim Manager devam ser refeitos. Ela significa que o estado atual ainda não oferece uma migração controlada, reproduzível, segura e testada para a infraestrutura institucional da UFRN.
+
+## Atualização M1B — 2026-08-12
+
+M1B removeu os dois blockers de ciclo de schema identificados em M1A:
+
+- versões 1 e 2 ordenadas, com nome/checksum e ledger `labcim_schema_migrations`;
+- comandos administrativos independentes do Streamlit para `status`, `verify`, `initialize`, `upgrade`, adoção de banco existente e seeds opcionais;
+- validação estrutural antes de adotar schema sem ledger;
+- transação e exclusão mútua por `BEGIN IMMEDIATE` no SQLite e advisory transaction lock no PostgreSQL;
+- startup web somente abre um banco já existente e compatível; não executa DDL, reparo, `UPDATE`, workbook ou POP seed;
+- testes efêmeros comprovam banco SQLite novo, snapshot legado preservado, recusa de versões atrasada/futura, ausência de seed automático e falha/retry;
+- tradução DDL e locking PostgreSQL foram testados deterministicamente, mas não havia instância efêmera PostgreSQL disponível.
+
+O `CODE BLOCKER` de repositório conhecido que permanece no preflight é o uploader genérico de equipamento sem allowlist. PostgreSQL UFRN, validação/adoção/migration do schema real, restore, Nginx/systemd e browser `/manager/` continuam `DEPLOYMENT PENDING`. Autenticação pública e demais itens de segurança continuam NO-GO. Detalhes operacionais: `DATABASE_SCHEMA_LIFECYCLE.md`.
 
 ## Atualização M1A — 2026-08-12
 
@@ -24,7 +38,7 @@ O snapshot histórico abaixo registra o que o M0 encontrou em `1ffe702`. A funda
 
 As resoluções de M0-B03 e da parte controlada pela aplicação em M0-B04/M0-B07 são estruturais, mas dependem de staging. M0-B06 foi apenas parcialmente mitigado: o uploader genérico de equipamento ainda exige política/allowlist, e a revisão ampla de HTML permanece pendente.
 
-Os `CODE BLOCKER` intencionalmente remanescentes após M1A são:
+Os `CODE BLOCKER` que eram intencionalmente remanescentes ao fim de M1A eram:
 
 1. migrações/versionamento de schema ausentes;
 2. startup ainda executa DDL, importação e seed;
@@ -74,7 +88,7 @@ Navegador
       -> SMTP síncrono para códigos de acesso e notificações
 ```
 
-No primeiro uso de uma combinação banco/configuração, `get_conn()` chama `ensure_database_initialized()`, que:
+No snapshot M0, no primeiro uso de uma combinação banco/configuração, `get_conn()` chamava `ensure_database_initialized()`, que:
 
 1. executa `init_db()`;
 2. cria tabelas e índices ausentes;
@@ -83,7 +97,7 @@ No primeiro uso de uma combinação banco/configuração, `get_conn()` chama `en
 5. importa `data/LabCim_Base.xlsx` se todas as tabelas operacionais estiverem vazias;
 6. associa POPs empacotados no repositório.
 
-Portanto, iniciar o servidor **não é uma operação somente leitura**.
+Esse era o comportamento histórico auditado. Em M1B, `ensure_database_compatible()` passou a abrir apenas banco existente e executar verificação somente leitura; incompatibilidade interrompe o app sem reparar ou semear.
 
 ## 3. Estado por área A–O
 
@@ -107,11 +121,11 @@ Portanto, iniciar o servidor **não é uma operação somente leitura**.
 
 ## 4. BLOCKERS
 
-### M0-B01 — inicialização do app altera schema e dados
+### M0-B01 — inicialização do app altera schema e dados — **resolvido no código em M1B**
 
-`ensure_database_initialized()` chama `init_db()`, importação inicial e seed de POPs durante o startup. `init_db()` contém DDL e `UPDATE`s. Isso mistura deploy, migração e execução normal, impede um rollout previsível e pode alterar um banco restaurado apenas ao iniciar a aplicação.
+O texto abaixo descreve o achado M0: `ensure_database_initialized()` chamava `init_db()`, importação inicial e seed de POPs durante o startup. M1B removeu esse caminho e moveu DDL/seed para comandos administrativos explícitos.
 
-Critério para remover o bloqueio: criar migrações versionadas e idempotentes executadas por comando administrativo separado; o processo web deve validar a versão do schema e falhar de forma clara quando incompatível, sem migrar automaticamente.
+Critério atendido localmente: migrations versionadas executadas por CLI; processo web verifica versão/estrutura e falha fechado. A aplicação no ambiente UFRN ainda depende de ensaio de staging.
 
 ### M0-B02 — origem e procedimento de migração de dados não estão definidos
 
@@ -167,16 +181,16 @@ Critério: política aprovada de RPO/RTO, backups automatizados e criptografados
 ## 5. IMPORTANTES
 
 - **M0-I01 — constraints insuficientes:** faltam `CHECK`s de status/booleanos/quantidades, unicidade de e-mail e de vários códigos de domínio; relações genéricas de `attachments` não possuem FK para a entidade alvo.
-- **M0-I02 — migrações incrementais não recompõem constraints:** `_add_column()` adiciona coluna, mas não adiciona FKs e demais constraints que existiriam em um banco criado do zero.
+- **M0-I02 — constraints históricas não recompostas:** a migration 2 preserva o comportamento incremental aprovado e adiciona colunas sem reconstruir tabelas; assim, não adiciona FKs/constraints que exigiriam reescrita e validação de dados. Essa harmonização continua fora de M1B.
 - **M0-I03 — timestamps ingênuos:** datas e horas são `TEXT`, geradas com `datetime.now()`/`datetime.utcnow()`, sem offset. O timezone do serviço afetará autenticação, reservas e relatórios.
 - **M0-I04 — conexões PostgreSQL:** há uma conexão duradoura por sessão Streamlit e conexões adicionais em caches, sem pool ou limites explícitos. Leituras podem manter transações abertas. Há caminhos de erro, como conflito em `create_equipment`, sem `rollback()`.
 - **M0-I05 — atomicidade banco/arquivo:** o arquivo é salvo antes do registro em `attachments`; falha de banco deixa objeto órfão. Upload, criação da entidade e atualização do campo legado usam commits separados.
 - **M0-I06 — importação administrativa:** `data/_uploaded_base.xlsx` é um nome global sobrescrito antes da confirmação. Duas sessões podem interferir. A importação faz upsert e commit único, mas a UI não garante rollback ao capturar toda exceção.
-- **M0-I07 — caminhos relativos:** banco, uploads, planilha seed, imagens e POPs dependem do `WorkingDirectory` ser a raiz do repositório.
+- **M0-I07 — caminhos relativos (resolvido no código em M1A):** banco/assets são ancorados no projeto e raízes mutáveis podem ser externalizadas; permissões reais continuam pendentes.
 - **M0-I08 — logging:** faltam IDs de correlação, eventos de autenticação, latência/erro de storage e política de retenção para `notification_log`, que contém e-mails e conteúdo de mensagens.
 - **M0-I09 — SMTP síncrono:** envio acontece no request, com timeout de 20 segundos; notificações para vários destinatários são sequenciais e podem bloquear a sessão.
 - **M0-I10 — exclusão e retenção de arquivos:** inativação preserva o byte, o que favorece auditoria, mas não há política de retenção, legal hold, descarte seguro nem coletor de órfãos.
-- **M0-I11 — dados de demonstração:** `data/LabCim_Base.xlsx` está versionado e pode ser importado automaticamente em banco vazio; precisa ser formalmente classificado como seed autorizado ou removido do caminho de produção.
+- **M0-I11 — dados de demonstração (startup resolvido em M1B):** `data/LabCim_Base.xlsx` permanece versionado, mas só pode ser importado por comando/UI administrativo explícito; sua classificação e uso em produção ainda exigem decisão formal.
 - **M0-I12 — superfícies antigas:** documentação e exemplos ainda promovem Streamlit Cloud/Neon/R2, criando risco operacional durante a migração.
 
 ## 6. OPCIONAIS
@@ -228,16 +242,19 @@ O Streamlit documenta `server.baseUrlPath`, CORS/XSRF e configuração por vari�
 | Testes automatizados existentes | Não encontrados |
 | Linter/type checker configurado | Não encontrado |
 | Teste PostgreSQL real | Não executado: não havia driver/servidor PostgreSQL no runtime de auditoria |
-| Import/startup completo do Streamlit | Não executado: runtime de auditoria não possuía todas as dependências do app |
+| Import/startup completo do Streamlit | M1A validou runtime limpo; M1B adicionou regressão estática do caminho de startup e testes de compatibilidade efêmeros |
+| Testes M1B | PASS: 39 testes totais; 18 cobrem schema/CLI/startup/seed/locks/falha-retry |
+| Streamlit AppTest com schema atual | PASS em cópia efêmera, sem erros; um aviso de depreciação conhecido |
+| Paridade estrutural com `init_db()` histórico | PASS: mesmas 16 tabelas, colunas e 23 índices, além do ledger |
 
 Nenhum banco ou diretório de uploads persistente foi criado no repositório. Instalar as dependências abertas mais recentes apenas para obter um startup verde não seria uma homologação reproduzível; isso deve ocorrer depois do lock em M1.
 
 ## 9. Resultado do M0
 
-O suporte PostgreSQL é real, mas **parcialmente pronto para produção**: operações principais usam SQL parametrizado e há tratamento de concorrência para reservas/estoque, porém faltam migração versionada, testes PostgreSQL e controles de conexão/schema.
+O suporte PostgreSQL é real, mas **parcialmente pronto para produção**: operações principais usam SQL parametrizado, migrations versionadas e locking; ainda falta executar a matriz em PostgreSQL efêmero/staging real e validar conexão/schema UFRN.
 
 O armazenamento é real, mas **não atende ainda à arquitetura local proposta** sem manter R2. A autenticação é funcional para beta controlado, mas **não deve ser exposta publicamente** antes dos controles de abuso e unicidade de identidade.
 
-Próxima sprint recomendada após a fundação M1A: **M1B — migrações versionadas e startup não mutante**, seguida pelo hardening dedicado de autenticação/upload e por staging/restore controlados. Não iniciar deploy de produção enquanto o preflight retornar `CODE BLOCKER`.
+Próxima sprint recomendada após M1B: hardening dedicado de autenticação/upload, seguido de PostgreSQL staging/restore e validação controlada. Não iniciar deploy de produção enquanto o preflight retornar `CODE BLOCKER` ou os gates institucionais estiverem pendentes.
 
 Nenhuma conexão com a VM UFRN, alteração de infraestrutura, migração de dados ou modificação de banco de produção foi realizada neste M0.

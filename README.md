@@ -23,13 +23,14 @@ O foco da v1.0 é organizar a operação diária, reduzir dependência de contro
 
 O código suporta Streamlit, PostgreSQL via `DATABASE_URL`, SQLite local e escolha explícita de arquivos por `STORAGE_BACKEND=local|r2`. Banco e storage são independentes, inclusive PostgreSQL + filesystem institucional.
 
-A fundação M1A declara Python 3.12.13, usa lock com hashes, centraliza URL pública/configuração e prepara Streamlit/PWA/QR para `/manager/`. A migração institucional para Nginx + PostgreSQL UFRN continua **NO-GO** até migrations, startup, autenticação/upload e gates de staging/restore serem resolvidos. Nenhum deploy UFRN foi executado.
+As fundações M1A/M1B declaram Python 3.12.13, usam lock com hashes, centralizam URL/configuração, preparam `/manager/` e introduzem schema versionado com startup não mutante. A migração institucional para Nginx + PostgreSQL UFRN continua **NO-GO** até autenticação/upload e gates PostgreSQL, staging/restore serem resolvidos. Nenhum deploy UFRN foi executado.
 
 ## Documentação
 
 - [Prontidão para produção UFRN — M0](docs/PRODUCTION_READINESS.md)
 - [Plano de implantação UFRN](docs/UFRN_DEPLOYMENT_PLAN.md)
 - [Plano de migração do banco](docs/DATABASE_MIGRATION_PLAN.md)
+- [Ciclo de vida versionado do schema](docs/DATABASE_SCHEMA_LIFECYCLE.md)
 - [Plano de migração de arquivos](docs/FILE_STORAGE_MIGRATION_PLAN.md)
 - [Template de ambiente de produção](docs/PRODUCTION_ENV_TEMPLATE.md)
 - [Guia local e staging simulado](docs/LOCAL_STAGING_GUIDE.md)
