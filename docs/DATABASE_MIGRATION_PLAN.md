@@ -4,7 +4,7 @@ Status: ciclo de schema M1B implementado e validado localmente; migração de da
 
 ## Atualização M1B — schema antes da migração de dados
 
-O repositório agora possui migrations forward-only em `labcim_manager/migrations/`, ledger `labcim_schema_migrations` e CLI administrativa em `python -m labcim_manager.db_migrate`. A versão atual é 2. O startup web apenas abre um banco existente e verifica versão, checksums e contrato estrutural; não cria/repara schema, não executa transformações de dados e não importa a planilha/POPs.
+O repositório agora possui migrations forward-only em `labcim_manager/migrations/`, ledger `labcim_schema_migrations` e CLI administrativa em `python -m labcim_manager.db_migrate`. A versão atual é 3; v3 adiciona somente o ledger persistente de throttling OTP, sem reescrever v1/v2 nem dados operacionais. O startup web apenas abre um banco existente e verifica versão, checksums e contrato estrutural; não cria/repara schema, não executa transformações de dados e não importa a planilha/POPs.
 
 Alembic não foi adotado porque o projeto usa SQL direto centralizado, sem ORM, e possui apenas dois dialetos tratados pelo adaptador existente. O migrador pequeno torna as duas versões reais legíveis e evita uma segunda pilha de engine/metadata. Estratégia, estados, comandos, adoção, locks, falha/retry e procedimentos completos estão em `DATABASE_SCHEMA_LIFECYCLE.md`.
 

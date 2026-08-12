@@ -8,6 +8,21 @@ Decisão atual: **NO-GO para produção**
 
 Esta decisão não significa que os fluxos funcionais do LabCim Manager devam ser refeitos. Ela significa que o estado atual ainda não oferece uma migração controlada, reproduzível, segura e testada para a infraestrutura institucional da UFRN.
 
+## Atualização M1C — 2026-08-12
+
+M1C removeu os blockers de código de autenticação/abuso e upload identificados no M0/M1B:
+
+- identidade de autenticação `lower(trim(email))`, sem merge automático; conflitos históricos tornam o login fail-closed e possuem diagnóstico administrativo;
+- resposta pública neutra para endereço conhecido, desconhecido, inativo, ambíguo, limitado ou falha operacional;
+- HMAC do OTP com segredo, validade curta, cinco erros máximos, uso único e invalidação de códigos anteriores;
+- throttling persistente por identidade (3/15 min), origem (20/15 min) e global (100/15 min), configurável e sem e-mail/IP em claro;
+- exibição de OTP de debug removida; logs usam referências e hashes truncados;
+- migration forward-only v3 adiciona somente `auth_rate_limit_events`; v1/v2 e seus checksums permanecem intactos;
+- todos os uploads usam políticas centralizadas, limite default 25 MiB, validação de extensão/MIME/assinatura, nome seguro e chave UUID;
+- downloads local/R2 recusam escape/namespace arbitrário; importação XLSX usa temporário UUID e limpeza garantida.
+
+O preflight passa os gates estáticos de autenticação e do uploader de equipamento. Não restam `CODE BLOCKERS` conhecidos dentro do escopo M1C. A decisão continua **NO-GO**, pois PostgreSQL/SMTP/storage/Nginx reais, origem de dados, migração/reconciliação, backup/restore, browser `/manager/`, permissões e controles institucionais permanecem `DEPLOYMENT PENDING`. Não foi feito pentest nem scanning antimalware.
+
 ## Atualização M1B — 2026-08-12
 
 M1B removeu os dois blockers de ciclo de schema identificados em M1A:
@@ -145,7 +160,7 @@ Critério: decidir formalmente entre R2 e filesystem institucional; se filesyste
 
 Critério: configurar `manager`, corrigir manifesto e URL pública, adicionar Nginx que preserve o prefixo e WebSockets e executar a matriz manual da seção 7.
 
-### M0-B05 — autenticação pública precisa de controles contra abuso e ambiguidade
+### M0-B05 — autenticação pública precisa de controles contra abuso e ambiguidade — **resolvido no código em M1C**
 
 Pontos positivos: código aleatório de seis dígitos, hash SHA-256 no banco, uso único, expiração e bloqueio após tentativas; falha SMTP invalida o código, salvo debug explicitamente habilitado.
 
@@ -156,9 +171,9 @@ Pendências bloqueadoras:
 - coluna `users.email` aceita nulo e duplicatas; `LIMIT 1` torna a identidade ambígua;
 - nenhuma política de limpeza/retention para `access_codes`;
 - nenhuma auditoria de IP/user-agent e nenhum bloqueio global contra automação;
-- `LABCIM_AUTH_DEBUG_CODES=true` expõe o código na tela.
+- o antigo `LABCIM_AUTH_DEBUG_CODES=true` expunha o código na tela; esse caminho foi removido em M1C.
 
-Critério: e-mail ativo normalizado e único, resposta uniforme, rate limiting no proxy e/ou aplicação, política de expiração/limpeza, debug impossível no perfil de produção e teste de login atrás do proxy.
+Critério local atendido por normalização única, fail-closed em conflito, resposta uniforme, throttling persistente, expiração/uso único/limpeza e remoção do debug. Login, SMTP, timing e origem sob proxy real ainda exigem staging.
 
 ### M0-B06 — upload e divulgação de erros não estão endurecidos
 

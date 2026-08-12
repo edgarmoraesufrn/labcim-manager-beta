@@ -50,7 +50,7 @@ Valores não secretos já possuem defaults seguros em `.streamlit/config.toml`. 
 
 Desenvolvedores podem sobrescrever apenas `baseUrlPath` e detalhes de erro em uma invocação local, conforme `LOCAL_STAGING_GUIDE.md`.
 
-## SMTP e autenticação existente
+## SMTP e segurança da autenticação
 
 | Variável | Obrigatoriedade | Finalidade | Exemplo seguro | Ambiente |
 |---|---|---|---|---|
@@ -60,7 +60,16 @@ Desenvolvedores podem sobrescrever apenas `baseUrlPath` e detalhes de erro em um
 | `LABCIM_SMTP_PASSWORD` | Obrigatória para SMTP | credencial secreta | `<SMTP_PASSWORD>` | staging/produção |
 | `LABCIM_SMTP_FROM` | Obrigatória para SMTP | remetente autorizado | `LabCim Manager <labcim-manager@example.invalid>` | staging/produção |
 | `LABCIM_SMTP_TLS` | Obrigatória para SMTP | política STARTTLS | `true` | staging/produção |
-| `LABCIM_AUTH_DEBUG_CODES` | Obrigatória em produção | deve ser explicitamente `false` | `false` | produção |
+| `LABCIM_OTP_HASH_SECRET` | Recomendada; um segredo OTP ou cookie secret é obrigatório em staging/produção | HMAC dos desafios; mínimo 32 caracteres | `<RANDOM_HIGH_ENTROPY_SECRET>` | staging/produção |
+| `LABCIM_OTP_TTL_SECONDS` | Opcional, validada | validade; default 600, faixa 60–1800 | `600` | todos |
+| `LABCIM_OTP_MAX_VERIFY_ATTEMPTS` | Opcional, validada | erros por desafio; default 5, faixa 3–10 | `5` | todos |
+| `LABCIM_OTP_REQUEST_WINDOW_SECONDS` | Opcional, validada | janela móvel; default 900, faixa 60–86400 | `900` | todos |
+| `LABCIM_OTP_MAX_REQUESTS_PER_WINDOW` | Opcional, validada | solicitações por identidade; default 3, faixa 1–20 | `3` | todos |
+| `LABCIM_OTP_MAX_REQUESTS_PER_ORIGIN` | Opcional, validada | solicitações por origem; default 20, faixa 1–200 | `20` | todos |
+| `LABCIM_OTP_GLOBAL_MAX_REQUESTS` | Opcional, validada | solicitações globais; default 100, faixa 10–2000 | `100` | todos |
+| `LABCIM_UPLOAD_MAX_BYTES` | Opcional, validada | limite por arquivo; default 26214400, faixa 1048576–52428800 | `26214400` | todos |
+
+O antigo modo de exibição de OTP em debug foi removido. A política completa está em `AUTHENTICATION_SECURITY.md` e `UPLOAD_SECURITY.md`.
 
 ## Processo e diagnóstico
 
@@ -81,7 +90,14 @@ LOCAL_STORAGE_ROOT=/var/lib/labcim-manager/uploads
 LOCAL_WORK_ROOT=/var/lib/labcim-manager/work
 APP_LOG_LEVEL=INFO
 STREAMLIT_SERVER_COOKIE_SECRET=<RANDOM_HIGH_ENTROPY_SECRET>
-LABCIM_AUTH_DEBUG_CODES=false
+LABCIM_OTP_HASH_SECRET=<RANDOM_HIGH_ENTROPY_SECRET>
+LABCIM_OTP_TTL_SECONDS=600
+LABCIM_OTP_MAX_VERIFY_ATTEMPTS=5
+LABCIM_OTP_REQUEST_WINDOW_SECONDS=900
+LABCIM_OTP_MAX_REQUESTS_PER_WINDOW=3
+LABCIM_OTP_MAX_REQUESTS_PER_ORIGIN=20
+LABCIM_OTP_GLOBAL_MAX_REQUESTS=100
+LABCIM_UPLOAD_MAX_BYTES=26214400
 TZ=America/Fortaleza
 ```
 

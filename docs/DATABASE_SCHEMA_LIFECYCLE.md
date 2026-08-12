@@ -12,8 +12,9 @@ Cada migration tem número, nome e checksum determinísticos. `labcim_schema_mig
 |---|---|---|
 | 1 | `legacy_core` | dez tabelas do snapshot legado real do repositório |
 | 2 | `approved_schema_2026_08` | seis tabelas, 22 colunas e 23 índices do contrato aprovado atual |
+| 3 | `auth_abuse_protection` | tabela e três índices de eventos persistentes de throttling OTP, sem alterar usuários/dados operacionais |
 
-A versão esperada desta release é **2**. Ela representa as 16 tabelas operacionais já aprovadas: `equipment`, `users`, `projects`, `project_services`, `bookings`, `booking_status_history`, `maintenance_preventive`, `maintenance_corrective`, `maintenance_status_history`, `supplies`, `supply_lots`, `supply_movements`, `equipment_spare_parts`, `attachments`, `access_codes` e `notification_log`.
+A versão esperada desta release é **3**. Ela preserva as 16 tabelas operacionais aprovadas e acrescenta apenas `auth_rate_limit_events`, tabela de segurança não operacional. Os checksums M1B permanecem: v1 `082096411bef0900a165e443b0efe8ffd61c9db4fa1718203d6cce001c447bf2`; v2 `a07a72c9752d99324b0e8fbb07e510342e253b785da85f0fa74e06ae7981b8a0`.
 
 M1B preserva os tipos e constraints históricos que o SQL atual consegue criar/adicionar. Não adiciona constraints de negócio, não converte timestamps, não normaliza status/e-mail, não reescreve FKs e não altera dados operacionais.
 
@@ -47,8 +48,8 @@ O inspetor classifica o banco como:
 - `missing`: nenhuma tabela de aplicação;
 - `unversioned`: há schema, mas não há ledger;
 - `current`: versão, checksums, tabelas, colunas críticas, tipos críticos e índices correspondem à release;
-- `behind`: ledger válido e versão menor que 2;
-- `ahead`: versão maior que 2;
+- `behind`: ledger válido e versão menor que 3;
+- `ahead`: versão maior que 3;
 - `unknown`: ledger ilegível/descontínuo, checksum divergente ou estrutura incompatível.
 
 O processo web abre SQLite com `mode=rw`, sem criar arquivo, e faz apenas `verify_schema_compatible()`. Somente `current` inicia a aplicação. Qualquer outro estado falha fechado com mensagem administrativa curta; o navegador não recebe URL, credencial, SQL ou detalhe interno. Um SQLite ausente não é criado nem mesmo em development pelo startup normal.
@@ -76,9 +77,9 @@ Os comandos nunca imprimem `DATABASE_URL` ou seus componentes secretos. Erros in
 
 ## Adoção segura de banco existente
 
-`baseline-existing` serve para snapshots existentes sem ledger. A primeira execução, sem confirmação, inspeciona e não escreve. A inspeção exige o contrato completo de versão 1 ou 2: tabelas, colunas esperadas, tipos críticos coerentes com SQLite/PostgreSQL e, para versão 2, os índices relevantes.
+`baseline-existing` serve para snapshots existentes sem ledger. A primeira execução, sem confirmação, inspeciona e não escreve. A inspeção exige o contrato completo de versão 1, 2 ou 3: tabelas, colunas esperadas, tipos críticos coerentes com SQLite/PostgreSQL e índices relevantes.
 
-Schema arbitrário ou evolução parcial de versão 2 é recusado com lista limitada de divergências. Após revisão humana, repetir com `--confirm-compatible-schema` grava apenas os registros de versão compatíveis. O comando não cria tabela funcional, não adiciona coluna/índice e não reinterpreta dados. Um snapshot legado validado é adotado como versão 1 e depois requer `upgrade`; um snapshot atual validado é adotado como versão 2.
+Schema arbitrário ou evolução parcial é recusado com lista limitada de divergências. Após revisão humana, repetir com `--confirm-compatible-schema` grava apenas os registros de versão compatíveis. O comando não cria tabela funcional, não adiciona coluna/índice e não reinterpreta dados. Snapshots completos v1/v2 são adotados na versão correspondente e depois requerem `upgrade`; um snapshot v3 completo é adotado como atual.
 
 Para produção, executar somente após backup, em janela aprovada e primeiro em staging restaurado. Não usar adoção como forma de ignorar diferenças.
 

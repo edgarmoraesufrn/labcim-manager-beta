@@ -62,6 +62,8 @@ python -m streamlit run app.py --server.baseUrlPath= --server.address=127.0.0.1
 
 Abra `http://127.0.0.1:8501/`. `APP_BASE_URL` é opcional enquanto nenhum QR for gerado. O manifesto continua intencionalmente instalável sob `/manager/`; não use o modo raiz para homologar instalação PWA. Para diagnóstico local detalhado, uma invocação explícita pode acrescentar `--client.showErrorDetails=full`; não use essa opção em staging/produção.
 
+Antes de testar login, execute `python -m labcim_manager.db_migrate diagnose-email-identities`. Configure SMTP fictício/local e um `LABCIM_OTP_HASH_SECRET` sem reutilizar segredo real. O OTP nunca é exibido no app; capture mensagens somente no servidor SMTP de teste. Para uploads, o default é 25 MiB por arquivo (`LABCIM_UPLOAD_MAX_BYTES`) e os formatos aceitos estão em `UPLOAD_SECURITY.md`.
+
 ## B. Simulação local sob `/manager/`
 
 Linux/macOS:
@@ -72,6 +74,7 @@ APP_BASE_URL=http://127.0.0.1:8501/manager/ \
 STORAGE_BACKEND=local \
 LOCAL_STORAGE_ROOT=/tmp/labcim-manager-uploads \
 LOCAL_WORK_ROOT=/tmp/labcim-manager-work \
+LABCIM_OTP_HASH_SECRET=<STAGING_ONLY_SECRET> \
 python -m streamlit run app.py
 ```
 
@@ -83,6 +86,7 @@ $env:APP_BASE_URL="http://127.0.0.1:8501/manager/"
 $env:STORAGE_BACKEND="local"
 $env:LOCAL_STORAGE_ROOT="$env:TEMP\labcim-manager-uploads"
 $env:LOCAL_WORK_ROOT="$env:TEMP\labcim-manager-work"
+$env:LABCIM_OTP_HASH_SECRET="staging-only-secret-at-least-32-chars"
 python -m streamlit run app.py
 ```
 

@@ -196,8 +196,8 @@ Nenhum deploy será aprovado apenas porque o backup “rodou”; um restore comp
 
 1. **M1A — fundação reproduzível:** runtime, lock, configuração, storage e subpath preparados no repositório.
 2. **M1B — banco/startup (concluído no repositório):** migrations versionadas, adoção validada, seeds explícitos e startup não mutante.
-3. **Hardening dedicado:** autenticação pública, uploads e revisão de HTML/erros restantes.
-4. **Build reproduzível:** gerar ambiente Linux limpo e SBOM/lista de versões.
+3. **M1C — hardening de autenticação/upload (concluído no repositório):** anti-enumeração, throttling, limites de tentativa, identidade normalizada, allowlists e fronteiras de storage/download.
+4. **Próximo sprint — staging isolado:** gerar build Linux, subir PostgreSQL/storage/SMTP de teste sem dados reais, validar migration v3 e controles M1C atrás do proxy.
 5. **Staging isolado:** PostgreSQL e storage sem dados reais ou com cópia sanitizada.
 6. **Teste `/manager/`:** executar a matriz de `PRODUCTION_READINESS.md` e perfis `member/manager/admin`.
 7. **Ensaio de migração:** em staging autorizado, `status`, adoção/upgrade/verify, backup, carga, reconciliação, restore e rollback.

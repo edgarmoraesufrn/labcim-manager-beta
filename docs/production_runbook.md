@@ -21,7 +21,7 @@ Manter secrets fora do release. Conferir sem imprimir valores:
 - `APP_ENV=production` e `APP_BASE_URL` HTTPS terminando em `/manager/`;
 - `DATABASE_URL` PostgreSQL;
 - `STORAGE_BACKEND=local` com raiz absoluta ou `r2` com credenciais completas, além de `LOCAL_WORK_ROOT` absoluto;
-- cookie secret estável, SMTP, `LABCIM_AUTH_DEBUG_CODES=false` e `TZ=America/Fortaleza`;
+- cookie/OTP HMAC secret estável, SMTP, limites OTP/upload validados e `TZ=America/Fortaleza`;
 - defaults Streamlit versionados: loopback, porta 8501, `manager`, CORS/XSRF, limite 50 MB e erros ocultos.
 
 O contrato e exemplos fictícios ficam em `PRODUCTION_ENV_TEMPLATE.md`. Permissões pretendidas: environment file `0640`, uploads `0750/0640`, `UMask=0027`; validar no host, nunca aplicar `0777`.
@@ -42,18 +42,19 @@ Interpretação:
 - `WARNING`: risco/revisão não conclusiva;
 - `PASS`: invariante efetivamente observado.
 
-Após M1B, migrations e startup não mutante passam nos gates locais. O resultado continua NO-GO pelo uploader genérico sem allowlist, autenticação/hardening e validações institucionais pendentes.
+Após M1C, migrations/startup não mutante, autenticação antiabuso e uploads passam nos gates locais. O resultado continua NO-GO pelas validações institucionais reais pendentes; preflight não equivale a deploy, pentest ou ensaio de restore.
 
 ## 4. Gates de staging
 
 - branch/commit revisados e árvore limpa;
 - migrations versionadas executadas por comando administrativo, não pelo processo web;
-- autenticação pública endurecida;
+- autenticação pública M1C validada novamente com SMTP e proxy reais;
 - banco/storage de staging sem dados reais ou com cópia sanitizada formalmente autorizada;
 - usuário de serviço sem login/privilégios, Streamlit somente em `127.0.0.1:8501`;
 - Nginx `/manager/`, WebSocket, health, limites e TLS revisados;
 - storage escolhido com quota, persistência e política institucional;
-- SMTP autorizado e debug de OTP desativado;
+- SMTP autorizado, segredos OTP e limites validados;
+- `python -m labcim_manager.db_migrate diagnose-email-identities` retorna zero antes de habilitar login/seed/import;
 - backup completo e restore ensaiado antes do cutover.
 
 ## 5. Procedimento administrativo de schema
@@ -88,6 +89,8 @@ Validar health e UI em `/manager/`, assets/PWA sem requests na raiz, WebSocket, 
 ## 7. Falhas e apresentação segura
 
 O usuário deve receber mensagem curta e referência de evento. Usar essa referência no journal; não copiar traceback, connection string, OTP, segredo ou URL assinada para navegador/ticket. `APP_LOG_LEVEL=INFO` é o default. Um operador pode habilitar diagnóstico detalhado somente em desenvolvimento isolado.
+
+Para autenticação e uploads, seguir `AUTHENTICATION_SECURITY.md` e `UPLOAD_SECURITY.md`. Confirmar que Nginx sobrescreve `X-Forwarded-For`/`X-Real-IP`, que os limites do Nginx/Streamlit são coerentes com `LABCIM_UPLOAD_MAX_BYTES` e que banco e anexos são restauráveis como conjunto.
 
 ## 8. Backup, restore e rollback
 
