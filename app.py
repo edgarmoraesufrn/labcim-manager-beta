@@ -61,8 +61,6 @@ from labcim_manager.db import (
     get_latest_attachment_for_entity,
     import_base_xlsx,
     inactivate_supply_lot,
-    init_db,
-    is_operational_database_empty,
     list_attachments,
     list_booking_status_history,
     list_equipment_for_spare_part,
@@ -73,7 +71,6 @@ from labcim_manager.db import (
     list_upcoming_preventive_maintenance,
     log_notification,
     query_df,
-    seed_default_pops,
     set_spare_part_equipment_links,
     table_counts,
     update_corrective_ticket,
@@ -91,6 +88,7 @@ from labcim_manager.db import (
     verify_access_code_record,
 )
 from labcim_manager.errors import configure_logging, safe_exception_message
+from labcim_manager.schema import SchemaCompatibilityError, verify_database_target
 from labcim_manager.storage import (
     LocalStorageBackend,
     R2StorageBackend,
@@ -831,13 +829,6 @@ def _database_fingerprint(database_url: str | None) -> str:
     return f"sqlite:{DB_PATH.as_posix()}"
 
 
-def _base_xlsx_marker() -> str:
-    if not BASE_XLSX.exists():
-        return "missing"
-    stat = BASE_XLSX.stat()
-    return f"{stat.st_mtime_ns}:{stat.st_size}"
-
-
 def _debug_perf_enabled() -> bool:
     value = os.environ.get("LABCIM_DEBUG_PERF")
     try:
@@ -892,25 +883,17 @@ def _render_perf_debug() -> None:
 
 
 @st.cache_resource(show_spinner=False)
-def ensure_database_initialized(
+def ensure_database_compatible(
     db_path: str,
     database_fingerprint: str,
-    base_xlsx_marker: str,
     _database_url_value: str | None = None,
 ) -> dict[str, str]:
-    conn = connect(Path(db_path), database_url=_database_url_value)
-    try:
-        init_db(conn)
-        if BASE_XLSX.exists() and is_operational_database_empty(conn):
-            import_base_xlsx(conn, BASE_XLSX)
-        seed_default_pops(conn)
-        return {
-            "database": database_fingerprint,
-            "base_xlsx": base_xlsx_marker,
-            "initialized_at": datetime.now().isoformat(timespec="seconds"),
-        }
-    finally:
-        conn.close()
+    status = verify_database_target(db_path, _database_url_value)
+    return {
+        "database": database_fingerprint,
+        "schema_version": str(status.current_version),
+        "verified_at": datetime.now().isoformat(timespec="seconds"),
+    }
 
 
 def _connection_is_healthy(conn) -> bool:
@@ -935,11 +918,10 @@ def _close_connection(conn) -> None:
 def get_conn():
     database_url = _database_url()
     fingerprint = _database_fingerprint(database_url)
-    with perf_timer("Inicialização do banco"):
-        ensure_database_initialized(
+    with perf_timer("Verificação do banco"):
+        ensure_database_compatible(
             str(DB_PATH),
             fingerprint,
-            _base_xlsx_marker(),
             _database_url_value=database_url,
         )
 
@@ -949,7 +931,7 @@ def get_conn():
         if conn is not None:
             _close_connection(conn)
         with perf_timer("Conexão com banco"):
-            conn = connect(DB_PATH, database_url=database_url)
+            conn = connect(DB_PATH, database_url=database_url, allow_create=False)
         st.session_state[DB_CONNECTION_KEY] = conn
         st.session_state[DB_CONNECTION_FINGERPRINT_KEY] = fingerprint
     return conn
@@ -968,7 +950,7 @@ def clear_app_caches() -> None:
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def _cached_table_counts(database_fingerprint: str, _database_url_value: str | None = None) -> dict[str, int]:
-    conn = connect(DB_PATH, database_url=_database_url_value)
+    conn = connect(DB_PATH, database_url=_database_url_value, allow_create=False)
     try:
         return table_counts(conn)
     finally:
@@ -986,7 +968,7 @@ def cached_table_counts(conn) -> dict[str, int]:
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def _cached_reference_data(database_fingerprint: str, _database_url_value: str | None = None):
-    conn = connect(DB_PATH, database_url=_database_url_value)
+    conn = connect(DB_PATH, database_url=_database_url_value, allow_create=False)
     try:
         equipment = query_df(conn, "SELECT * FROM equipment ORDER BY active DESC, equipment_code")
         users = query_df(conn, "SELECT * FROM users ORDER BY active DESC, full_name")
@@ -998,7 +980,7 @@ def _cached_reference_data(database_fingerprint: str, _database_url_value: str |
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def _cached_supply_page_data(database_fingerprint: str, _database_url_value: str | None = None):
-    conn = connect(DB_PATH, database_url=_database_url_value)
+    conn = connect(DB_PATH, database_url=_database_url_value, allow_create=False)
     try:
         supplies = query_df(conn, "SELECT * FROM supplies ORDER BY active DESC, supply_name")
         supply_lots = list_supply_lots(conn)
@@ -1016,7 +998,7 @@ def _cached_project_services_data(
     active_only: bool = True,
     _database_url_value: str | None = None,
 ) -> pd.DataFrame:
-    conn = connect(DB_PATH, database_url=_database_url_value)
+    conn = connect(DB_PATH, database_url=_database_url_value, allow_create=False)
     try:
         return list_project_services(conn, active_only=active_only)
     finally:
@@ -6649,7 +6631,7 @@ def _cached_filtered_reports_data(
     data_fingerprint: str,
     _database_url_value: str | None = None,
 ) -> dict[str, pd.DataFrame]:
-    conn = connect(DB_PATH, database_url=_database_url_value)
+    conn = connect(DB_PATH, database_url=_database_url_value, allow_create=False)
     try:
         return _filtered_reports_data(
             conn,
@@ -7686,8 +7668,29 @@ def main():
     configure_logging()
     setup_page()
     _reset_perf_events()
-    with perf_timer("get_conn"):
-        conn = get_conn()
+    try:
+        with perf_timer("get_conn"):
+            conn = get_conn()
+    except (SchemaCompatibilityError, FileNotFoundError):
+        st.error(
+            "O banco de dados não é compatível com esta versão do LabCim Manager. "
+            "Execute o procedimento administrativo de migração documentado."
+        )
+        st.caption("A aplicação foi interrompida sem alterar o schema ou importar dados.")
+        return
+    except Exception as exc:
+        st.error(
+            safe_exception_message(
+                exc,
+                context="verificação do schema no startup",
+                user_message=(
+                    "Não foi possível verificar o banco de dados. "
+                    "Execute o procedimento administrativo de migração documentado."
+                ),
+            )
+        )
+        st.caption("A aplicação foi interrompida sem tentar reparar o banco de dados.")
+        return
     if not is_authenticated():
         with perf_timer("Página: Login"):
             page_login(conn)
