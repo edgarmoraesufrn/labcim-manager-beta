@@ -21,9 +21,9 @@ O foco da v1.0 é organizar a operação diária, reduzir dependência de contro
 
 ## Infraestrutura
 
-O código atual suporta Streamlit, PostgreSQL via `DATABASE_URL`, SQLite local, Cloudflare R2 e armazenamento local de desenvolvimento. A infraestrutura histórica era Streamlit Cloud + Neon + R2.
+O código suporta Streamlit, PostgreSQL via `DATABASE_URL`, SQLite local e escolha explícita de arquivos por `STORAGE_BACKEND=local|r2`. Banco e storage são independentes, inclusive PostgreSQL + filesystem institucional.
 
-A migração institucional para Nginx + Streamlit em `/manager/` + PostgreSQL na UFRN está em preparação. A auditoria M0 classificou o estado atual como **NO-GO para produção** até que os blockers documentados sejam resolvidos e validados em staging. Nenhum deploy UFRN foi executado.
+A fundação M1A declara Python 3.12.13, usa lock com hashes, centraliza URL pública/configuração e prepara Streamlit/PWA/QR para `/manager/`. A migração institucional para Nginx + PostgreSQL UFRN continua **NO-GO** até migrations, startup, autenticação/upload e gates de staging/restore serem resolvidos. Nenhum deploy UFRN foi executado.
 
 ## Documentação
 
@@ -32,6 +32,7 @@ A migração institucional para Nginx + Streamlit em `/manager/` + PostgreSQL na
 - [Plano de migração do banco](docs/DATABASE_MIGRATION_PLAN.md)
 - [Plano de migração de arquivos](docs/FILE_STORAGE_MIGRATION_PLAN.md)
 - [Template de ambiente de produção](docs/PRODUCTION_ENV_TEMPLATE.md)
+- [Guia local e staging simulado](docs/LOCAL_STAGING_GUIDE.md)
 - [Runbook de produção](docs/production_runbook.md)
 - [Pacote de demonstração v1.0 para auditoria](docs/v1_0_audit_demo_package.md)
 - [Release notes v1.0](docs/v1_0_release_notes.md)

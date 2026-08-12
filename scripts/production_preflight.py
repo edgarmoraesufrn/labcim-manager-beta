@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import argparse
 import ast
+from collections import Counter
 from dataclasses import dataclass
 import importlib.metadata
 import importlib.util
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -23,10 +25,21 @@ from urllib.parse import urlsplit
 
 
 EXPECTED_BASE_PATH = "manager"
+EXPECTED_PYTHON = "3.12.13"
 EXPECTED_TIMEZONE = "America/Fortaleza"
-PLACEHOLDER_RE = re.compile(r"<[A-Z][A-Z0-9_ -]*>|CHANGE[_ -]?ME|COLE_AQUI|EXAMPLE\.INVALID", re.IGNORECASE)
+PLACEHOLDER_RE = re.compile(
+    r"<[A-Z][A-Z0-9_ -]*>|CHANGE[_ -]?ME|COLE_AQUI|EXAMPLE\.INVALID",
+    re.IGNORECASE,
+)
 FALSE_VALUES = {"", "0", "false", "no", "nao", "não", "off"}
 TRUE_VALUES = {"1", "true", "yes", "sim", "on"}
+SEVERITY_ORDER = {
+    "CODE BLOCKER": 0,
+    "ENVIRONMENT REQUIRED": 1,
+    "DEPLOYMENT PENDING": 2,
+    "WARNING": 3,
+    "PASS": 4,
+}
 
 
 @dataclass(frozen=True)
@@ -46,21 +59,34 @@ class Report:
     def passed(self, check: str, message: str) -> None:
         self.add("PASS", check, message)
 
-    def warn(self, check: str, message: str) -> None:
-        self.add("WARN", check, message)
+    def warning(self, check: str, message: str) -> None:
+        self.add("WARNING", check, message)
 
-    def blocker(self, check: str, message: str) -> None:
-        self.add("BLOCKER", check, message)
+    def code_blocker(self, check: str, message: str) -> None:
+        self.add("CODE BLOCKER", check, message)
 
-    def render(self) -> tuple[int, int, int]:
-        order = {"BLOCKER": 0, "WARN": 1, "PASS": 2}
-        for finding in sorted(self.findings, key=lambda item: (order[item.severity], item.check)):
-            print(f"[{finding.severity:7}] {finding.check}: {finding.message}")
-        blockers = sum(item.severity == "BLOCKER" for item in self.findings)
-        warnings = sum(item.severity == "WARN" for item in self.findings)
-        passes = sum(item.severity == "PASS" for item in self.findings)
-        print(f"\nSummary: {blockers} blocker(s), {warnings} warning(s), {passes} pass(es).")
-        return blockers, warnings, passes
+    def environment_required(self, check: str, message: str) -> None:
+        self.add("ENVIRONMENT REQUIRED", check, message)
+
+    def deployment_pending(self, check: str, message: str) -> None:
+        self.add("DEPLOYMENT PENDING", check, message)
+
+    def render(self) -> Counter[str]:
+        for finding in sorted(
+            self.findings,
+            key=lambda item: (SEVERITY_ORDER[item.severity], item.check),
+        ):
+            print(f"[{finding.severity:<20}] {finding.check}: {finding.message}")
+        counts: Counter[str] = Counter(item.severity for item in self.findings)
+        print(
+            "\nSummary: "
+            f"{counts['CODE BLOCKER']} code blocker(s), "
+            f"{counts['DEPLOYMENT PENDING']} deployment pending, "
+            f"{counts['ENVIRONMENT REQUIRED']} environment required, "
+            f"{counts['WARNING']} warning(s), "
+            f"{counts['PASS']} pass(es)."
+        )
+        return counts
 
 
 def parse_args() -> argparse.Namespace:
@@ -77,7 +103,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--strict-warnings",
         action="store_true",
-        help="Return exit code 1 when warnings remain and no blockers exist.",
+        help="Return exit code 1 when only warnings remain.",
     )
     return parser.parse_args()
 
@@ -89,10 +115,16 @@ def read_text(path: Path) -> str:
 def load_env_file(path: Path | None, report: Report) -> dict[str, str]:
     values = dict(os.environ)
     if path is None:
-        report.warn("environment.file", "No external environment file was supplied for validation.")
+        report.environment_required(
+            "environment.file",
+            "No external production environment file was supplied for validation.",
+        )
         return values
     if not path.is_file():
-        report.blocker("environment.file", "The supplied environment file does not exist or is not a regular file.")
+        report.environment_required(
+            "environment.file",
+            "The supplied environment file does not exist or is not a regular file.",
+        )
         return values
 
     try:
@@ -103,19 +135,28 @@ def load_env_file(path: Path | None, report: Report) -> dict[str, str]:
             if line.startswith("export "):
                 line = line[7:].lstrip()
             if "=" not in line:
-                report.warn("environment.file", f"Ignored malformed entry at line {line_number}; no value was printed.")
+                report.warning(
+                    "environment.file",
+                    f"Ignored malformed entry at line {line_number}; no value was printed.",
+                )
                 continue
             key, value = line.split("=", 1)
             key = key.strip()
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
-                report.warn("environment.file", f"Ignored invalid variable name at line {line_number}.")
+                report.warning(
+                    "environment.file",
+                    f"Ignored invalid variable name at line {line_number}.",
+                )
                 continue
             value = value.strip()
             if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
                 value = value[1:-1]
             values[key] = value
     except (OSError, UnicodeError) as exc:
-        report.blocker("environment.file", f"Could not read the environment file: {type(exc).__name__}.")
+        report.environment_required(
+            "environment.file",
+            f"Could not read the environment file: {type(exc).__name__}.",
+        )
         return values
 
     report.passed("environment.file", "External environment file parsed; values were not displayed.")
@@ -130,7 +171,10 @@ def require_env(env: dict[str, str], report: Report, key: str, purpose: str) -> 
     if is_real_value(env.get(key)):
         report.passed(f"environment.{key}", f"Configured for {purpose}; value withheld.")
     else:
-        report.blocker(f"environment.{key}", f"Missing or placeholder value for {purpose}.")
+        report.environment_required(
+            f"environment.{key}",
+            f"Missing or placeholder value for {purpose}.",
+        )
 
 
 def parse_bool(value: object) -> bool | None:
@@ -147,12 +191,15 @@ def parse_bool(value: object) -> bool | None:
 def load_streamlit_config(repo_root: Path, report: Report) -> dict[str, object]:
     path = repo_root / ".streamlit" / "config.toml"
     if not path.is_file():
-        report.blocker("streamlit.config", ".streamlit/config.toml is missing.")
+        report.code_blocker("streamlit.config", ".streamlit/config.toml is missing.")
         return {}
     try:
         config = tomllib.loads(read_text(path))
     except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
-        report.blocker("streamlit.config", f"Config cannot be parsed: {type(exc).__name__}.")
+        report.code_blocker(
+            "streamlit.config",
+            f"Config cannot be parsed: {type(exc).__name__}.",
+        )
         return {}
     report.passed("streamlit.config", "Project Streamlit configuration parses successfully.")
     return config
@@ -176,54 +223,58 @@ def streamlit_value(
 
 
 def check_streamlit(env: dict[str, str], config: dict[str, object], report: Report) -> None:
-    base_path = streamlit_value(env, config, "SERVER", "baseUrlPath")
-    if str(base_path or "").strip("/ ") == EXPECTED_BASE_PATH:
-        report.passed("streamlit.baseUrlPath", "Configured for /manager/.")
-    else:
-        report.blocker("streamlit.baseUrlPath", "Must resolve to 'manager'.")
-
-    address = str(streamlit_value(env, config, "SERVER", "address") or "").strip().lower()
-    if address == "127.0.0.1":
-        report.passed("streamlit.address", "Bound explicitly to IPv4 loopback.")
-    else:
-        report.blocker("streamlit.address", "Must be explicitly set to 127.0.0.1.")
-
-    port = str(streamlit_value(env, config, "SERVER", "port") or "").strip()
-    if port == "8501":
-        report.passed("streamlit.port", "Expected upstream port is configured.")
-    else:
-        report.blocker("streamlit.port", "Must resolve to the approved upstream port 8501.")
-
-    expected_booleans = {
-        ("SERVER", "headless"): True,
-        ("SERVER", "enableCORS"): True,
-        ("SERVER", "enableXsrfProtection"): True,
+    exact_values = {
+        "baseUrlPath": EXPECTED_BASE_PATH,
+        "address": "127.0.0.1",
+        "port": "8501",
     }
-    for (section, key), expected in expected_booleans.items():
-        actual = parse_bool(streamlit_value(env, config, section, key))
-        check_name = f"streamlit.{key}"
-        if actual is expected:
-            report.passed(check_name, f"Set to {str(expected).lower()}.")
+    for key, expected in exact_values.items():
+        actual = str(streamlit_value(env, config, "SERVER", key) or "").strip("/ ")
+        if actual.lower() == expected.lower():
+            report.passed(f"streamlit.{key}", f"Expected value {expected!r} is configured.")
         else:
-            report.blocker(check_name, f"Must resolve to {str(expected).lower()}.")
+            report.code_blocker(
+                f"streamlit.{key}",
+                f"Must resolve to {expected!r} for the production profile.",
+            )
 
-    error_details = str(streamlit_value(env, config, "CLIENT", "showErrorDetails") or "").strip().lower()
+    for key in ("headless", "enableCORS", "enableXsrfProtection"):
+        if parse_bool(streamlit_value(env, config, "SERVER", key)) is True:
+            report.passed(f"streamlit.{key}", "Set to true.")
+        else:
+            report.code_blocker(f"streamlit.{key}", "Must resolve to true.")
+
+    error_details = str(
+        streamlit_value(env, config, "CLIENT", "showErrorDetails") or ""
+    ).strip().lower()
     if error_details == "none":
         report.passed("streamlit.showErrorDetails", "Browser error details are disabled.")
     else:
-        report.blocker("streamlit.showErrorDetails", "Must resolve to 'none' in production.")
+        report.code_blocker(
+            "streamlit.showErrorDetails",
+            "Must resolve to 'none' in the production profile.",
+        )
 
     for key in ("maxUploadSize", "maxMessageSize"):
         raw_value = streamlit_value(env, config, "SERVER", key)
         try:
             size_mb = int(str(raw_value))
         except (TypeError, ValueError):
-            report.blocker(f"streamlit.{key}", "Must be explicitly configured as an integer number of MB.")
+            report.code_blocker(
+                f"streamlit.{key}",
+                "Must be explicitly configured as an integer number of MB.",
+            )
             continue
-        if not 1 <= size_mb <= 100:
-            report.blocker(f"streamlit.{key}", "Must be between 1 and the M0 ceiling of 100 MB, pending policy approval.")
+        if 1 <= size_mb <= 100:
+            report.passed(
+                f"streamlit.{key}",
+                "Explicit bounded value is configured; value withheld.",
+            )
         else:
-            report.passed(f"streamlit.{key}", "Explicit bounded value is configured; value withheld.")
+            report.code_blocker(
+                f"streamlit.{key}",
+                "Must be between 1 and the M0 ceiling of 100 MB, pending policy approval.",
+            )
 
     require_env(env, report, "STREAMLIT_SERVER_COOKIE_SECRET", "stable Streamlit cookie signing")
 
@@ -231,24 +282,75 @@ def check_streamlit(env: dict[str, str], config: dict[str, object], report: Repo
 def check_database_environment(env: dict[str, str], report: Report) -> None:
     database_url = env.get("DATABASE_URL")
     if not is_real_value(database_url):
-        report.blocker("database.url", "DATABASE_URL is missing or a placeholder; the app would fall back to SQLite.")
+        report.environment_required(
+            "database.url",
+            "DATABASE_URL is missing or a placeholder; production would fall back to SQLite.",
+        )
         return
     try:
         parsed = urlsplit(database_url)
     except ValueError:
-        report.blocker("database.url", "DATABASE_URL is malformed; value withheld.")
+        report.environment_required("database.url", "DATABASE_URL is malformed; value withheld.")
         return
     if parsed.scheme not in {"postgres", "postgresql"}:
-        report.blocker("database.url", "DATABASE_URL must use PostgreSQL, not SQLite or another scheme.")
+        report.environment_required(
+            "database.url",
+            "DATABASE_URL must use PostgreSQL in production.",
+        )
     elif not parsed.hostname or not parsed.path.strip("/") or not parsed.username:
-        report.blocker("database.url", "PostgreSQL URL lacks host/socket target, database name or user.")
+        report.environment_required(
+            "database.url",
+            "PostgreSQL URL lacks host, database name or user; value withheld.",
+        )
     else:
-        report.passed("database.url", "PostgreSQL URL structure is valid; credentials and host were withheld.")
+        report.passed(
+            "database.url",
+            "PostgreSQL URL structure is valid; credentials and host were withheld.",
+        )
 
 
-def check_environment(env: dict[str, str], repo_root: Path, report: Report) -> None:
+def check_application_environment(env: dict[str, str], repo_root: Path, report: Report) -> None:
+    app_env = str(env.get("APP_ENV") or "").strip().lower()
+    if app_env == "production":
+        report.passed("environment.APP_ENV", "Production mode is explicitly selected.")
+    else:
+        report.environment_required(
+            "environment.APP_ENV",
+            "APP_ENV must be explicitly set to production for production validation.",
+        )
+
+    app_base_url = env.get("APP_BASE_URL")
+    try:
+        parsed_base_url = urlsplit(app_base_url or "")
+    except ValueError:
+        parsed_base_url = urlsplit("")
+    hostname = (parsed_base_url.hostname or "").lower()
+    private_target = hostname == "localhost" or hostname.endswith(".localhost")
+    try:
+        private_target = private_target or ipaddress.ip_address(hostname).is_private
+    except ValueError:
+        pass
+    if (
+        is_real_value(app_base_url)
+        and parsed_base_url.scheme == "https"
+        and hostname
+        and not private_target
+        and parsed_base_url.path.rstrip("/") == "/manager"
+        and not parsed_base_url.query
+        and not parsed_base_url.fragment
+        and not parsed_base_url.username
+    ):
+        report.passed(
+            "environment.APP_BASE_URL",
+            "HTTPS public application URL targets /manager/; host withheld.",
+        )
+    else:
+        report.environment_required(
+            "environment.APP_BASE_URL",
+            "APP_BASE_URL must be a credential-free HTTPS URL ending in /manager/.",
+        )
+
     check_database_environment(env, report)
-
     for key, purpose in (
         ("LABCIM_SMTP_HOST", "SMTP host"),
         ("LABCIM_SMTP_PORT", "SMTP port"),
@@ -259,24 +361,78 @@ def check_environment(env: dict[str, str], repo_root: Path, report: Report) -> N
     ):
         require_env(env, report, key, purpose)
 
-    debug_codes = parse_bool(env.get("LABCIM_AUTH_DEBUG_CODES"))
-    if "LABCIM_AUTH_DEBUG_CODES" in env and debug_codes is False:
+    if parse_bool(env.get("LABCIM_AUTH_DEBUG_CODES")) is False and "LABCIM_AUTH_DEBUG_CODES" in env:
         report.passed("authentication.debug_codes", "Debug-code display is explicitly disabled.")
     else:
-        report.blocker("authentication.debug_codes", "LABCIM_AUTH_DEBUG_CODES must be explicitly false.")
+        report.environment_required(
+            "authentication.debug_codes",
+            "LABCIM_AUTH_DEBUG_CODES must be explicitly false.",
+        )
 
     if env.get("TZ") == EXPECTED_TIMEZONE:
         report.passed("process.timezone", f"Timezone is explicitly {EXPECTED_TIMEZONE}.")
     else:
-        report.blocker("process.timezone", f"TZ must be {EXPECTED_TIMEZONE} while timestamps remain naive text.")
+        report.environment_required(
+            "process.timezone",
+            f"TZ must be {EXPECTED_TIMEZONE} while timestamps remain naive text.",
+        )
+
+    log_level = str(env.get("APP_LOG_LEVEL") or "INFO").strip().upper()
+    if log_level in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+        report.passed("environment.APP_LOG_LEVEL", f"Application log level resolves to {log_level}.")
+    else:
+        report.environment_required(
+            "environment.APP_LOG_LEVEL",
+            "APP_LOG_LEVEL must be a standard Python logging level.",
+        )
+
+    work_root = str(env.get("LOCAL_WORK_ROOT") or "").strip()
+    if work_root and Path(work_root).is_absolute():
+        report.passed(
+            "filesystem.work_root",
+            "An absolute writable work root is configured; value withheld.",
+        )
+    else:
+        report.environment_required(
+            "filesystem.work_root",
+            "LOCAL_WORK_ROOT must be an absolute path in production.",
+        )
+
+    backend = str(env.get("STORAGE_BACKEND") or "").strip().lower()
+    if backend not in {"local", "r2"}:
+        report.environment_required(
+            "storage.backend",
+            "STORAGE_BACKEND must explicitly select local or r2.",
+        )
+    elif backend == "local":
+        report.passed("storage.backend", "Local file storage is explicitly selected.")
+        root = str(env.get("LOCAL_STORAGE_ROOT") or "").strip()
+        if root and Path(root).is_absolute():
+            report.passed(
+                "storage.local_root",
+                "An absolute institutional storage root is configured; value withheld.",
+            )
+        else:
+            report.environment_required(
+                "storage.local_root",
+                "LOCAL_STORAGE_ROOT must be an absolute path for production local storage.",
+            )
+    else:
+        report.passed("storage.backend", "R2 object storage is explicitly selected.")
+        for key in ("R2_ENDPOINT_URL", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET"):
+            require_env(env, report, key, "the explicitly selected R2 backend")
 
     storage_source = read_text(repo_root / "labcim_manager" / "storage.py")
-    current_code_forces_r2 = "if database_url or database_url_configured()" in storage_source
-    if current_code_forces_r2:
-        for key in ("R2_ENDPOINT_URL", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET"):
-            require_env(env, report, key, "R2 required by the current PostgreSQL upload path")
+    if "del database_url" in storage_source and "selected_storage_backend()" in storage_source:
+        report.passed(
+            "storage.database_independence",
+            "File backend selection is explicit and independent from DATABASE_URL.",
+        )
     else:
-        report.warn("storage.contract", "Current code no longer matches the M0 R2-only production rule; review this checker for the selected backend.")
+        report.code_blocker(
+            "storage.database_independence",
+            "Storage selection still appears coupled to database configuration.",
+        )
 
 
 def check_manifest(repo_root: Path, report: Report) -> None:
@@ -284,13 +440,25 @@ def check_manifest(repo_root: Path, report: Report) -> None:
     try:
         manifest = json.loads(read_text(path))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        report.blocker("subpath.manifest", f"PWA manifest cannot be read: {type(exc).__name__}.")
+        report.code_blocker(
+            "subpath.manifest",
+            f"PWA manifest cannot be read: {type(exc).__name__}.",
+        )
         return
     for key in ("start_url", "scope"):
         if manifest.get(key) == "/manager/":
             report.passed(f"subpath.manifest.{key}", "PWA value is scoped to /manager/.")
         else:
-            report.blocker(f"subpath.manifest.{key}", "Must be exactly /manager/.")
+            report.code_blocker(f"subpath.manifest.{key}", "Must be exactly /manager/.")
+    icons = manifest.get("icons")
+    if isinstance(icons, list) and icons and all(
+        isinstance(icon, dict)
+        and str(icon.get("src") or "").startswith("/manager/app/static/")
+        for icon in icons
+    ):
+        report.passed("subpath.manifest.icons", "PWA icons are scoped beneath /manager/.")
+    else:
+        report.code_blocker("subpath.manifest.icons", "PWA icon paths must remain under /manager/.")
 
 
 def function_source(path: Path, function_name: str) -> str:
@@ -306,77 +474,208 @@ def function_source(path: Path, function_name: str) -> str:
 def check_source_gates(repo_root: Path, report: Report) -> None:
     app_path = repo_root / "app.py"
     app_source = read_text(app_path)
+    database_source = read_text(repo_root / "labcim_manager" / "db.py")
     init_source = function_source(app_path, "ensure_database_initialized")
-    if "init_db(" in init_source or "import_base_xlsx(" in init_source or "seed_default_pops(" in init_source:
-        report.blocker("database.startup_mutation", "Startup still invokes schema/data initialization or seeding.")
+    if any(token in init_source for token in ("init_db(", "import_base_xlsx(", "seed_default_pops(")):
+        report.code_blocker(
+            "database.startup_mutation",
+            "Startup still invokes schema/data initialization or seeding.",
+        )
     else:
-        report.passed("database.startup_mutation", "No known schema/data mutation call remains in startup initialization.")
+        report.passed(
+            "database.startup_mutation",
+            "No known schema/data mutation call remains in startup initialization.",
+        )
 
     if "https://labcim-manager.streamlit.app" in app_source:
-        report.blocker("subpath.qr_default", "The legacy Streamlit Cloud URL remains in QR generation.")
+        report.code_blocker(
+            "subpath.qr_default",
+            "The legacy Streamlit Cloud URL remains in QR generation.",
+        )
+    elif "get_public_app_url(required=True)" in app_source:
+        report.passed(
+            "subpath.qr_default",
+            "QR generation requires the centrally validated public application URL.",
+        )
     else:
-        report.passed("subpath.qr_default", "Legacy Streamlit Cloud QR default is absent.")
+        report.code_blocker(
+            "subpath.qr_default",
+            "QR generation does not visibly enforce central public URL configuration.",
+        )
 
-    unrestricted_equipment_upload = re.search(
-        r"file_uploader\(\s*[\"']Arquivo[\"']\s*,\s*key=",
-        app_source,
-    )
-    if unrestricted_equipment_upload:
-        report.blocker("uploads.equipment_allowlist", "Equipment document uploader still has no explicit type allowlist.")
+    if re.search(r"file_uploader\(\s*[\"']Arquivo[\"']\s*,\s*key=", app_source):
+        report.code_blocker(
+            "uploads.equipment_allowlist",
+            "Equipment document uploader still has no explicit type allowlist.",
+        )
     else:
-        report.passed("uploads.equipment_allowlist", "Known unrestricted equipment uploader pattern is absent.")
+        report.passed(
+            "uploads.equipment_allowlist",
+            "Known unrestricted equipment uploader pattern is absent.",
+        )
+
+    legacy_error_patterns = (
+        'st.error(f"Erro na importação: {exc}")',
+        'st.warning(f"Não foi possível abrir o anexo persistido: {exc}")',
+        "return False, str(exc)",
+        'f"Erro ao atualizar status da reserva: {exc}"',
+        'f"Erro ao registrar reserva: {exc}"',
+        'f"Erro ao atualizar equipamento: {exc}"',
+    )
+    error_source = app_source + "\n" + database_source
+    if any(pattern in error_source for pattern in legacy_error_patterns):
+        report.code_blocker(
+            "errors.touched_paths",
+            "A raw exception remains exposed in an M1A-touched browser path.",
+        )
+    elif error_source.count("safe_exception_message(") >= 6:
+        report.passed(
+            "errors.touched_paths",
+            "M1A-touched failure paths log diagnostics and show opaque references.",
+        )
+    else:
+        report.code_blocker(
+            "errors.touched_paths",
+            "The production-safe error helper is not applied to all M1A-touched paths.",
+        )
+
+    path_patterns = (
+        "Path.cwd()",
+        "os.getcwd()",
+        'Path("data/',
+        "Path('data/",
+        'Path("assets/',
+        "Path('assets/",
+    )
+    if any(pattern in app_source for pattern in path_patterns):
+        report.code_blocker(
+            "filesystem.cwd_independence",
+            "Application entrypoint still contains a known CWD-dependent owned path.",
+        )
+    else:
+        report.passed(
+            "filesystem.cwd_independence",
+            "Known application-owned paths resolve independently from process CWD.",
+        )
 
     unsafe_blocks = app_source.count("unsafe_allow_html=True")
     if unsafe_blocks:
-        report.warn("security.unsafe_html", f"{unsafe_blocks} unsafe HTML rendering call(s) require manual escaping review.")
+        report.warning(
+            "security.unsafe_html",
+            f"{unsafe_blocks} unsafe HTML rendering call(s) require manual escaping review.",
+        )
     else:
         report.passed("security.unsafe_html", "No unsafe HTML rendering calls found.")
 
 
 def check_migrations(repo_root: Path, report: Report) -> None:
     candidates = (repo_root / "migrations", repo_root / "alembic")
-    has_migrations = any(path.is_dir() and any(item.is_file() for item in path.rglob("*")) for path in candidates)
+    has_migrations = any(
+        path.is_dir() and any(item.is_file() for item in path.rglob("*"))
+        for path in candidates
+    )
     has_config = (repo_root / "alembic.ini").is_file()
     if has_migrations or has_config:
-        report.passed("database.migrations", "A migration artifact exists; content still requires release review.")
+        report.passed(
+            "database.migrations",
+            "A migration artifact exists; content still requires release review.",
+        )
     else:
-        report.blocker("database.migrations", "No versioned database migration artifacts were found.")
+        report.code_blocker(
+            "database.migrations",
+            "No versioned database migration artifacts were found.",
+        )
 
 
 def check_runtime(repo_root: Path, report: Report) -> None:
-    if sys.version_info >= (3, 10):
-        report.passed("runtime.python_current", "Current interpreter can parse the project's Python syntax.")
+    version_path = repo_root / ".python-version"
+    try:
+        declared_version = read_text(version_path).strip()
+    except (OSError, UnicodeError):
+        declared_version = ""
+    if declared_version == EXPECTED_PYTHON:
+        report.passed(
+            "runtime.python_declared",
+            f"Repository declares the reviewed Python {EXPECTED_PYTHON} runtime.",
+        )
     else:
-        report.blocker("runtime.python_current", "Python 3.10 or newer is required by current syntax.")
+        report.code_blocker(
+            "runtime.python_declared",
+            f".python-version must declare the reviewed runtime {EXPECTED_PYTHON}.",
+        )
 
-    version_files = (repo_root / ".python-version", repo_root / "runtime.txt")
-    if any(path.is_file() and read_text(path).strip() for path in version_files):
-        report.passed("runtime.python_declared", "Repository declares a Python runtime version.")
+    current_version = ".".join(str(part) for part in sys.version_info[:3])
+    if current_version == EXPECTED_PYTHON:
+        report.passed("runtime.python_current", "Preflight runs under the declared Python runtime.")
     else:
-        report.blocker("runtime.python_declared", "Repository does not declare the production Python version.")
+        report.environment_required(
+            "runtime.python_current",
+            f"Run preflight with Python {EXPECTED_PYTHON}; current interpreter is {current_version}.",
+        )
 
     requirements_path = repo_root / "requirements.txt"
-    raw_requirement_lines: list[str] = []
+    input_path = repo_root / "requirements.in"
+    lock_path = repo_root / "requirements.lock"
     try:
-        raw_requirement_lines = read_text(requirements_path).splitlines()
-        requirement_lines = [
+        install_lines = [
             line.strip()
-            for line in raw_requirement_lines
-            if line.strip() and not line.lstrip().startswith("#") and not line.lstrip().startswith("--hash")
+            for line in read_text(requirements_path).splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
         ]
-    except (OSError, UnicodeError) as exc:
-        report.blocker("runtime.dependencies", f"requirements.txt cannot be read: {type(exc).__name__}.")
-        requirement_lines = []
+    except (OSError, UnicodeError):
+        install_lines = []
+    if "--require-hashes" in install_lines and "-r requirements.lock" in install_lines:
+        report.passed(
+            "runtime.install_contract",
+            "Production install delegates to the fully resolved hash-locked graph.",
+        )
+    else:
+        report.code_blocker(
+            "runtime.install_contract",
+            "requirements.txt must enforce hashes and include requirements.lock.",
+        )
 
-    non_exact = [line for line in requirement_lines if "==" not in line]
-    if requirement_lines and not non_exact:
-        report.passed("runtime.dependencies", "All top-level requirements are exactly pinned.")
+    try:
+        source_lines = [
+            line.strip()
+            for line in read_text(input_path).splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+    except (OSError, UnicodeError):
+        source_lines = []
+    required_names = {"streamlit", "pandas", "plotly", "qrcode", "openpyxl", "psycopg", "boto3"}
+    source_names = {
+        re.split(r"\[|==", line, maxsplit=1)[0].lower().replace("_", "-")
+        for line in source_lines
+        if "==" in line
+    }
+    if source_lines and all("==" in line for line in source_lines) and required_names <= source_names:
+        report.passed(
+            "runtime.direct_dependencies",
+            "All reviewed direct runtime dependencies are explicitly and exactly pinned.",
+        )
     else:
-        report.blocker("runtime.dependencies", "Dependencies are absent or not all exactly pinned; use a reviewed lock with hashes.")
-    if requirement_lines and any("--hash=" in line for line in raw_requirement_lines):
-        report.passed("runtime.dependency_hashes", "Requirement hashes are present.")
+        report.code_blocker(
+            "runtime.direct_dependencies",
+            "requirements.in must exactly pin every reviewed direct runtime dependency.",
+        )
+
+    try:
+        lock_source = read_text(lock_path)
+    except (OSError, UnicodeError):
+        lock_source = ""
+    package_count = len(re.findall(r"(?m)^[A-Za-z0-9_.-]+(?:\[[^]]+\])?==[^\s\\]+", lock_source))
+    hash_count = lock_source.count("--hash=sha256:")
+    if package_count and hash_count >= package_count and "# This file is autogenerated by pip-compile" in lock_source:
+        report.passed(
+            "runtime.dependency_lock",
+            f"Resolved lock contains {package_count} package record(s) protected by hashes.",
+        )
     else:
-        report.warn("runtime.dependency_hashes", "No requirement hashes were found.")
+        report.code_blocker(
+            "runtime.dependency_lock",
+            "requirements.lock is absent, incomplete, or lacks hashes.",
+        )
 
     modules = {
         "streamlit": "streamlit",
@@ -389,22 +688,36 @@ def check_runtime(repo_root: Path, report: Report) -> None:
     }
     for distribution, module in modules.items():
         if importlib.util.find_spec(module) is None:
-            report.blocker(f"runtime.import.{module}", "Required module is not importable in the current environment.")
+            report.environment_required(
+                f"runtime.import.{module}",
+                "Required module is not importable in the current environment; install the lock.",
+            )
             continue
         try:
             importlib.metadata.version(distribution)
         except importlib.metadata.PackageNotFoundError:
-            report.warn(f"runtime.import.{module}", "Module imports but package metadata is unavailable.")
+            report.warning(
+                f"runtime.import.{module}",
+                "Module imports but package metadata is unavailable.",
+            )
         else:
-            report.passed(f"runtime.import.{module}", "Required module and package metadata are available.")
+            report.passed(
+                f"runtime.import.{module}",
+                "Required module and package metadata are available.",
+            )
 
 
 def check_required_files(repo_root: Path, report: Report) -> None:
     required = (
         "app.py",
+        ".python-version",
+        "requirements.in",
         "requirements.txt",
+        "requirements.lock",
         ".streamlit/config.toml",
+        "labcim_manager/config.py",
         "labcim_manager/db.py",
+        "labcim_manager/errors.py",
         "labcim_manager/storage.py",
         "static/manifest.json",
         "docs/PRODUCTION_READINESS.md",
@@ -412,16 +725,34 @@ def check_required_files(repo_root: Path, report: Report) -> None:
         "docs/DATABASE_MIGRATION_PLAN.md",
         "docs/FILE_STORAGE_MIGRATION_PLAN.md",
         "docs/PRODUCTION_ENV_TEMPLATE.md",
+        "docs/LOCAL_STAGING_GUIDE.md",
     )
     missing = [relative for relative in required if not (repo_root / relative).is_file()]
     if missing:
-        report.blocker("repository.required_files", f"Missing {len(missing)} required file(s); names intentionally omitted from compact output.")
+        report.code_blocker(
+            "repository.required_files",
+            f"Missing {len(missing)} required foundation file(s): {', '.join(missing)}.",
+        )
     else:
-        report.passed("repository.required_files", "All required M0 files are present.")
+        report.passed("repository.required_files", "All required M1A foundation files are present.")
 
     for secret_path in (repo_root / ".streamlit" / "secrets.toml", repo_root / ".env"):
         if secret_path.exists():
-            report.warn("repository.local_secrets", "A local secret-bearing file exists; verify it is untracked and permission-restricted.")
+            report.warning(
+                "repository.local_secrets",
+                "A local secret-bearing file exists; verify it is untracked and permission-restricted.",
+            )
+
+
+def check_deployment_boundaries(report: Report) -> None:
+    for check, message in (
+        ("deployment.nginx", "Real Nginx routing, TLS and WebSocket forwarding require UFRN deployment validation."),
+        ("deployment.systemd", "The real systemd unit, service user and filesystem permissions require UFRN validation."),
+        ("deployment.postgresql", "UFRN PostgreSQL connectivity and target schema compatibility have not been tested."),
+        ("deployment.backup_restore", "A backup and restore drill remains required before production."),
+        ("deployment.manager_browser", "Browser/PWA behavior behind the real /manager/ reverse proxy remains to be validated."),
+    ):
+        report.deployment_pending(check, message)
 
 
 def main() -> int:
@@ -429,23 +760,26 @@ def main() -> int:
     report = Report()
     repo_root = args.repo_root.resolve()
     if not repo_root.is_dir():
-        print("[BLOCKER] repository.root: Repository root is not a directory.")
+        print("[CODE BLOCKER        ] repository.root: Repository root is not a directory.")
         return 2
 
     env = load_env_file(args.env_file, report)
     check_required_files(repo_root, report)
     config = load_streamlit_config(repo_root, report)
     check_streamlit(env, config, report)
-    check_environment(env, repo_root, report)
+    check_application_environment(env, repo_root, report)
     check_manifest(repo_root, report)
     check_source_gates(repo_root, report)
     check_migrations(repo_root, report)
     check_runtime(repo_root, report)
+    check_deployment_boundaries(report)
 
-    blockers, warnings, _ = report.render()
-    if blockers:
+    counts = report.render()
+    if counts["CODE BLOCKER"]:
         return 2
-    if warnings and args.strict_warnings:
+    if counts["ENVIRONMENT REQUIRED"] or counts["DEPLOYMENT PENDING"]:
+        return 1
+    if counts["WARNING"] and args.strict_warnings:
         return 1
     return 0
 

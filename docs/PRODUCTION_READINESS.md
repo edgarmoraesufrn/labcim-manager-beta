@@ -1,12 +1,36 @@
-# LabCim Manager — prontidão para produção UFRN (Sprint M0)
+# LabCim Manager — prontidão para produção UFRN (M0 + fundação M1A)
 
 Data do levantamento: 2026-08-11
 
 Escopo: auditoria estática e validação local não destrutiva
 
-Decisão M0: **NO-GO para produção**
+Decisão atual: **NO-GO para produção**
 
 Esta decisão não significa que os fluxos funcionais do LabCim Manager devam ser refeitos. Ela significa que o estado atual ainda não oferece uma migração controlada, reproduzível, segura e testada para a infraestrutura institucional da UFRN.
+
+## Atualização M1A — 2026-08-12
+
+O snapshot histórico abaixo registra o que o M0 encontrou em `1ffe702`. A fundação M1A, iniciada em `a5d1b5a`, alterou as seguintes conclusões de código sem executar deploy:
+
+- runtime declarado como Python 3.12.13 e dependências diretas/transitivas fixadas com hashes;
+- configuração explícita por `APP_ENV`, `APP_BASE_URL`, `STORAGE_BACKEND` e `LOCAL_STORAGE_ROOT`;
+- banco e storage desacoplados: SQLite + local, PostgreSQL + local e PostgreSQL + R2 são combinações aceitas;
+- caminhos de dados/assets ancorados na raiz do projeto em vez do CWD;
+- `baseUrlPath=manager`, manifesto/ícones sob `/manager/` e QR sem domínio histórico;
+- URLs públicas de produção validadas como HTTPS e exatamente `/manager/`;
+- detalhes do Streamlit ocultos no navegador e helper de erro com referência opaca aplicado aos fluxos tocados;
+- testes unitários adicionados para configuração, storage, URLs/PWA/QR, caminhos e erros;
+- preflight agora separa `CODE BLOCKER`, `ENVIRONMENT REQUIRED`, `DEPLOYMENT PENDING`, `WARNING` e `PASS`.
+
+As resoluções de M0-B03 e da parte controlada pela aplicação em M0-B04/M0-B07 são estruturais, mas dependem de staging. M0-B06 foi apenas parcialmente mitigado: o uploader genérico de equipamento ainda exige política/allowlist, e a revisão ampla de HTML permanece pendente.
+
+Os `CODE BLOCKER` intencionalmente remanescentes após M1A são:
+
+1. migrações/versionamento de schema ausentes;
+2. startup ainda executa DDL, importação e seed;
+3. uploader genérico de equipamento sem allowlist explícita.
+
+Autenticação pública continua **NO-GO** até o sprint dedicado. Nginx, systemd, PostgreSQL UFRN, proxy/browser em `/manager/` e restore continuam `DEPLOYMENT PENDING`, não falhas falsamente atribuídas ao repositório.
 
 ## 1. Snapshot auditado
 
@@ -196,7 +220,7 @@ O Streamlit documenta `server.baseUrlPath`, CORS/XSRF e configuração por vari�
 | Smoke efêmero SQLite | PASS: schema, import da planilha seed, usuário, reserva, insumo/movimento e contagens |
 | Smoke efêmero de autenticação | PASS: criação, expiração futura, verificação e uso único do registro OTP |
 | Smoke efêmero de storage local | PASS: escrita/leitura em diretório temporário e bloqueio de traversal |
-| Preflight no estado atual | NO-GO esperado, exit `2`: 36 blockers, 3 warnings, 5 passes |
+| Preflight no estado M0 | NO-GO esperado, exit `2`: 36 blockers, 3 warnings, 5 passes |
 | Preflight com ambiente fictício completo | Configuração reconhecida; blockers de código/release permaneceram |
 | Teste de não divulgação do preflight | PASS: sentinelas de senha/chave não apareceram na saída |
 | AST/TOML/JSON/UTF-8/links Markdown | PASS em 26 arquivos de texto auditados |
@@ -214,6 +238,6 @@ O suporte PostgreSQL é real, mas **parcialmente pronto para produção**: opera
 
 O armazenamento é real, mas **não atende ainda à arquitetura local proposta** sem manter R2. A autenticação é funcional para beta controlado, mas **não deve ser exposta publicamente** antes dos controles de abuso e unicidade de identidade.
 
-Próxima sprint recomendada: **M1 — hardening mínimo e staging reproduzível**, limitada aos critérios dos blockers, seguida por ensaio de migração/restore. Não iniciar deploy de produção enquanto o preflight retornar `BLOCKER`.
+Próxima sprint recomendada após a fundação M1A: **M1B — migrações versionadas e startup não mutante**, seguida pelo hardening dedicado de autenticação/upload e por staging/restore controlados. Não iniciar deploy de produção enquanto o preflight retornar `CODE BLOCKER`.
 
 Nenhuma conexão com a VM UFRN, alteração de infraestrutura, migração de dados ou modificação de banco de produção foi realizada neste M0.

@@ -1,55 +1,86 @@
-# LabCim Manager — template de ambiente de produção
+# LabCim Manager — contrato de ambiente
 
-Somente nomes, finalidade, obrigatoriedade e formatos fictícios são documentados abaixo. Todos os valores sensíveis são placeholders.
+Este documento contém apenas nomes, finalidades e valores fictícios. Segredos reais devem permanecer fora do Git, preferencialmente em um `EnvironmentFile` restrito ao serviço.
 
-## 1. Banco
+## Aplicação, banco e arquivos
 
-| Variável | Obrigatória | Finalidade | Exemplo fictício |
-|---|---:|---|---|
-| `DATABASE_URL` | Sim | conexão PostgreSQL usada pelo app | `postgresql://labcim_app:<DB_PASSWORD>@127.0.0.1:5432/labcim_manager` |
+| Variável | Obrigatoriedade | Finalidade | Exemplo seguro | Ambiente |
+|---|---|---|---|---|
+| `APP_ENV` | Obrigatória em staging/produção | ativa validações explícitas; valores: `development`, `test`, `staging`, `production` | `production` | todos |
+| `APP_BASE_URL` | Obrigatória para QR; obrigatória na produção planejada | URL pública completa do Manager, usada em QR e metadata PWA | `https://manager.example.invalid/manager/` | staging/produção |
+| `DATABASE_URL` | Obrigatória em produção | conexão PostgreSQL; sua presença **não** seleciona storage | `postgresql://labcim_app:<DB_PASSWORD>@127.0.0.1:5432/labcim_manager` | staging/produção |
+| `STORAGE_BACKEND` | Obrigatória em staging/produção | seleção independente: `local` ou `r2` | `local` | todos; default `local` só em development/test |
+| `LOCAL_STORAGE_ROOT` | Obrigatória e absoluta quando `STORAGE_BACKEND=local` em staging/produção | raiz persistente externa ao release | `/var/lib/labcim-manager/uploads` | backend local |
+| `LOCAL_WORK_ROOT` | Obrigatória em staging/produção | diretório gravável para importações e temporários controlados | `/var/lib/labcim-manager/work` | staging/produção |
+| `APP_LOG_LEVEL` | Opcional | nível do logging Python; default `INFO` | `INFO` | todos |
 
-## 2. Streamlit e `/manager/`
+Em produção, `APP_BASE_URL` deve usar HTTPS, não pode apontar para localhost/IP privado e deve terminar exatamente em `/manager/`. Caminhos locais relativos são aceitos somente em development/test e são resolvidos a partir da raiz do projeto, nunca do CWD do processo.
 
-| Variável | Obrigatória | Finalidade | Exemplo fictício |
-|---|---:|---|---|
-| `STREAMLIT_SERVER_ADDRESS` | Sim | impedir exposição direta; somente loopback | `127.0.0.1` |
-| `STREAMLIT_SERVER_PORT` | Sim | porta do upstream Nginx | `8501` |
-| `STREAMLIT_SERVER_HEADLESS` | Sim | execução sem browser/prompt interativo | `true` |
-| `STREAMLIT_SERVER_BASE_URL_PATH` | Sim | publicar sob o prefixo institucional | `manager` |
-| `STREAMLIT_SERVER_ENABLE_CORS` | Sim | manter proteção CORS do Streamlit | `true` |
-| `STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION` | Sim | manter proteção XSRF | `true` |
-| `STREAMLIT_SERVER_COOKIE_SECRET` | Sim | chave de assinatura de cookies; valor estável e aleatório | `<RANDOM_HIGH_ENTROPY_SECRET>` |
-| `STREAMLIT_SERVER_MAX_UPLOAD_SIZE` | Sim | limite global em MB, igual ou menor que o Nginx | `<APPROVED_MB>` |
-| `STREAMLIT_SERVER_MAX_MESSAGE_SIZE` | Sim | limite WebSocket em MB compatível com upload | `<APPROVED_MB>` |
-| `STREAMLIT_CLIENT_SHOW_ERROR_DETAILS` | Sim | impedir traceback/detalhes no navegador | `none` |
-| `STREAMLIT_BROWSER_GATHER_USAGE_STATS` | Recomendável | desabilitar telemetria no ambiente institucional | `false` |
+## R2, somente quando selecionado
 
-## 3. SMTP/autenticação
+| Variável | Obrigatoriedade | Finalidade | Exemplo seguro | Ambiente |
+|---|---|---|---|---|
+| `R2_ENDPOINT_URL` | Obrigatória para `STORAGE_BACKEND=r2` | endpoint S3 compatível | `https://<ACCOUNT_ID>.r2.cloudflarestorage.com` | backend R2 |
+| `R2_ACCESS_KEY_ID` | Obrigatória para R2 | identificador de acesso | `<R2_ACCESS_KEY_ID>` | backend R2 |
+| `R2_SECRET_ACCESS_KEY` | Obrigatória para R2 | chave secreta | `<R2_SECRET_ACCESS_KEY>` | backend R2 |
+| `R2_BUCKET` | Obrigatória para R2 | bucket privado | `labcim-manager-files` | backend R2 |
+| `R2_ACCOUNT_ID` | Opcional | identificação operacional da conta | `<R2_ACCOUNT_ID>` | backend R2 |
 
-| Variável | Obrigatória | Finalidade | Exemplo fictício |
-|---|---:|---|---|
-| `LABCIM_SMTP_HOST` | Sim | host SMTP aprovado | `smtp.example.invalid` |
-| `LABCIM_SMTP_PORT` | Sim | porta SMTP/STARTTLS | `587` |
-| `LABCIM_SMTP_USER` | Sim | conta do serviço | `labcim-manager@example.invalid` |
-| `LABCIM_SMTP_PASSWORD` | Sim | credencial secreta da conta | `<SMTP_PASSWORD>` |
-| `LABCIM_SMTP_FROM` | Sim | remetente visível e autorizado | `LabCim Manager <labcim-manager@example.invalid>` |
-| `LABCIM_SMTP_TLS` | Sim | habilitar STARTTLS | `true` |
-| `LABCIM_AUTH_DEBUG_CODES` | Sim | deve permanecer desabilitado em produção | `false` |
+As variáveis R2 são irrelevantes para `STORAGE_BACKEND=local`. PostgreSQL + local é uma combinação suportada.
 
-## 4. Storage reconhecido atualmente
+## Streamlit e `/manager/`
 
-| Variável | Obrigatória no código M0 | Finalidade | Exemplo fictício |
-|---|---:|---|---|
-| `R2_ENDPOINT_URL` | Sim para upload com PostgreSQL | endpoint S3 do R2 | `https://<ACCOUNT_ID>.r2.cloudflarestorage.com` |
-| `R2_ACCESS_KEY_ID` | Sim para upload com PostgreSQL | identificador de acesso | `<R2_ACCESS_KEY_ID>` |
-| `R2_SECRET_ACCESS_KEY` | Sim para upload com PostgreSQL | chave secreta | `<R2_SECRET_ACCESS_KEY>` |
-| `R2_BUCKET` | Sim para upload com PostgreSQL | bucket privado | `labcim-manager-files` |
-| `R2_ACCOUNT_ID` | Não | conferência/identificação do endpoint | `<R2_ACCOUNT_ID>` |
+Valores não secretos já possuem defaults seguros em `.streamlit/config.toml`. O ambiente do servidor pode fixá-los novamente sem alterar o contrato.
 
-## 5. Processo e diagnóstico
+| Variável | Obrigatoriedade | Finalidade | Exemplo seguro | Ambiente |
+|---|---|---|---|---|
+| `STREAMLIT_SERVER_COOKIE_SECRET` | Obrigatória em produção | assinatura estável de cookies | `<RANDOM_HIGH_ENTROPY_SECRET>` | produção |
+| `STREAMLIT_SERVER_ADDRESS` | Default versionado | escutar apenas em loopback | `127.0.0.1` | staging/produção |
+| `STREAMLIT_SERVER_PORT` | Default versionado | porta do upstream Nginx | `8501` | staging/produção |
+| `STREAMLIT_SERVER_BASE_URL_PATH` | Default versionado | publicar sob `/manager/` | `manager` | staging/produção |
+| `STREAMLIT_SERVER_HEADLESS` | Default versionado | execução não interativa | `true` | staging/produção |
+| `STREAMLIT_SERVER_ENABLE_CORS` | Default versionado | proteção CORS do Streamlit | `true` | todos |
+| `STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION` | Default versionado | proteção XSRF | `true` | todos |
+| `STREAMLIT_SERVER_MAX_UPLOAD_SIZE` | Default versionado | limite global em MB | `50` | todos |
+| `STREAMLIT_SERVER_MAX_MESSAGE_SIZE` | Default versionado | limite WebSocket em MB | `50` | todos |
+| `STREAMLIT_CLIENT_SHOW_ERROR_DETAILS` | Default versionado | omitir detalhes internos no browser | `none` | staging/produção |
+| `STREAMLIT_BROWSER_GATHER_USAGE_STATS` | Default versionado | desabilitar telemetria | `false` | todos |
 
-| Variável | Obrigatória | Finalidade | Exemplo fictício |
-|---|---:|---|---|
-| `TZ` | Sim enquanto timestamps forem ingênuos | manter semântica local consistente | `America/Fortaleza` |
-| `PYTHONUNBUFFERED` | Recomendável | enviar logs imediatamente ao journald | `1` |
-| `LABCIM_DEBUG_PERF` | Não | painel temporário de performance; manter desligado | `false` |
+Desenvolvedores podem sobrescrever apenas `baseUrlPath` e detalhes de erro em uma invocação local, conforme `LOCAL_STAGING_GUIDE.md`.
+
+## SMTP e autenticação existente
+
+| Variável | Obrigatoriedade | Finalidade | Exemplo seguro | Ambiente |
+|---|---|---|---|---|
+| `LABCIM_SMTP_HOST` | Obrigatória para login por e-mail | host SMTP aprovado | `smtp.example.invalid` | staging/produção |
+| `LABCIM_SMTP_PORT` | Obrigatória para SMTP | porta SMTP/STARTTLS | `587` | staging/produção |
+| `LABCIM_SMTP_USER` | Obrigatória para SMTP | conta do serviço | `labcim-manager@example.invalid` | staging/produção |
+| `LABCIM_SMTP_PASSWORD` | Obrigatória para SMTP | credencial secreta | `<SMTP_PASSWORD>` | staging/produção |
+| `LABCIM_SMTP_FROM` | Obrigatória para SMTP | remetente autorizado | `LabCim Manager <labcim-manager@example.invalid>` | staging/produção |
+| `LABCIM_SMTP_TLS` | Obrigatória para SMTP | política STARTTLS | `true` | staging/produção |
+| `LABCIM_AUTH_DEBUG_CODES` | Obrigatória em produção | deve ser explicitamente `false` | `false` | produção |
+
+## Processo e diagnóstico
+
+| Variável | Obrigatoriedade | Finalidade | Exemplo seguro | Ambiente |
+|---|---|---|---|---|
+| `TZ` | Obrigatória enquanto timestamps forem ingênuos | semântica local consistente | `America/Fortaleza` | staging/produção |
+| `PYTHONUNBUFFERED` | Recomendada | entrega imediata de logs ao journald | `1` | staging/produção |
+| `LABCIM_DEBUG_PERF` | Opcional | diagnóstico temporário de performance | `false` | development/staging |
+
+## Exemplo estrutural não utilizável
+
+```dotenv
+APP_ENV=production
+APP_BASE_URL=https://manager.example.invalid/manager/
+DATABASE_URL=postgresql://labcim_app:<DB_PASSWORD>@127.0.0.1:5432/labcim_manager
+STORAGE_BACKEND=local
+LOCAL_STORAGE_ROOT=/var/lib/labcim-manager/uploads
+LOCAL_WORK_ROOT=/var/lib/labcim-manager/work
+APP_LOG_LEVEL=INFO
+STREAMLIT_SERVER_COOKIE_SECRET=<RANDOM_HIGH_ENTROPY_SECRET>
+LABCIM_AUTH_DEBUG_CODES=false
+TZ=America/Fortaleza
+```
+
+O exemplo é deliberadamente inválido por conter placeholders. Não o copie como credencial.

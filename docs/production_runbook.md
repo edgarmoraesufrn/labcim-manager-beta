@@ -1,175 +1,84 @@
-# LabCim Manager — Runbook de Produção
+# LabCim Manager — runbook preliminar de produção UFRN
 
-> **Atenção:** este runbook descreve o ambiente histórico Streamlit Cloud + Neon + R2. Ele não autoriza nem cobre a implantação na VM UFRN. Para a migração institucional, consulte `PRODUCTION_READINESS.md` e `UFRN_DEPLOYMENT_PLAN.md`. O status M0 é **NO-GO**.
+Status: **NO-GO**. Este documento organiza gates futuros; não autoriza deploy, acesso à VM, banco real ou configuração de infraestrutura.
 
-## 1. Objetivo
+## 1. Identidade da release
 
-Este documento é um checklist operacional para liberar e acompanhar o LabCim Manager em produção controlada na versão operacional v1.0. Ele não substitui revisão técnica, mas organiza as conferências mínimas de ambiente, permissões, persistência, backup e recuperação.
+Antes de qualquer staging, registrar commit, branch, Python 3.12.13, checksum de `requirements.lock`, operador, janela e plano de rollback. Criar ambiente limpo e instalar com:
 
-## 2. Secrets obrigatórios
+```bash
+python3.12 -m venv /caminho/isolado/venv
+/caminho/isolado/venv/bin/python -m pip install --upgrade pip
+/caminho/isolado/venv/bin/python -m pip install -r requirements.txt
+```
 
-Configure os secrets no Streamlit Cloud ou como variáveis de ambiente, sem registrar valores reais no repositório:
+Não regenerar o lock no servidor.
 
-- `DATABASE_URL`
-- `R2_ENDPOINT_URL`
-- `R2_ACCESS_KEY_ID`
-- `R2_SECRET_ACCESS_KEY`
-- `R2_BUCKET`
-- `smtp_host` ou `[email].smtp_host` ou `LABCIM_SMTP_HOST`
-- `smtp_port` ou `[email].smtp_port` ou `LABCIM_SMTP_PORT`
-- `smtp_user` ou `[email].smtp_user` ou `LABCIM_SMTP_USER`
-- `smtp_password` ou `[email].smtp_password` ou `LABCIM_SMTP_PASSWORD`
-- `smtp_from` ou `[email].smtp_from` ou `LABCIM_SMTP_FROM`
-- `smtp_tls` ou `[email].smtp_tls` ou `LABCIM_SMTP_TLS`
+## 2. Configuração e secrets
 
-## 3. Flags opcionais
+Manter secrets fora do release. Conferir sem imprimir valores:
 
-- `LABCIM_DEBUG_PERF`: ativa painel técnico de performance para diagnóstico controlado.
-- `R2_ACCOUNT_ID`: opcional, útil para conferir o endpoint R2.
+- `APP_ENV=production` e `APP_BASE_URL` HTTPS terminando em `/manager/`;
+- `DATABASE_URL` PostgreSQL;
+- `STORAGE_BACKEND=local` com raiz absoluta ou `r2` com credenciais completas, além de `LOCAL_WORK_ROOT` absoluto;
+- cookie secret estável, SMTP, `LABCIM_AUTH_DEBUG_CODES=false` e `TZ=America/Fortaleza`;
+- defaults Streamlit versionados: loopback, porta 8501, `manager`, CORS/XSRF, limite 50 MB e erros ocultos.
 
-## 4. Flags proibidas/perigosas em produção
+O contrato e exemplos fictícios ficam em `PRODUCTION_ENV_TEMPLATE.md`. Permissões pretendidas: environment file `0640`, uploads `0750/0640`, `UMask=0027`; validar no host, nunca aplicar `0777`.
 
-- `LABCIM_AUTH_DEBUG_CODES=true` não deve estar ativo em produção. Essa flag permite exibir código de acesso volátil quando SMTP falha ou em diagnóstico, portanto deve ficar ausente ou `false`.
+## 3. Preflight
 
-## 5. Checklist antes de liberar
+Executar de forma offline antes de qualquer conexão externa:
 
-- `DATABASE_URL` configurado para PostgreSQL/Neon.
-- R2 configurado com bucket privado.
-- SMTP funcionando com senha de app ou credencial apropriada.
-- `LABCIM_AUTH_DEBUG_CODES` ausente ou `false`.
-- Login testado.
-- Perfil `member` testado.
-- Perfil `manager` testado.
-- Perfil `admin` testado.
-- Reboot/redeploy testado.
-- Persistência após reboot testada para banco e arquivos.
+```bash
+python scripts/production_preflight.py --env-file /etc/labcim-manager/manager.env
+```
 
-## 6. Testes por perfil
+Interpretação:
 
-### member
+- `CODE BLOCKER`: requer mudança/revisão de repositório;
+- `ENVIRONMENT REQUIRED`: configuração ausente ou ainda não fornecida ao checker;
+- `DEPLOYMENT PENDING`: validação que só pode ocorrer no ambiente autorizado;
+- `WARNING`: risco/revisão não conclusiva;
+- `PASS`: invariante efetivamente observado.
 
-- Fazer login.
-- Criar reserva própria.
-- Cancelar a própria reserva `scheduled`.
-- Reportar problema em equipamento.
-- Consultar documentos operacionais.
-- Registrar saída/consumo de insumo.
-- Confirmar ausência da página Relatórios.
-- Confirmar ausência da lista completa de usuários.
-- Confirmar ausência do CSV completo de estoque.
-- Confirmar ausência do cadastro estrutural de insumos.
-- Confirmar ausência do CSV de histórico de movimentações.
-- Confirmar ausência de ZIP em massa de QR Codes.
+O resultado M1A continua NO-GO por migrações ausentes, startup mutante e uploader genérico sem allowlist.
 
-### manager
+## 4. Gates de staging
 
-- Criar e alterar reservas de terceiros.
-- Usar fluxo completo de manutenção.
-- Editar equipamentos e documentos.
-- Gerenciar insumos e lotes.
-- Gerenciar projetos e serviços/análises.
-- Acessar relatórios e exportações.
-- Gerar ZIP em massa de QR Codes.
+- branch/commit revisados e árvore limpa;
+- migrations versionadas executadas por comando administrativo, não pelo processo web;
+- autenticação pública endurecida;
+- banco/storage de staging sem dados reais ou com cópia sanitizada formalmente autorizada;
+- usuário de serviço sem login/privilégios, Streamlit somente em `127.0.0.1:8501`;
+- Nginx `/manager/`, WebSocket, health, limites e TLS revisados;
+- storage escolhido com quota, persistência e política institucional;
+- SMTP autorizado e debug de OTP desativado;
+- backup completo e restore ensaiado antes do cutover.
 
-### admin
+## 5. Smoke funcional obrigatório
 
-- Criar e editar usuários/perfis.
-- Importar base com backup prévio.
-- Conferir permissões.
-- Acessar relatórios e exportações.
+Validar health e UI em `/manager/`, assets/PWA sem requests na raiz, WebSocket, login/logout, perfis `member`/`manager`/`admin`, reservas, manutenção, insumos/lotes, relatórios, QR, upload/download e persistência após restart. Para QR, confirmar destino `https://labcim.quimica.ufrn.br/manager/?...`; para PWA, confirmar que instalação abre o Manager e não o site institucional.
 
-## 7. Testes de infraestrutura
+## 6. Falhas e apresentação segura
 
-- Enviar arquivo para R2.
-- Baixar arquivo do R2 por URL assinada.
-- Solicitar código de login por SMTP.
-- Fazer reboot/redeploy no Streamlit Cloud.
-- Confirmar persistência no Neon.
-- Confirmar persistência de arquivo no R2.
-- Gerar QR individual.
-- Gerar ZIP de QR Codes com perfil `manager` ou `admin`.
+O usuário deve receber mensagem curta e referência de evento. Usar essa referência no journal; não copiar traceback, connection string, OTP, segredo ou URL assinada para navegador/ticket. `APP_LOG_LEVEL=INFO` é o default. Um operador pode habilitar diagnóstico detalhado somente em desenvolvimento isolado.
 
-## 8. Backup e recuperação
+## 7. Backup, restore e rollback
 
-### Neon
+Banco e anexos são um conjunto lógico. Registrar RPO/RTO, destino fora da VM, criptografia, retenção, monitoramento e sequência. Restaurar em ambiente isolado, reconciliar contagens/hashes e executar smoke antes de aprovar. Manter release/origem anterior imutável durante a janela; não apagar órfãos nem reverter schema por DDL improvisado.
 
-- Fazer backups e restores pelo painel do Neon ou mecanismo oficial disponível na conta.
-- Registrar data, hora, commit e responsável antes de mudanças grandes.
-- Validar restore em ambiente seguro antes de sobrescrever produção.
+## 8. Registro de liberação futura
 
-### R2
+- data/janela:
+- commit e checksum do lock:
+- responsáveis e aprovações:
+- backend de storage:
+- preflight anexado:
+- migrations e backup registrados:
+- restore aprovado:
+- testes por perfil e `/manager/`:
+- decisão GO/NO-GO:
+- rollback e observações:
 
-- Registrar nome do bucket e política de acesso.
-- Manter o bucket privado.
-- Preservar arquivos junto com os metadados da tabela `attachments`.
-- Restaurar banco e R2 de forma coordenada para evitar anexos sem referência ou referências sem arquivo.
-
-## 9. Rollback pós-deploy
-
-- Identificar último commit ou PR estável.
-- Reverter o PR problemático ou voltar a `main` para commit estável.
-- Fazer redeploy no Streamlit Cloud.
-- Validar login, conexão com banco, upload/download R2 e principais fluxos por perfil.
-
-## 10. Procedimento em caso de falha
-
-### Login falhando
-
-- Conferir SMTP e `LABCIM_AUTH_DEBUG_CODES`.
-- Confirmar que o usuário está ativo e com role válido.
-- Conferir `notification_log` se necessário.
-
-### SMTP falhando
-
-- Conferir host, porta, usuário, senha, remetente e TLS.
-- Confirmar se o provedor exige senha de app.
-- Manter fail-closed; não ativar debug de código em produção.
-
-### R2 falhando
-
-- Conferir endpoint, bucket e chaves.
-- Confirmar que o bucket está privado.
-- Testar upload e download de um anexo pequeno.
-
-### Banco indisponível
-
-- Conferir `DATABASE_URL`.
-- Verificar disponibilidade do Neon.
-- Confirmar se a connection string pooled está ativa.
-
-### App lento
-
-- Conferir Neon, Streamlit Cloud e tamanho dos relatórios.
-- Usar `LABCIM_DEBUG_PERF` apenas temporariamente.
-- Desativar a flag ao fim do diagnóstico.
-
-### Dados inconsistentes
-
-- Não editar banco manualmente sem backup.
-- Registrar tela, horário, usuário e ação.
-- Restaurar em ambiente seguro antes de aplicar qualquer correção em produção.
-
-## 11. O que não fazer em produção
-
-- Não ativar debug de código de login.
-- Não usar importação de base sem backup prévio.
-- Não apagar secrets sem registrar.
-- Não alterar banco manualmente sem backup.
-- Não fazer deploy de branch não revisada.
-- Não tornar bucket R2 público.
-- Não versionar secrets, banco local ou uploads.
-
-## 12. Registro de liberação
-
-- Data:
-- Versão/commit:
-- Responsável:
-- Secrets conferidos:
-- Testes `member` executados:
-- Testes `manager` executados:
-- Testes `admin` executados:
-- Testes de SMTP:
-- Testes de Neon:
-- Testes de R2:
-- Reboot/redeploy validado:
-- Pendências:
+Enquanto algum `CODE BLOCKER` ou gate institucional permanecer, a decisão é NO-GO.

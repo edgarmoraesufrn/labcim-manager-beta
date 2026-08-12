@@ -1,6 +1,6 @@
 # LabCim Manager — plano de implantação UFRN
 
-Status: plano pós-auditoria; **não executar durante o M0**.
+Status: fundação de código M1A preparada; **não executar sem aprovação de uma sprint de implantação**.
 
 Dependência: todos os blockers de `PRODUCTION_READINESS.md` resolvidos em staging.
 
@@ -33,7 +33,7 @@ O Streamlit não deve escutar no IPv4 interno nem em `0.0.0.0`. O repositório d
 | `/var/lib/labcim-manager/work` | temporários controlados de import/export | serviço, com quota/limpeza |
 | `/var/backups/labcim-manager` | staging local de backups, se aprovado | acesso administrativo restrito |
 
-O caminho de uploads ainda exige adaptação de código: hoje está fixo em `data/uploads`.
+O código M1A aceita essa raiz por `STORAGE_BACKEND=local` e `LOCAL_STORAGE_ROOT=/var/lib/labcim-manager/uploads`. Dono, permissões, quota e backup ainda exigem validação no host.
 
 ## 3. Usuários e rede
 
@@ -48,14 +48,13 @@ O caminho de uploads ainda exige adaptação de código: hoje está fixo em `dat
 
 Antes do staging:
 
-- selecionar uma versão Python suportada pelo Ubuntu alvo e pela versão travada do Streamlit;
-- registrar a versão em arquivo do repositório;
-- trocar ranges abertos por lock com hashes;
+- disponibilizar Python 3.12.13, conforme `.python-version`;
+- instalar somente pelo `requirements.txt`, que exige o `requirements.lock` com hashes;
 - construir virtualenv limpo;
 - executar compile, testes SQLite/PostgreSQL e smoke de startup;
 - registrar commit, Python, lock e checksums dos artefatos.
 
-O M0 apenas compilou o código com Python 3.12.13; isso não é uma homologação de runtime porque várias dependências do app não estavam instaladas no ambiente de auditoria.
+O M1A validou instalação limpa e testes locais com Python 3.12.13. Isso ainda não substitui a homologação no Linux/Ubuntu alvo.
 
 ## 5. Configuração Streamlit necessária
 
@@ -73,7 +72,9 @@ STREAMLIT_CLIENT_SHOW_ERROR_DETAILS=none
 
 Definir o mesmo limite de upload em Streamlit e Nginx. Não desabilitar CORS/XSRF para “corrigir” o proxy. TLS termina no Nginx, não no Streamlit.
 
-## 6. Unidade systemd — especificação para M1
+Também definir `APP_ENV=production`, `APP_BASE_URL=https://labcim.quimica.ufrn.br/manager/`, `DATABASE_URL`, `STORAGE_BACKEND` e as variáveis condicionais do backend escolhido. O contrato completo, com exemplos fictícios, está em `PRODUCTION_ENV_TEMPLATE.md`.
+
+## 6. Unidade systemd — especificação para sprint de implantação
 
 A unidade final deve conter, no mínimo:
 
@@ -152,11 +153,11 @@ Escolher uma opção antes do staging:
 
 ### Opção A — filesystem institucional (recomendada se integrado ao backup da VM)
 
-Exige M1 para externalizar a raiz, permitir local com PostgreSQL, criar arquivos atomicamente e validar permissões/quota. Backup deve coordenar PostgreSQL e diretório de uploads.
+O contrato M1A já externaliza a raiz e permite local com PostgreSQL. Antes de produção ainda é necessário validar escrita, permissões/quota, política de escrita atômica e backup coordenado com PostgreSQL.
 
 ### Opção B — manter R2 privado
 
-Funciona com o código atual, mas mantém dependência externa, credenciais, egress e URLs assinadas. Confirmar política UFRN, conectividade, residência/retention e restore coordenado.
+É selecionável explicitamente e mantém dependência externa, credenciais, egress e URLs assinadas. Confirmar política UFRN, conectividade, residência/retenção e restore coordenado.
 
 Detalhes em `FILE_STORAGE_MIGRATION_PLAN.md`.
 
@@ -188,14 +189,16 @@ Nenhum deploy será aprovado apenas porque o backup “rodou”; um restore comp
 
 ## 12. Sequência de implantação
 
-1. **M1 — hardening no repositório:** resolver blockers de autenticação, uploads, storage, migrations, subpath e dependências.
-2. **Build reproduzível:** gerar ambiente limpo e SBOM/lista de versões.
-3. **Staging isolado:** PostgreSQL e storage sem dados reais ou com cópia sanitizada.
-4. **Teste `/manager/`:** executar a matriz de `PRODUCTION_READINESS.md` e perfis `member/manager/admin`.
-5. **Ensaio de migração:** backup, carga, reconciliação, restore e rollback.
-6. **Revisão institucional:** segurança, DNS/TLS, e-mail, backup e janela de mudança.
-7. **Cutover aprovado:** somente em sprint própria, com responsáveis, comunicação e rollback.
-8. **Pós-cutover:** smoke funcional, observação de logs/métricas e confirmação de backup.
+1. **M1A — fundação reproduzível:** runtime, lock, configuração, storage e subpath preparados no repositório.
+2. **M1B — banco/startup:** implementar migrações versionadas e remover mutações do startup.
+3. **Hardening dedicado:** autenticação pública, uploads e revisão de HTML/erros restantes.
+4. **Build reproduzível:** gerar ambiente Linux limpo e SBOM/lista de versões.
+5. **Staging isolado:** PostgreSQL e storage sem dados reais ou com cópia sanitizada.
+6. **Teste `/manager/`:** executar a matriz de `PRODUCTION_READINESS.md` e perfis `member/manager/admin`.
+7. **Ensaio de migração:** backup, carga, reconciliação, restore e rollback.
+8. **Revisão institucional:** segurança, DNS/TLS, e-mail, backup e janela de mudança.
+9. **Cutover aprovado:** somente em sprint própria, com responsáveis, comunicação e rollback.
+10. **Pós-cutover:** smoke funcional, observação de logs/métricas e confirmação de backup.
 
 ## 13. Rollback esperado
 
