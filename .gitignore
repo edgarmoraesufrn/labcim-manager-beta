@@ -8,6 +8,7 @@ __pycache__/
 .venv/
 venv/
 env/
+work/
 
 # Streamlit secrets - nunca subir senha/API key para o GitHub
 .streamlit/secrets.toml

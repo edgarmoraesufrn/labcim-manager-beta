@@ -1,7 +1,3 @@
-streamlit>=1.36
-pandas>=2.0
-plotly>=5.20
-qrcode[pil]>=7.4
-openpyxl>=3.1
-psycopg[binary]>=3.2
-boto3>=1.34
+# Production installs use the fully resolved, hash-locked dependency graph.
+--require-hashes
+-r requirements.lock
