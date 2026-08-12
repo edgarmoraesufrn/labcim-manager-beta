@@ -7,6 +7,7 @@ import mimetypes
 import os
 from pathlib import Path
 import re
+from uuid import uuid4
 from urllib.parse import quote
 
 from labcim_manager.config import (
@@ -15,6 +16,11 @@ from labcim_manager.config import (
     get_app_environment,
     normalize_storage_backend,
     resolve_local_storage_root,
+)
+from labcim_manager.upload_security import (
+    UploadValidationError,
+    safe_display_filename,
+    validate_attachment_storage_key,
 )
 
 LOCAL_UPLOAD_ROOT = DEFAULT_LOCAL_STORAGE_ROOT
@@ -46,9 +52,7 @@ class StoredFile:
 
 
 def _safe_filename(filename: str) -> str:
-    name = Path(filename or "arquivo").name
-    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._")
-    return safe or "arquivo"
+    return safe_display_filename(filename)
 
 
 def _sha256(data: bytes) -> str:
@@ -63,7 +67,8 @@ def make_storage_key(entity_type: str, entity_id: int, filename: str, digest: st
     now = datetime.now(UTC)
     safe_name = _safe_filename(filename)
     safe_entity = re.sub(r"[^A-Za-z0-9_-]+", "_", str(entity_type)).strip("_") or "entity"
-    return f"attachments/{safe_entity}/{int(entity_id)}/{now:%Y}/{now:%m}/{digest}_{safe_name}"
+    nonce = uuid4().hex
+    return f"attachments/{safe_entity}/{int(entity_id)}/{now:%Y}/{now:%m}/{digest}_{nonce}_{safe_name}"
 
 
 def _read_streamlit_secret(key: str, section: str | None = None) -> str | None:
@@ -175,6 +180,10 @@ class LocalStorageBackend:
         return candidate
 
     def resolve_target_path(self, storage_key: str) -> Path:
+        try:
+            storage_key = validate_attachment_storage_key(storage_key)
+        except UploadValidationError as exc:
+            raise FileNotFoundError("Arquivo fora da raiz de armazenamento configurada.") from exc
         candidate = (self.root / storage_key).resolve()
         root = self.root.resolve()
         if root not in candidate.parents and candidate != root:
@@ -232,6 +241,7 @@ class R2StorageBackend:
         )
 
     def get_file_bytes(self, storage_key: str) -> bytes:
+        storage_key = validate_attachment_storage_key(storage_key)
         response = self.client.get_object(Bucket=self.config.bucket, Key=storage_key)
         return response["Body"].read()
 
@@ -241,6 +251,7 @@ class R2StorageBackend:
         original_filename: str | None = None,
         expires_in: int = DEFAULT_DOWNLOAD_TTL_SECONDS,
     ) -> str:
+        storage_key = validate_attachment_storage_key(storage_key)
         safe_name = _safe_filename(original_filename or Path(storage_key).name)
         return self.client.generate_presigned_url(
             "get_object",

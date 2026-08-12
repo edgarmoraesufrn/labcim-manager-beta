@@ -5,7 +5,11 @@ from enum import Enum
 import hashlib
 import sqlite3
 from labcim_manager.db import DatabaseConnection, _execute_script, _postgres_schema, db_backend
-from labcim_manager.migrations import v001_legacy_core, v002_approved_schema
+from labcim_manager.migrations import (
+    v001_legacy_core,
+    v002_approved_schema,
+    v003_auth_abuse_protection,
+)
 
 
 MIGRATION_TABLE = "labcim_schema_migrations"
@@ -68,6 +72,8 @@ def _migration_payload(version: int) -> str:
                 v002_approved_schema.INDEX_SQL,
             )
         )
+    if version == v003_auth_abuse_protection.VERSION:
+        return v003_auth_abuse_protection.SQL
     raise ValueError(f"Versão de migration desconhecida: {version}.")
 
 
@@ -79,6 +85,7 @@ def _migration(version: int, name: str) -> Migration:
 MIGRATIONS: tuple[Migration, ...] = (
     _migration(v001_legacy_core.VERSION, v001_legacy_core.NAME),
     _migration(v002_approved_schema.VERSION, v002_approved_schema.NAME),
+    _migration(v003_auth_abuse_protection.VERSION, v003_auth_abuse_protection.NAME),
 )
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1].version
 
@@ -162,10 +169,10 @@ LEGACY_TABLE_COLUMNS: dict[str, frozenset[str]] = {
 }
 
 
-CURRENT_TABLE_COLUMNS: dict[str, frozenset[str]] = dict(LEGACY_TABLE_COLUMNS)
+V2_TABLE_COLUMNS: dict[str, frozenset[str]] = dict(LEGACY_TABLE_COLUMNS)
 for _table, _column, _definition in v002_approved_schema.COLUMN_ADDITIONS:
-    CURRENT_TABLE_COLUMNS[_table] = CURRENT_TABLE_COLUMNS[_table] | {_column}
-CURRENT_TABLE_COLUMNS.update(
+    V2_TABLE_COLUMNS[_table] = V2_TABLE_COLUMNS[_table] | {_column}
+V2_TABLE_COLUMNS.update(
     {
         "project_services": frozenset(
             {
@@ -208,8 +215,13 @@ CURRENT_TABLE_COLUMNS.update(
     }
 )
 
+CURRENT_TABLE_COLUMNS: dict[str, frozenset[str]] = dict(V2_TABLE_COLUMNS)
+CURRENT_TABLE_COLUMNS["auth_rate_limit_events"] = frozenset(
+    {"id", "identity_hash", "origin_hash", "event_type", "outcome", "occurred_at"}
+)
 
-CURRENT_INDEXES = frozenset(
+
+V2_INDEXES = frozenset(
     {
         "idx_project_services_project", "idx_project_services_code",
         "idx_maintenance_status_history_entity", "idx_supply_lots_supply_active_expiration",
@@ -224,6 +236,12 @@ CURRENT_INDEXES = frozenset(
         "idx_supply_lots_active_expiration", "idx_attachments_entity_role_active",
     }
 )
+
+CURRENT_INDEXES = V2_INDEXES | {
+    "idx_auth_rate_identity_event_time",
+    "idx_auth_rate_origin_event_time",
+    "idx_auth_rate_event_time",
+}
 
 
 CRITICAL_COLUMN_TYPES: dict[tuple[str, str], str] = {
@@ -249,6 +267,8 @@ CRITICAL_COLUMN_TYPES: dict[tuple[str, str], str] = {
     ("attachments", "storage_key"): "text",
     ("access_codes", "id"): "integer",
     ("notification_log", "id"): "integer",
+    ("auth_rate_limit_events", "id"): "integer",
+    ("auth_rate_limit_events", "identity_hash"): "text",
 }
 
 
@@ -320,7 +340,15 @@ def _index_names(conn: DatabaseConnection) -> set[str]:
 
 
 def structural_issues(conn: DatabaseConnection, version: int = LATEST_SCHEMA_VERSION) -> tuple[str, ...]:
-    contract = LEGACY_TABLE_COLUMNS if version == 1 else CURRENT_TABLE_COLUMNS
+    if version == 1:
+        contract = LEGACY_TABLE_COLUMNS
+        expected_indexes: frozenset[str] = frozenset()
+    elif version == 2:
+        contract = V2_TABLE_COLUMNS
+        expected_indexes = V2_INDEXES
+    else:
+        contract = CURRENT_TABLE_COLUMNS
+        expected_indexes = CURRENT_INDEXES
     tables = _table_names(conn)
     issues: list[str] = []
     for table, expected_columns in contract.items():
@@ -338,8 +366,8 @@ def structural_issues(conn: DatabaseConnection, version: int = LATEST_SCHEMA_VER
             issues.append(
                 f"tipo incompatível em {table}.{column}: esperado {expected_type}"
             )
-    if version >= LATEST_SCHEMA_VERSION:
-        missing_indexes = sorted(CURRENT_INDEXES - _index_names(conn))
+    if expected_indexes:
+        missing_indexes = sorted(expected_indexes - _index_names(conn))
         if missing_indexes:
             issues.append(f"índices ausentes: {', '.join(missing_indexes)}")
     return tuple(issues)
@@ -517,6 +545,12 @@ def _apply_migration(conn: DatabaseConnection, migration: Migration) -> None:
             _add_column(conn, table, column, definition)
         _execute_script(conn, v002_approved_schema.INDEX_SQL)
         return
+    if migration.version == 3:
+        _execute_script(
+            conn,
+            migration_sql_for_dialect(v003_auth_abuse_protection.SQL, db_backend(conn)),
+        )
+        return
     raise SchemaLifecycleError(f"Migration sem executor: {migration.version}.")
 
 
@@ -582,7 +616,13 @@ def _adoptable_version(conn: DatabaseConnection) -> tuple[int | None, tuple[str,
     if not current_issues:
         return LATEST_SCHEMA_VERSION, ()
     tables = _table_names(conn)
-    version_two_tables = set(CURRENT_TABLE_COLUMNS) - set(LEGACY_TABLE_COLUMNS)
+    if "auth_rate_limit_events" in tables:
+        return None, current_issues
+
+    version_two_issues = structural_issues(conn, 2)
+    if not version_two_issues:
+        return 2, ()
+    version_two_tables = set(V2_TABLE_COLUMNS) - set(LEGACY_TABLE_COLUMNS)
     version_two_columns = {
         (table, column)
         for table, column, _definition in v002_approved_schema.COLUMN_ADDITIONS
@@ -592,7 +632,7 @@ def _adoptable_version(conn: DatabaseConnection) -> tuple[int | None, tuple[str,
         for table, column in version_two_columns
     )
     if has_version_two_signal:
-        return None, current_issues
+        return None, version_two_issues
     legacy_issues = structural_issues(conn, 1)
     if not legacy_issues:
         return 1, ()

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import sys
 
+from labcim_manager.auth_security import identity_reference, normalized_email_conflicts
 from labcim_manager.config import PROJECT_ROOT
 from labcim_manager.db import connect, import_base_xlsx, is_operational_database_empty, seed_default_pops
 from labcim_manager.schema import (
@@ -50,6 +51,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Allow explicit upsert into a non-empty database.",
     )
     subparsers.add_parser("seed-pops")
+    subparsers.add_parser("diagnose-email-identities")
     return parser.parse_args(argv)
 
 
@@ -137,6 +139,22 @@ def run(argv: list[str] | None = None) -> int:
             verify_schema_compatible(conn)
             print(f"updated={seed_default_pops(conn)}")
             return 0
+        if args.command == "diagnose-email-identities":
+            verify_schema_compatible(conn)
+            conflicts = normalized_email_conflicts(conn)
+            print(f"normalized_email_conflicts={len(conflicts)}")
+            for position, conflict in enumerate(conflicts, start=1):
+                normalized = str(conflict["normalized_email"])
+                rows = conn.execute(
+                    "SELECT id FROM users WHERE LOWER(TRIM(email)) = ? ORDER BY id",
+                    [normalized],
+                ).fetchall()
+                user_ids = ",".join(str(int(row["id"])) for row in rows)
+                print(
+                    f"conflict_{position}=identity_ref:{identity_reference(normalized)},"
+                    f"users:{user_ids},active:{int(conflict['active_count'])}"
+                )
+            return 1 if conflicts else 0
     finally:
         conn.close()
     return 2

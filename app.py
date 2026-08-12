@@ -15,8 +15,8 @@ from io import BytesIO
 import json
 from numbers import Integral, Real
 import os
-import secrets as py_secrets
 import smtplib
+import shutil
 from time import perf_counter
 import zipfile
 from pathlib import Path
@@ -56,7 +56,6 @@ from labcim_manager.db import (
     create_supply_movement,
     create_user,
     deactivate_attachment,
-    get_active_user_by_email,
     get_attachment,
     get_latest_attachment_for_entity,
     import_base_xlsx,
@@ -88,6 +87,19 @@ from labcim_manager.db import (
     verify_access_code_record,
 )
 from labcim_manager.errors import configure_logging, safe_exception_message
+from labcim_manager.auth_security import (
+    INVALID_OTP_MESSAGE,
+    NEUTRAL_OTP_REQUEST_MESSAGE,
+    clear_auth_session,
+    generate_otp_code,
+    hash_otp_code,
+    load_auth_security_config,
+    log_security_event,
+    lookup_auth_identity,
+    normalize_email_identity,
+    otp_hash_secret,
+    register_otp_request,
+)
 from labcim_manager.schema import SchemaCompatibilityError, verify_database_target
 from labcim_manager.storage import (
     LocalStorageBackend,
@@ -98,6 +110,13 @@ from labcim_manager.storage import (
     get_storage_backend_for_name,
     resolve_config_value,
 )
+from labcim_manager.upload_security import (
+    UploadValidationError,
+    policy_extensions,
+    unique_temporary_upload_path,
+    upload_max_bytes,
+    validate_upload,
+)
 
 APP_TITLE = "LabCim Manager"
 APP_SUBTITLE = "Gestão integrada, rastreabilidade e governança operacional do LabCim"
@@ -106,7 +125,6 @@ BASE_XLSX = project_path("data", "LabCim_Base.xlsx")
 LOGO_PATH = project_path("assets", "logo_labcim.png")
 APP_ICON_PATH = project_path("assets", "app_icon.png")
 POP_DIR = project_path("assets", "pops")
-ACCESS_CODE_TTL_MINUTES = 10
 CACHE_TTL_SECONDS = 120
 DB_CONNECTION_KEY = "labcim_db_connection"
 DB_CONNECTION_FINGERPRINT_KEY = "labcim_db_connection_fingerprint"
@@ -1113,25 +1131,6 @@ def send_email(to_email: str, subject: str, body: str) -> tuple[bool, str]:
         )
 
 
-def _auth_debug_codes_enabled() -> bool:
-    keys = ("LABCIM_AUTH_DEBUG_CODES", "auth_debug_codes")
-    for key in keys:
-        env_value = os.environ.get(key)
-        if clean_input(env_value):
-            return clean_input(env_value).lower() in {"1", "true", "sim", "yes", "y", "on"}
-        try:
-            if hasattr(st, "secrets") and key in st.secrets:
-                return clean_input(st.secrets[key]).lower() in {"1", "true", "sim", "yes", "y", "on"}
-        except Exception:
-            pass
-        try:
-            if hasattr(st, "secrets") and "auth" in st.secrets and key in st.secrets["auth"]:
-                return clean_input(st.secrets["auth"][key]).lower() in {"1", "true", "sim", "yes", "y", "on"}
-        except Exception:
-            pass
-    return False
-
-
 def _unique_emails(values) -> list[str]:
     seen = set()
     emails: list[str] = []
@@ -1234,8 +1233,8 @@ def notify_equipment_maintenance(
     return sent, total
 
 
-def _hash_access_code(code: str) -> str:
-    return hashlib.sha256(code.encode("utf-8")).hexdigest()
+def _hash_access_code(code: str, email: str) -> str:
+    return hash_otp_code(code, normalize_email_identity(email), otp_hash_secret())
 
 
 SESSION_ROLE_ALIASES = {
@@ -1299,9 +1298,10 @@ def revalidate_authenticated_user(conn) -> dict | None:
         row = conn.execute("SELECT * FROM users WHERE id = ? LIMIT 1", [user_id]).fetchone()
 
     if row is None:
-        email = clean_input(user.get("email")).lower()
+        email = normalize_email_identity(user.get("email"))
         if email:
-            row = get_active_user_by_email(conn, email)
+            identity_state, identity_row = lookup_auth_identity(conn, email)
+            row = identity_row if identity_state == "eligible" else None
 
     if row is None or not truthy(row["active"]):
         logout()
@@ -1313,65 +1313,161 @@ def revalidate_authenticated_user(conn) -> dict | None:
 
 
 def logout() -> None:
-    for key in ["auth_user", "access_role", "pending_login_email", "last_access_code"]:
-        if key in st.session_state:
-            del st.session_state[key]
+    clear_auth_session(st.session_state)
+
+
+def _request_origin() -> str | None:
+    try:
+        context = getattr(st, "context", None)
+        headers = getattr(context, "headers", {}) if context else {}
+        forwarded = str(headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
+        return forwarded or str(headers.get("X-Real-IP") or "").strip() or None
+    except Exception:
+        return None
 
 
 def request_access_code(conn, email: str) -> tuple[bool, str]:
-    user = get_active_user_by_email(conn, email)
-    if not user:
-        return False, "E-mail não encontrado entre usuários ativos do LabCim Manager."
-    code = f"{py_secrets.randbelow(1_000_000):06d}"
-    expires_at = (datetime.now() + timedelta(minutes=ACCESS_CODE_TTL_MINUTES)).isoformat(timespec="seconds")
-    create_access_code_record(
-        conn,
-        user_id=int(user["id"]),
-        email=str(user["email"]).strip().lower(),
-        code_hash=_hash_access_code(code),
-        expires_at=expires_at,
-    )
+    config = load_auth_security_config()
+    normalized = normalize_email_identity(email)
+    origin = _request_origin()
+    st.session_state["pending_login_email"] = normalized
+    try:
+        allowed, limit_reason = register_otp_request(
+            conn,
+            normalized,
+            origin=origin,
+            config=config,
+        )
+    except Exception as exc:
+        safe_exception_message(
+            exc,
+            context="registro de limite de solicitação OTP",
+            user_message="A solicitação de acesso não pôde ser processada.",
+        )
+        log_security_event(
+            "otp_request",
+            identity=normalized,
+            origin=origin,
+            result="neutral_failure",
+            reason="rate_limit_unavailable",
+        )
+        return True, NEUTRAL_OTP_REQUEST_MESSAGE
+    if not allowed:
+        log_security_event(
+            "otp_request",
+            identity=normalized,
+            origin=origin,
+            result="limited",
+            reason=limit_reason,
+        )
+        return True, NEUTRAL_OTP_REQUEST_MESSAGE
+
+    try:
+        identity_state, user = lookup_auth_identity(conn, normalized)
+    except Exception as exc:
+        safe_exception_message(
+            exc,
+            context="consulta de identidade OTP",
+            user_message="A solicitação de acesso não pôde ser processada.",
+        )
+        log_security_event(
+            "otp_request",
+            identity=normalized,
+            origin=origin,
+            result="neutral_failure",
+            reason="identity_lookup_unavailable",
+        )
+        return True, NEUTRAL_OTP_REQUEST_MESSAGE
+    if identity_state != "eligible" or user is None:
+        log_security_event(
+            "otp_request",
+            identity=normalized,
+            origin=origin,
+            result="neutral_no_delivery",
+            reason=identity_state,
+        )
+        return True, NEUTRAL_OTP_REQUEST_MESSAGE
+
+    canonical_email = normalize_email_identity(user["email"])
+    code = generate_otp_code()
+    expires_at = (
+        datetime.now() + timedelta(seconds=config.otp_ttl_seconds)
+    ).isoformat(timespec="seconds")
+    try:
+        create_access_code_record(
+            conn,
+            user_id=int(user["id"]),
+            email=canonical_email,
+            code_hash=_hash_access_code(code, canonical_email),
+            expires_at=expires_at,
+        )
+    except Exception as exc:
+        safe_exception_message(
+            exc,
+            context="persistência de desafio OTP",
+            user_message="A solicitação de acesso não pôde ser processada.",
+        )
+        log_security_event(
+            "otp_request",
+            identity=canonical_email,
+            origin=origin,
+            result="neutral_failure",
+            reason="challenge_persistence_failed",
+        )
+        return True, NEUTRAL_OTP_REQUEST_MESSAGE
     subject = "Código de acesso - LabCim Manager"
     body = (
         f"Olá, {user['full_name']}.\n\n"
         f"Seu código de acesso ao LabCim Manager é: {code}\n\n"
-        f"Ele expira em {ACCESS_CODE_TTL_MINUTES} minutos.\n"
+        f"Ele expira em {config.otp_ttl_seconds // 60} minutos.\n"
         "Se você não solicitou este acesso, ignore esta mensagem.\n\n"
         "LabCim Manager"
     )
     ok, msg = send_email(str(user["email"]), subject, body)
-    debug_codes_enabled = _auth_debug_codes_enabled()
-    log_notification(
-        conn,
-        event_type="access_code",
-        recipient_email=str(user["email"]),
-        subject=subject,
-        body=(
-            "Código de acesso enviado por e-mail."
-            if ok
-            else "Falha ao enviar código de acesso; código não exibido."
-            if not debug_codes_enabled
-            else "Código de acesso disponibilizado em modo debug de desenvolvimento."
-        ),
-        status="sent" if ok else "failed" if not debug_codes_enabled else "debug_code_available",
-        error_message=None if ok else msg,
-        related_table="users",
-        related_id=int(user["id"]),
-    )
-    st.session_state["pending_login_email"] = str(user["email"]).strip().lower()
+    try:
+        log_notification(
+            conn,
+            event_type="access_code",
+            recipient_email=str(user["email"]),
+            subject=subject,
+            body=(
+                "Código de acesso enviado por e-mail."
+                if ok
+                else "Falha ao enviar código de acesso; desafio invalidado."
+            ),
+            status="sent" if ok else "failed",
+            error_message=None if ok else msg,
+            related_table="users",
+            related_id=int(user["id"]),
+        )
+    except Exception as exc:
+        safe_exception_message(
+            exc,
+            context="registro de notificação OTP",
+            user_message="O evento de autenticação não pôde ser registrado.",
+        )
     if not ok:
-        if debug_codes_enabled:
-            st.session_state["last_access_code"] = code
-            return True, "Modo debug de desenvolvimento: o código foi exibido na tela."
         conn.execute(
             "UPDATE access_codes SET used_at = CURRENT_TIMESTAMP WHERE user_id = ? AND code_hash = ? AND used_at IS NULL",
-            [int(user["id"]), _hash_access_code(code)],
+            [int(user["id"]), _hash_access_code(code, canonical_email)],
         )
         conn.commit()
-        st.session_state.pop("last_access_code", None)
-        return False, "Não foi possível enviar o código de acesso. Verifique a configuração de e-mail ou contate o administrador."
-    st.session_state.pop("last_access_code", None)
-    return True, f"Código enviado para {user['email']}."
+        log_security_event(
+            "otp_delivery",
+            identity=canonical_email,
+            origin=origin,
+            result="failed",
+            reason="smtp_failure",
+        )
+        return True, NEUTRAL_OTP_REQUEST_MESSAGE
+    log_security_event(
+        "otp_delivery",
+        identity=canonical_email,
+        origin=origin,
+        result="sent",
+        reason="eligible",
+    )
+    return True, NEUTRAL_OTP_REQUEST_MESSAGE
 
 
 def page_login(conn) -> None:
@@ -1391,12 +1487,6 @@ def page_login(conn) -> None:
             ok, msg = request_access_code(conn, email)
             (st.success if ok else st.error)(msg)
 
-        if st.session_state.get("last_access_code"):
-            st.warning(
-                f"Modo debug de desenvolvimento: código de teste **{st.session_state['last_access_code']}**. "
-                "Desative LABCIM_AUTH_DEBUG_CODES em produção."
-            )
-
     with st.container(border=True):
         st.markdown("### Validar código")
         pending_email = clean_input(st.session_state.get("pending_login_email", "")).lower()
@@ -1408,6 +1498,7 @@ def page_login(conn) -> None:
             "Código recebido",
             max_chars=6,
             placeholder="000000",
+            type="password",
             key="verify_code",
         ).strip()
         if st.button("Entrar", type="primary", key="verify_access_code"):
@@ -1417,7 +1508,28 @@ def page_login(conn) -> None:
             if not code:
                 st.error("Informe o código recebido por e-mail.")
                 return
-            ok, msg, row = verify_access_code_record(conn, email=pending_email, code_hash=_hash_access_code(code))
+            config = load_auth_security_config()
+            try:
+                ok, msg, row = verify_access_code_record(
+                    conn,
+                    email=pending_email,
+                    code_hash=_hash_access_code(code, pending_email),
+                    max_attempts=config.max_verify_attempts,
+                )
+            except Exception as exc:
+                safe_exception_message(
+                    exc,
+                    context="verificação de desafio OTP",
+                    user_message="O código não pôde ser verificado.",
+                )
+                ok, msg, row = False, INVALID_OTP_MESSAGE, None
+            log_security_event(
+                "otp_verify",
+                identity=pending_email,
+                origin=_request_origin(),
+                result="success" if ok else "rejected",
+                reason="verified" if ok else "invalid_or_expired",
+            )
             if ok and row is not None:
                 if _set_authenticated_user(row):
                     st.success("Acesso liberado.")
@@ -1902,8 +2014,11 @@ def _resolve_local_doc(path_value) -> Path | None:
         path = PROJECT_ROOT / path
     try:
         path = path.resolve()
-        project_root = PROJECT_ROOT.resolve()
-        if project_root not in path.parents and path != project_root:
+        allowed_roots = (
+            POP_DIR.resolve(),
+            project_path("data", "uploads").resolve(),
+        )
+        if not any(root == path or root in path.parents for root in allowed_roots):
             return None
     except Exception:
         return None
@@ -3516,12 +3631,29 @@ def _attachment_id_from_ref(path_value) -> int | None:
         return None
 
 
-def _ensure_storage_ready_for_upload(*uploaded_files) -> bool:
+def _ensure_storage_ready_for_upload(
+    *uploaded_files,
+    policy_names: tuple[str, ...] | None = None,
+) -> bool:
     if not any(uploaded_file is not None for uploaded_file in uploaded_files):
         return True
     try:
         active_storage_backend()
+        if policy_names is not None:
+            if len(policy_names) != len(uploaded_files):
+                raise RuntimeError("Configuração interna de política de upload inválida.")
+            for uploaded_file, policy_name in zip(uploaded_files, policy_names):
+                if uploaded_file is not None:
+                    validate_upload(
+                        filename=uploaded_file.name,
+                        content=uploaded_file.getvalue(),
+                        declared_mime=getattr(uploaded_file, "type", None),
+                        policy_name=policy_name,
+                    )
         return True
+    except UploadValidationError as exc:
+        st.error(str(exc))
+        return False
     except StorageConfigurationError as exc:
         st.error(str(exc))
         return False
@@ -3534,18 +3666,24 @@ def _save_upload(
     entity_type: str,
     entity_id: int,
     attachment_role: str,
+    policy_name: str,
     notes: str | None = None,
 ) -> str | None:
     if uploaded_file is None:
         return None
     backend = active_storage_backend()
-    content = uploaded_file.getvalue()
+    validated = validate_upload(
+        filename=uploaded_file.name,
+        content=uploaded_file.getvalue(),
+        declared_mime=getattr(uploaded_file, "type", None),
+        policy_name=policy_name,
+    )
     stored = backend.save_file(
         entity_type=entity_type,
         entity_id=int(entity_id),
-        original_filename=uploaded_file.name,
-        content=content,
-        mime_type=getattr(uploaded_file, "type", None),
+        original_filename=validated.safe_display_filename,
+        content=validated.content,
+        mime_type=validated.mime_type,
     )
     attachment_id = create_attachment(
         conn,
@@ -3959,24 +4097,34 @@ def render_equipment_documents_section(
             list(EQUIPMENT_DOCUMENT_ROLE_LABELS.values()),
             key=f"{key_prefix}_role",
         )
-        upload = st.file_uploader("Arquivo", key=f"{key_prefix}_upload")
+        upload = st.file_uploader(
+            "Arquivo",
+            type=policy_extensions("equipment_document"),
+            key=f"{key_prefix}_upload",
+        )
         notes = st.text_area("Observação", value="", key=f"{key_prefix}_notes")
         if st.button("Salvar documento", type="primary", key=f"{key_prefix}_save"):
             if upload is None:
                 st.error("Selecione um arquivo para enviar.")
-            elif _ensure_storage_ready_for_upload(upload):
+            elif _ensure_storage_ready_for_upload(
+                upload, policy_names=("equipment_document",)
+            ):
                 role = EQUIPMENT_DOCUMENT_ROLE_REVERSE[role_label]
-                _save_upload(
-                    conn,
-                    upload,
-                    entity_type="equipment",
-                    entity_id=equipment_id,
-                    attachment_role=role,
-                    notes=notes.strip() or None,
-                )
-                st.success("Documento do equipamento cadastrado.")
-                clear_app_caches()
-                st.rerun()
+                try:
+                    _save_upload(
+                        conn,
+                        upload,
+                        entity_type="equipment",
+                        entity_id=equipment_id,
+                        attachment_role=role,
+                        policy_name="equipment_document",
+                        notes=notes.strip() or None,
+                    )
+                    st.success("Documento do equipamento cadastrado.")
+                    clear_app_caches()
+                    st.rerun()
+                except UploadValidationError as exc:
+                    st.error(str(exc))
 
 
 def render_supply_lots_section(conn, supply_row: pd.Series, supply_lots: pd.DataFrame) -> None:
@@ -4030,7 +4178,7 @@ def render_supply_lots_section(conn, supply_row: pd.Series, supply_lots: pd.Data
                 location = st.text_input("Localização", value=supply_location, key=f"lot_location_new_{supply_id}")
                 certificate_upload = st.file_uploader(
                     "Certificado de análise",
-                    type=["pdf", "png", "jpg", "jpeg", "xlsx"],
+                    type=policy_extensions("certificate"),
                     key=f"lot_certificate_new_{supply_id}",
                 )
                 notes = st.text_area("Observações", key=f"lot_notes_new_{supply_id}")
@@ -4039,7 +4187,9 @@ def render_supply_lots_section(conn, supply_row: pd.Series, supply_lots: pd.Data
         if create_lot_submitted:
             if not lot_code.strip():
                 st.error("Informe o código do lote.")
-            elif not _ensure_storage_ready_for_upload(certificate_upload):
+            elif not _ensure_storage_ready_for_upload(
+                certificate_upload, policy_names=("certificate",)
+            ):
                 pass
             else:
                 try:
@@ -4081,6 +4231,7 @@ def render_supply_lots_section(conn, supply_row: pd.Series, supply_lots: pd.Data
                             entity_type="supply_lot",
                             entity_id=lot_id,
                             attachment_role="analysis_certificate",
+                            policy_name="certificate",
                         )
                         update_legacy_attachment_path(
                             conn,
@@ -4128,7 +4279,7 @@ def render_supply_lots_section(conn, supply_row: pd.Series, supply_lots: pd.Data
                 edit_location = st.text_input("Localização", value=clean_input(edit_lot.get("location")), key=f"lot_location_edit_{int(edit_lot['id'])}")
                 edit_certificate_upload = st.file_uploader(
                     "Novo certificado de análise",
-                    type=["pdf", "png", "jpg", "jpeg", "xlsx"],
+                    type=policy_extensions("certificate"),
                     key=f"lot_certificate_edit_{int(edit_lot['id'])}",
                 )
                 edit_notes = st.text_area("Observações", value=clean_input(edit_lot.get("notes")), key=f"lot_notes_edit_{int(edit_lot['id'])}")
@@ -4137,7 +4288,9 @@ def render_supply_lots_section(conn, supply_row: pd.Series, supply_lots: pd.Data
         if edit_lot_submitted:
             if not edit_lot_code.strip():
                 st.error("Informe o código do lote.")
-            elif not _ensure_storage_ready_for_upload(edit_certificate_upload):
+            elif not _ensure_storage_ready_for_upload(
+                edit_certificate_upload, policy_names=("certificate",)
+            ):
                 pass
             else:
                 try:
@@ -4149,6 +4302,7 @@ def render_supply_lots_section(conn, supply_row: pd.Series, supply_lots: pd.Data
                             entity_type="supply_lot",
                             entity_id=int(edit_lot["id"]),
                             attachment_role="analysis_certificate",
+                            policy_name="certificate",
                         )
                     update_supply_lot(
                         conn,
@@ -4505,8 +4659,8 @@ def page_insumos(conn):
                     with t3:
                         safety_doc_path = st.text_input("FDS/FISPQ existente ou link", value=safety_doc_path)
                         technical_doc_path = st.text_input("Ficha técnica/caracterização existente ou link", value=technical_doc_path)
-                        safety_upload = st.file_uploader("Anexar FDS/FISPQ", type=["pdf", "png", "jpg", "jpeg"], key="safety_doc_upload")
-                        technical_upload = st.file_uploader("Anexar ficha/caracterização", type=["pdf", "png", "jpg", "jpeg", "xlsx"], key="technical_doc_upload")
+                        safety_upload = st.file_uploader("Anexar FDS/FISPQ", type=policy_extensions("safety_document"), key="safety_doc_upload")
+                        technical_upload = st.file_uploader("Anexar ficha/caracterização", type=policy_extensions("technical_document"), key="technical_doc_upload")
 
                 if is_spare_part:
                     st.markdown("#### Equipamentos associados")
@@ -4570,7 +4724,11 @@ def page_insumos(conn):
                     st.error("Cadastro/edição estrutural de insumos exige perfil Gerente ou Administrador.")
                 elif not supply_name.strip():
                     st.error("Informe o nome do item.")
-                elif not _ensure_storage_ready_for_upload(safety_upload, technical_upload):
+                elif not _ensure_storage_ready_for_upload(
+                    safety_upload,
+                    technical_upload,
+                    policy_names=("safety_document", "technical_document"),
+                ):
                     pass
                 else:
                     if mode == "Novo item":
@@ -4627,6 +4785,7 @@ def page_insumos(conn):
                                 entity_type="supply",
                                 entity_id=supply_id,
                                 attachment_role="safety_doc",
+                                policy_name="safety_document",
                             )
                             update_legacy_attachment_path(
                                 conn,
@@ -4642,6 +4801,7 @@ def page_insumos(conn):
                                 entity_type="supply",
                                 entity_id=supply_id,
                                 attachment_role="technical_doc",
+                                policy_name="technical_document",
                             )
                             update_legacy_attachment_path(
                                 conn,
@@ -4664,6 +4824,7 @@ def page_insumos(conn):
                                 entity_type="supply",
                                 entity_id=supply_id,
                                 attachment_role="safety_doc",
+                                policy_name="safety_document",
                             )
                         if technical_upload is not None:
                             technical_final = _save_upload(
@@ -4672,6 +4833,7 @@ def page_insumos(conn):
                                 entity_type="supply",
                                 entity_id=supply_id,
                                 attachment_role="technical_doc",
+                                policy_name="technical_document",
                             )
                         update_supply(
                             conn,
@@ -4799,7 +4961,7 @@ def page_insumos(conn):
                         st.caption(f"Responsável pela movimentação: {clean_value(current_user().get('full_name'), 'usuário autenticado')}")
                 with c3:
                     purpose = st.text_area("Finalidade/observação", placeholder="Ex.: preparo de pasta; recebimento de material; descarte por vencimento...")
-                    movement_doc = st.file_uploader("Anexo da movimentação", type=["pdf", "png", "jpg", "jpeg", "xlsx"], key="movement_doc")
+                    movement_doc = st.file_uploader("Anexo da movimentação", type=policy_extensions("movement_document"), key="movement_doc")
                 move_submitted = st.form_submit_button("Registrar movimentação", type="primary")
 
             st.markdown("#### Ficha do item selecionado")
@@ -4869,7 +5031,9 @@ def page_insumos(conn):
                     st.error("Não foi possível identificar o usuário autenticado. Faça login novamente.")
                 elif selected_lot is not None and negative_movement and float(quantity) > float(lot_balance or 0) + 1e-9:
                     st.error(f"Saldo insuficiente no lote. Saldo atual do lote: {float(lot_balance or 0):g} {clean_value(selected_lot.get('unit'), clean_value(selected_movement_supply.get('unit'), ''))}.")
-                elif _ensure_storage_ready_for_upload(movement_doc):
+                elif _ensure_storage_ready_for_upload(
+                    movement_doc, policy_names=("movement_document",)
+                ):
                     ok, msg, movement_id = create_supply_movement(
                         conn,
                         supply_id=supply_id,
@@ -4890,6 +5054,7 @@ def page_insumos(conn):
                             entity_type="supply_movement",
                             entity_id=movement_id,
                             attachment_role="movement_document",
+                            policy_name="movement_document",
                         )
                         update_legacy_attachment_path(
                             conn,
@@ -5037,7 +5202,7 @@ def page_manutencao(conn):
             with c2:
                 description = st.text_area("Descrição do problema *", placeholder="Explique a falha, mensagem de erro, contexto de uso, sintomas observados...", key="member_corr_desc")
                 priority = st.selectbox("Prioridade sugerida", ["alta", "média", "baixa"], index=2, key="member_corr_priority")
-                attachment = st.file_uploader("Anexo opcional (foto, vídeo, print)", type=["png", "jpg", "jpeg", "pdf", "mp4", "mov"], key="member_corr_attach")
+                attachment = st.file_uploader("Anexo opcional (foto, vídeo, print)", type=policy_extensions("maintenance_evidence"), key="member_corr_attach")
 
             st.markdown("#### Peças de reposição associadas ao equipamento")
             if equipment_id is None:
@@ -5050,7 +5215,9 @@ def page_manutencao(conn):
                     st.error("Selecione um equipamento para abrir o ticket.")
                 elif not title.strip() or not description.strip():
                     st.error("Informe o resumo e a descrição do problema.")
-                elif not _ensure_storage_ready_for_upload(attachment):
+                elif not _ensure_storage_ready_for_upload(
+                    attachment, policy_names=("maintenance_evidence",)
+                ):
                     pass
                 else:
                     occurrence_dt = datetime.combine(occurrence_date, occurrence_time).isoformat(timespec="minutes")
@@ -5087,6 +5254,7 @@ def page_manutencao(conn):
                             entity_type="maintenance_corrective",
                             entity_id=ticket_id,
                             attachment_role="corrective_attachment",
+                            policy_name="maintenance_evidence",
                         )
                         update_legacy_attachment_path(
                             conn,
@@ -5220,9 +5388,9 @@ def page_manutencao(conn):
 
             c4, c5 = st.columns(2)
             with c4:
-                checklist = st.file_uploader("Checklist anexado (PDF/imagem/formulário)", type=["pdf", "png", "jpg", "jpeg"], key="prev_check")
+                checklist = st.file_uploader("Checklist anexado (PDF/imagem/formulário)", type=policy_extensions("maintenance_document"), key="prev_check")
             with c5:
-                certificate = st.file_uploader("Certificado de calibração", type=["pdf", "png", "jpg", "jpeg"], key="prev_cert")
+                certificate = st.file_uploader("Certificado de calibração", type=policy_extensions("maintenance_document"), key="prev_cert")
 
             observations = st.text_area("Observações", key="prev_obs")
             blocks_booking = st.checkbox(
@@ -5252,7 +5420,11 @@ def page_manutencao(conn):
                     st.error("A data final prevista não pode ser anterior à data inicial.")
                 elif _maintenance_status_requires_justification("pendente", status, creating=True) and not prev_create_status_reason.strip():
                     st.error("Informe a justificativa para este status.")
-                elif not _ensure_storage_ready_for_upload(checklist, certificate):
+                elif not _ensure_storage_ready_for_upload(
+                    checklist,
+                    certificate,
+                    policy_names=("maintenance_document", "maintenance_document"),
+                ):
                     pass
                 else:
                     base_status = "pendente" if status != "pendente" else status
@@ -5288,6 +5460,7 @@ def page_manutencao(conn):
                             entity_type="maintenance_preventive",
                             entity_id=preventive_id,
                             attachment_role="preventive_checklist",
+                            policy_name="maintenance_document",
                         )
                         update_legacy_attachment_path(
                             conn,
@@ -5303,6 +5476,7 @@ def page_manutencao(conn):
                             entity_type="maintenance_preventive",
                             entity_id=preventive_id,
                             attachment_role="preventive_certificate",
+                            policy_name="maintenance_document",
                         )
                         update_legacy_attachment_path(
                             conn,
@@ -5492,9 +5666,9 @@ def page_manutencao(conn):
 
                 u1, u2 = st.columns(2)
                 with u1:
-                    edit_checklist = st.file_uploader("Novo checklist anexado", type=["pdf", "png", "jpg", "jpeg"], key=f"{prev_token}_check")
+                    edit_checklist = st.file_uploader("Novo checklist anexado", type=policy_extensions("maintenance_document"), key=f"{prev_token}_check")
                 with u2:
-                    edit_certificate = st.file_uploader("Novo certificado de calibração", type=["pdf", "png", "jpg", "jpeg"], key=f"{prev_token}_cert")
+                    edit_certificate = st.file_uploader("Novo certificado de calibração", type=policy_extensions("maintenance_document"), key=f"{prev_token}_cert")
 
                 edit_observations = st.text_area("Observações", value=clean_input(selected_prev.get("observations")), key=f"{prev_token}_obs")
                 edit_blocks_booking = st.checkbox(
@@ -5515,7 +5689,11 @@ def page_manutencao(conn):
                         st.error("A data final prevista não pode ser anterior à data inicial.")
                     elif edit_requires_reason and not edit_status_reason.strip():
                         st.error("Informe a justificativa para este status.")
-                    elif not _ensure_storage_ready_for_upload(edit_checklist, edit_certificate):
+                    elif not _ensure_storage_ready_for_upload(
+                        edit_checklist,
+                        edit_certificate,
+                        policy_names=("maintenance_document", "maintenance_document"),
+                    ):
                         pass
                     else:
                         checklist_final = clean_input(selected_prev.get("checklist_path")) or None
@@ -5527,6 +5705,7 @@ def page_manutencao(conn):
                                 entity_type="maintenance_preventive",
                                 entity_id=int(selected_prev["id"]),
                                 attachment_role="preventive_checklist",
+                                policy_name="maintenance_document",
                             )
                         if edit_certificate is not None:
                             certificate_final = _save_upload(
@@ -5535,6 +5714,7 @@ def page_manutencao(conn):
                                 entity_type="maintenance_preventive",
                                 entity_id=int(selected_prev["id"]),
                                 attachment_role="preventive_certificate",
+                                policy_name="maintenance_document",
                             )
                         ok, msg = update_preventive_activity(
                             conn,
@@ -5689,7 +5869,7 @@ def page_manutencao(conn):
                 else:
                     impact = "baixo"
                 priority = st.selectbox("Prioridade sugerida", ["alta", "média", "baixa"], index=2, key="corr_priority")
-                attachment = st.file_uploader("Anexos (foto, vídeo, print)", type=["png", "jpg", "jpeg", "pdf", "mp4", "mov"], key="corr_attach")
+                attachment = st.file_uploader("Anexos (foto, vídeo, print)", type=policy_extensions("maintenance_evidence"), key="corr_attach")
 
             st.markdown("#### Peças de reposição associadas ao equipamento")
             if equipment_id is None:
@@ -5754,7 +5934,9 @@ def page_manutencao(conn):
                     st.error("Informe o título e a descrição do ticket.")
                 elif _maintenance_status_requires_justification("aberto", status, creating=True) and not corr_create_status_reason.strip():
                     st.error("Informe a justificativa para este status.")
-                elif not _ensure_storage_ready_for_upload(attachment):
+                elif not _ensure_storage_ready_for_upload(
+                    attachment, policy_names=("maintenance_evidence",)
+                ):
                     pass
                 else:
                     occurrence_dt = datetime.combine(occurrence_date, occurrence_time).isoformat(timespec="minutes")
@@ -5792,6 +5974,7 @@ def page_manutencao(conn):
                             entity_type="maintenance_corrective",
                             entity_id=ticket_id,
                             attachment_role="corrective_attachment",
+                            policy_name="maintenance_evidence",
                         )
                         update_legacy_attachment_path(
                             conn,
@@ -5962,7 +6145,7 @@ def page_manutencao(conn):
                     edit_description = st.text_area("Descrição detalhada", value=clean_input(selected_corr.get("description")), key=f"{corr_token}_desc")
                     edit_impact = st.selectbox("Impacto", ["crítico", "moderado", "baixo"], index=_option_index(["crítico", "moderado", "baixo"], selected_corr.get("impact"), default=2), key=f"{corr_token}_impact")
                     edit_priority = st.selectbox("Prioridade sugerida", ["alta", "média", "baixa"], index=_option_index(["alta", "média", "baixa"], selected_corr.get("priority"), default=2), key=f"{corr_token}_priority")
-                    edit_attachment = st.file_uploader("Novo anexo (foto, vídeo, print)", type=["png", "jpg", "jpeg", "pdf", "mp4", "mov"], key=f"{corr_token}_attach")
+                    edit_attachment = st.file_uploader("Novo anexo (foto, vídeo, print)", type=policy_extensions("maintenance_evidence"), key=f"{corr_token}_attach")
 
                 st.markdown("#### Peças de reposição associadas ao equipamento")
                 render_equipment_spare_parts(list_spare_parts_for_equipment(conn, edit_equipment_id))
@@ -6011,7 +6194,9 @@ def page_manutencao(conn):
                         st.error("Informe o título e a descrição do ticket.")
                     elif edit_requires_reason and not edit_status_reason.strip():
                         st.error("Informe a justificativa para este status.")
-                    elif not _ensure_storage_ready_for_upload(edit_attachment):
+                    elif not _ensure_storage_ready_for_upload(
+                        edit_attachment, policy_names=("maintenance_evidence",)
+                    ):
                         pass
                     else:
                         attachment_final = clean_input(selected_corr.get("attachment_path")) or None
@@ -6022,6 +6207,7 @@ def page_manutencao(conn):
                                 entity_type="maintenance_corrective",
                                 entity_id=int(selected_corr["id"]),
                                 attachment_role="corrective_attachment",
+                                policy_name="maintenance_evidence",
                             )
                         edit_occurrence_dt = datetime.combine(edit_occurrence_date, edit_occurrence_time).isoformat(timespec="minutes")
                         ok, msg = update_corrective_ticket(
@@ -7621,17 +7807,32 @@ def page_importar(conn):
         st.info("Importação de base é restrita a Administrador.")
         return
     st.write("Use esta página para atualizar a base a partir do arquivo `LabCim_Base.xlsx`.")
-    uploaded = st.file_uploader("Enviar arquivo Excel", type=["xlsx"])
+    uploaded = st.file_uploader(
+        "Enviar arquivo Excel",
+        type=policy_extensions("base_workbook"),
+    )
     if uploaded is not None:
-        tmp = get_local_work_root() / "_uploaded_base.xlsx"
-        tmp.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_bytes(uploaded.getvalue())
         if st.button("Importar arquivo enviado", type="primary"):
+            tmp = None
             try:
+                validated = validate_upload(
+                    filename=uploaded.name,
+                    content=uploaded.getvalue(),
+                    declared_mime=getattr(uploaded, "type", None),
+                    policy_name="base_workbook",
+                )
+                tmp = unique_temporary_upload_path(
+                    get_local_work_root(),
+                    validated.safe_display_filename,
+                )
+                tmp.parent.mkdir(parents=True, exist_ok=False)
+                tmp.write_bytes(validated.content)
                 counts = import_base_xlsx(conn, tmp)
                 st.success(f"Importação concluída: {counts}")
                 clear_app_caches()
                 st.rerun()
+            except UploadValidationError as exc:
+                st.error(str(exc))
             except Exception as exc:
                 st.error(
                     safe_exception_message(
@@ -7640,6 +7841,9 @@ def page_importar(conn):
                         user_message="A importação não pôde ser concluída.",
                     )
                 )
+            finally:
+                if tmp is not None:
+                    shutil.rmtree(tmp.parent, ignore_errors=True)
 
     if BASE_XLSX.exists():
         if st.button("Reimportar arquivo local data/LabCim_Base.xlsx"):
@@ -7669,8 +7873,17 @@ def main():
     setup_page()
     _reset_perf_events()
     try:
+        load_auth_security_config()
+        upload_max_bytes()
+        otp_hash_secret()
         with perf_timer("get_conn"):
             conn = get_conn()
+    except ConfigurationError:
+        st.error(
+            "A configuração de segurança da aplicação é inválida. "
+            "Revise o ambiente antes de iniciar o serviço."
+        )
+        return
     except (SchemaCompatibilityError, FileNotFoundError):
         st.error(
             "O banco de dados não é compatível com esta versão do LabCim Manager. "

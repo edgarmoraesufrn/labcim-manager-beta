@@ -5,11 +5,19 @@ from datetime import datetime, timedelta
 import os
 from pathlib import Path
 import re
+import hmac
 from typing import Any
 
 import pandas as pd
 
+from labcim_manager.auth_security import (
+    INVALID_OTP_MESSAGE,
+    email_identity_available,
+    normalize_email_identity,
+    normalized_email_conflicts,
+)
 from labcim_manager.errors import safe_exception_message
+from labcim_manager.upload_security import validate_upload
 
 try:
     import psycopg
@@ -457,7 +465,7 @@ def update_legacy_attachment_path(
 
 
 def get_active_user_by_email(conn: sqlite3.Connection, email: str) -> sqlite3.Row | None:
-    email = str(email or "").strip().lower()
+    email = normalize_email_identity(email)
     if not email:
         return None
     return conn.execute(
@@ -490,67 +498,81 @@ def create_access_code_record(
         INSERT INTO access_codes (user_id, email, code_hash, expires_at)
         VALUES (?, ?, ?, ?)
         """,
-        [user_id, email, code_hash, expires_at],
+        [user_id, normalize_email_identity(email), code_hash, expires_at],
     )
     conn.commit()
 
 
-def verify_access_code_record(conn: sqlite3.Connection, *, email: str, code_hash: str) -> tuple[bool, str, sqlite3.Row | None]:
-    email = str(email or "").strip().lower()
+def verify_access_code_record(
+    conn: sqlite3.Connection,
+    *,
+    email: str,
+    code_hash: str,
+    max_attempts: int = 5,
+) -> tuple[bool, str, sqlite3.Row | None]:
+    email = normalize_email_identity(email)
     if not email:
-        return False, "E-mail não informado. Solicite uma nova senha volátil.", None
+        return False, INVALID_OTP_MESSAGE, None
     if not code_hash:
-        return False, "Código não informado.", None
-    row = conn.execute(
+        return False, INVALID_OTP_MESSAGE, None
+    challenge = conn.execute(
         """
         SELECT ac.*, u.full_name, u.role, u.active, u.email AS user_email
         FROM access_codes ac
         JOIN users u ON u.id = ac.user_id
         WHERE LOWER(TRIM(ac.email)) = ?
           AND ac.used_at IS NULL
-          AND ac.code_hash = ?
         ORDER BY ac.created_at DESC, ac.id DESC
         LIMIT 1
         """,
-        [email, code_hash],
+        [email],
     ).fetchone()
-    if not row:
-        active_for_email = conn.execute(
-            """
-            SELECT id
-            FROM access_codes
-            WHERE LOWER(TRIM(email)) = ?
-              AND used_at IS NULL
-            ORDER BY created_at DESC, id DESC
-            LIMIT 1
-            """,
-            [email],
-        ).fetchone()
-        if active_for_email:
-            conn.execute(
-                "UPDATE access_codes SET attempts = COALESCE(attempts, 0) + 1 WHERE id = ?",
-                [active_for_email["id"]],
-            )
-            conn.commit()
-            return False, "Código inválido. Use o código mais recente recebido por e-mail.", None
-        return False, "Nenhum código ativo encontrado para este e-mail. Solicite uma nova senha volátil.", None
-    if int(row["active"] or 0) != 1:
-        return False, "Usuário inativo.", None
+    if not challenge:
+        return False, INVALID_OTP_MESSAGE, None
     try:
-        expired = datetime.fromisoformat(str(row["expires_at"])) < datetime.now()
+        expired = datetime.fromisoformat(str(challenge["expires_at"])) < datetime.now()
     except Exception:
         expired = True
     if expired:
-        conn.execute("UPDATE access_codes SET used_at = CURRENT_TIMESTAMP WHERE id = ?", [row["id"]])
+        conn.execute(
+            "UPDATE access_codes SET used_at = CURRENT_TIMESTAMP WHERE id = ?",
+            [challenge["id"]],
+        )
         conn.commit()
-        return False, "Código expirado. Solicite um novo código.", None
-    if int(row["attempts"] or 0) >= 5:
-        conn.execute("UPDATE access_codes SET used_at = CURRENT_TIMESTAMP WHERE id = ?", [row["id"]])
+        return False, INVALID_OTP_MESSAGE, None
+    if int(challenge["attempts"] or 0) >= max_attempts:
+        conn.execute(
+            "UPDATE access_codes SET used_at = CURRENT_TIMESTAMP WHERE id = ?",
+            [challenge["id"]],
+        )
         conn.commit()
-        return False, "Muitas tentativas. Solicite um novo código.", None
-    conn.execute("UPDATE access_codes SET used_at = CURRENT_TIMESTAMP WHERE id = ?", [row["id"]])
+        return False, INVALID_OTP_MESSAGE, None
+    if not hmac.compare_digest(str(challenge["code_hash"]), str(code_hash)):
+        attempts = int(challenge["attempts"] or 0) + 1
+        conn.execute(
+            """
+            UPDATE access_codes
+            SET attempts = ?,
+                used_at = CASE WHEN ? >= ? THEN CURRENT_TIMESTAMP ELSE used_at END
+            WHERE id = ?
+            """,
+            [attempts, attempts, max_attempts, challenge["id"]],
+        )
+        conn.commit()
+        return False, INVALID_OTP_MESSAGE, None
+    if int(challenge["active"] or 0) != 1:
+        conn.execute(
+            "UPDATE access_codes SET used_at = CURRENT_TIMESTAMP WHERE id = ?",
+            [challenge["id"]],
+        )
+        conn.commit()
+        return False, INVALID_OTP_MESSAGE, None
+    conn.execute(
+        "UPDATE access_codes SET used_at = CURRENT_TIMESTAMP WHERE id = ?",
+        [challenge["id"]],
+    )
     conn.commit()
-    return True, "Acesso liberado.", row
+    return True, "Acesso liberado.", challenge
 
 
 def log_notification(
@@ -676,7 +698,18 @@ def _normalize_role(value: Any) -> str:
 
 def import_base_xlsx(conn: sqlite3.Connection, path: Path | str) -> dict[str, int]:
     """Importa uma base Excel simples, aceitando nomes de abas flexíveis."""
+    if normalized_email_conflicts(conn):
+        raise ValueError(
+            "A importação foi recusada porque já existem identidades de e-mail ambíguas. "
+            "Execute o diagnóstico administrativo e resolva os conflitos primeiro."
+        )
     path = Path(path)
+    validate_upload(
+        filename=path.name,
+        content=path.read_bytes(),
+        declared_mime=None,
+        policy_name="base_workbook",
+    )
     with pd.ExcelFile(path) as workbook:
         sheet_names = list(workbook.sheet_names)
     counts = {"equipment": 0, "users": 0, "projects": 0}
@@ -757,11 +790,16 @@ def import_base_xlsx(conn: sqlite3.Connection, path: Path | str) -> dict[str, in
                 name = str(_first(row, "full_name", "nome", "nome_completo", default="")).strip()
                 if not name:
                     continue
-                email = _clean_excel_value(_first(row, "email", "e-mail"))
+                email = normalize_email_identity(
+                    _clean_excel_value(_first(row, "email", "e-mail"))
+                ) or None
                 phone = _clean_excel_value(_first(row, "phone_e164", "telefone", "celular"))
                 existing = None
                 if email:
-                    existing = conn.execute("SELECT id FROM users WHERE LOWER(COALESCE(email, '')) = LOWER(?) LIMIT 1", [email]).fetchone()
+                    existing = conn.execute(
+                        "SELECT id FROM users WHERE LOWER(TRIM(COALESCE(email, ''))) = ? LIMIT 1",
+                        [email],
+                    ).fetchone()
                 if existing is None and phone:
                     existing = conn.execute("SELECT id FROM users WHERE COALESCE(phone_e164, '') = ? LIMIT 1", [phone]).fetchone()
                 if existing is None:
@@ -1460,6 +1498,9 @@ def create_user(
     if not full_name:
         return False, "Informe o nome completo do usuário."
     role = _normalize_role(role)
+    email = normalize_email_identity(email) or None
+    if email and not email_identity_available(conn, email):
+        return False, "Já existe um usuário com este e-mail de autenticação."
     conn.execute(
         """
         INSERT INTO users (
@@ -1493,6 +1534,9 @@ def update_user(
     if not full_name:
         return False, "Informe o nome completo do usuário."
     role = _normalize_role(role)
+    email = normalize_email_identity(email) or None
+    if email and not email_identity_available(conn, email, exclude_user_id=user_id):
+        return False, "Já existe outro usuário com este e-mail de autenticação."
     conn.execute(
         """
         UPDATE users
