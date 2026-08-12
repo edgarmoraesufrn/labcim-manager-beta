@@ -177,6 +177,37 @@ def require_env(env: dict[str, str], report: Report, key: str, purpose: str) -> 
         )
 
 
+def check_bounded_integer(
+    env: dict[str, str],
+    report: Report,
+    key: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> None:
+    raw = str(env.get(key, default)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        report.environment_required(
+            f"security.{key}",
+            "Configured value must be an integer; value withheld.",
+        )
+        return
+    if minimum <= value <= maximum:
+        source = "explicit value" if key in env else "secure repository default"
+        report.passed(
+            f"security.{key}",
+            f"{source.capitalize()} is within the validated range; value withheld.",
+        )
+    else:
+        report.environment_required(
+            f"security.{key}",
+            f"Value must be between {minimum} and {maximum}; value withheld.",
+        )
+
+
 def parse_bool(value: object) -> bool | None:
     if isinstance(value, bool):
         return value
@@ -361,12 +392,38 @@ def check_application_environment(env: dict[str, str], repo_root: Path, report: 
     ):
         require_env(env, report, key, purpose)
 
-    if parse_bool(env.get("LABCIM_AUTH_DEBUG_CODES")) is False and "LABCIM_AUTH_DEBUG_CODES" in env:
-        report.passed("authentication.debug_codes", "Debug-code display is explicitly disabled.")
+    otp_secret = str(
+        env.get("LABCIM_OTP_HASH_SECRET")
+        or env.get("STREAMLIT_SERVER_COOKIE_SECRET")
+        or ""
+    ).strip()
+    if is_real_value(otp_secret) and len(otp_secret) >= 32:
+        report.passed(
+            "authentication.otp_hash_secret",
+            "OTP HMAC secret material is configured; value withheld.",
+        )
     else:
         report.environment_required(
-            "authentication.debug_codes",
-            "LABCIM_AUTH_DEBUG_CODES must be explicitly false.",
+            "authentication.otp_hash_secret",
+            "LABCIM_OTP_HASH_SECRET or STREAMLIT_SERVER_COOKIE_SECRET with at least 32 characters is required.",
+        )
+
+    for key, default, minimum, maximum in (
+        ("LABCIM_OTP_TTL_SECONDS", 600, 60, 1800),
+        ("LABCIM_OTP_MAX_VERIFY_ATTEMPTS", 5, 3, 10),
+        ("LABCIM_OTP_REQUEST_WINDOW_SECONDS", 900, 60, 86400),
+        ("LABCIM_OTP_MAX_REQUESTS_PER_WINDOW", 3, 1, 20),
+        ("LABCIM_OTP_MAX_REQUESTS_PER_ORIGIN", 20, 1, 200),
+        ("LABCIM_OTP_GLOBAL_MAX_REQUESTS", 100, 10, 2000),
+        ("LABCIM_UPLOAD_MAX_BYTES", 25 * 1024 * 1024, 1_048_576, 52_428_800),
+    ):
+        check_bounded_integer(
+            env,
+            report,
+            key,
+            default=default,
+            minimum=minimum,
+            maximum=maximum,
         )
 
     if env.get("TZ") == EXPECTED_TIMEZONE:
@@ -515,15 +572,61 @@ def check_source_gates(repo_root: Path, report: Report) -> None:
             "QR generation does not visibly enforce central public URL configuration.",
         )
 
-    if re.search(r"file_uploader\(\s*[\"']Arquivo[\"']\s*,\s*key=", app_source):
+    upload_security_path = repo_root / "labcim_manager" / "upload_security.py"
+    upload_security_source = (
+        read_text(upload_security_path) if upload_security_path.is_file() else ""
+    )
+    upload_markers = (
+        "UPLOAD_POLICIES",
+        "validate_upload",
+        "upload_max_bytes",
+        "safe_display_filename",
+        "validate_attachment_storage_key",
+        "_detected_type",
+    )
+    if (
+        not all(marker in upload_security_source for marker in upload_markers)
+        or 'policy_name="equipment_document"' not in app_source
+        or "type=policy_extensions(\"equipment_document\")" not in app_source
+        or "validated = validate_upload(" not in app_source
+    ):
         report.code_blocker(
             "uploads.equipment_allowlist",
-            "Equipment document uploader still has no explicit type allowlist.",
+            "Centralized upload policy, content validation or equipment allowlist boundary is incomplete.",
         )
     else:
         report.passed(
             "uploads.equipment_allowlist",
-            "Known unrestricted equipment uploader pattern is absent.",
+            "Equipment uploads use the centralized extension, MIME, signature and size boundary.",
+        )
+
+    auth_security_path = repo_root / "labcim_manager" / "auth_security.py"
+    auth_security_source = (
+        read_text(auth_security_path) if auth_security_path.is_file() else ""
+    )
+    auth_markers = (
+        "NEUTRAL_OTP_REQUEST_MESSAGE",
+        "normalize_email_identity",
+        "register_otp_request",
+        "hash_otp_code",
+        "max_verify_attempts",
+        "identity_hash",
+    )
+    if (
+        all(marker in auth_security_source for marker in auth_markers)
+        and "lookup_auth_identity(conn, normalized)" in app_source
+        and "NEUTRAL_OTP_REQUEST_MESSAGE" in app_source
+        and "last_access_code" not in app_source
+        and "hmac.compare_digest" in database_source
+    ):
+        report.passed(
+            "authentication.abuse_controls",
+            "Neutral issuance, normalized identities, persistent request throttling, HMAC and verification ceilings are present.",
+        )
+    else:
+        report.code_blocker(
+            "authentication.abuse_controls",
+            "Authentication abuse controls or anti-enumeration boundary is incomplete.",
         )
 
     legacy_error_patterns = (
@@ -607,6 +710,7 @@ def check_migrations(repo_root: Path, report: Report) -> None:
         '"upgrade"',
         '"initialize"',
         '"baseline-existing"',
+        '"diagnose-email-identities"',
     )
     if (
         ordered
@@ -758,6 +862,8 @@ def check_required_files(repo_root: Path, report: Report) -> None:
         "labcim_manager/errors.py",
         "labcim_manager/schema.py",
         "labcim_manager/storage.py",
+        "labcim_manager/auth_security.py",
+        "labcim_manager/upload_security.py",
         "static/manifest.json",
         "docs/PRODUCTION_READINESS.md",
         "docs/UFRN_DEPLOYMENT_PLAN.md",
@@ -766,6 +872,8 @@ def check_required_files(repo_root: Path, report: Report) -> None:
         "docs/PRODUCTION_ENV_TEMPLATE.md",
         "docs/LOCAL_STAGING_GUIDE.md",
         "docs/DATABASE_SCHEMA_LIFECYCLE.md",
+        "docs/AUTHENTICATION_SECURITY.md",
+        "docs/UPLOAD_SECURITY.md",
     )
     missing = [relative for relative in required if not (repo_root / relative).is_file()]
     if missing:
