@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 import hashlib
 import mimetypes
 import os
@@ -9,13 +9,20 @@ from pathlib import Path
 import re
 from urllib.parse import quote
 
+from labcim_manager.config import (
+    ConfigurationError,
+    DEFAULT_LOCAL_STORAGE_ROOT,
+    get_app_environment,
+    normalize_storage_backend,
+    resolve_local_storage_root,
+)
 
-LOCAL_UPLOAD_ROOT = Path("data/uploads")
+LOCAL_UPLOAD_ROOT = DEFAULT_LOCAL_STORAGE_ROOT
 R2_REQUIRED_KEYS = ("R2_ENDPOINT_URL", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET")
 DEFAULT_DOWNLOAD_TTL_SECONDS = 300
 
 
-class StorageConfigurationError(RuntimeError):
+class StorageConfigurationError(ConfigurationError, RuntimeError):
     """Raised when production storage cannot safely persist uploaded files."""
 
 
@@ -53,7 +60,7 @@ def _guess_mime_type(filename: str, fallback: str | None = None) -> str | None:
 
 
 def make_storage_key(entity_type: str, entity_id: int, filename: str, digest: str) -> str:
-    now = datetime.utcnow()
+    now = datetime.now(UTC)
     safe_name = _safe_filename(filename)
     safe_entity = re.sub(r"[^A-Za-z0-9_-]+", "_", str(entity_type)).strip("_") or "entity"
     return f"attachments/{safe_entity}/{int(entity_id)}/{now:%Y}/{now:%m}/{digest}_{safe_name}"
@@ -92,20 +99,6 @@ def resolve_config_value(key: str, *, section: str | None = "r2") -> str | None:
     return None
 
 
-def database_url_configured() -> bool:
-    if os.environ.get("DATABASE_URL"):
-        return True
-
-    for key in ("DATABASE_URL", "database_url"):
-        if _read_streamlit_secret(key):
-            return True
-
-    for key in ("url", "DATABASE_URL", "database_url"):
-        if _read_streamlit_secret(key, section="database"):
-            return True
-    return False
-
-
 def get_r2_config() -> R2Config | None:
     values = {key: resolve_config_value(key) for key in R2_REQUIRED_KEYS}
     if all(values.values()):
@@ -127,11 +120,27 @@ def is_r2_configured() -> bool:
     return get_r2_config() is not None
 
 
+def selected_storage_backend() -> str:
+    environment = get_app_environment()
+    value = resolve_config_value("STORAGE_BACKEND", section="storage")
+    return normalize_storage_backend(value, environment=environment)
+
+
+def local_storage_root() -> Path:
+    environment = get_app_environment()
+    value = resolve_config_value("LOCAL_STORAGE_ROOT", section="storage")
+    return resolve_local_storage_root(value, environment=environment)
+
+
 class LocalStorageBackend:
     name = "local"
 
-    def __init__(self, root: Path | str = LOCAL_UPLOAD_ROOT):
-        self.root = Path(root)
+    def __init__(self, root: Path | str | None = None):
+        self.root = (
+            resolve_local_storage_root(root, environment="development")
+            if root is not None
+            else local_storage_root()
+        )
 
     def save_file(
         self,
@@ -144,7 +153,7 @@ class LocalStorageBackend:
     ) -> StoredFile:
         digest = _sha256(content)
         storage_key = make_storage_key(entity_type, entity_id, original_filename, digest)
-        target = self.root / storage_key
+        target = self.resolve_target_path(storage_key)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
         return StoredFile(
@@ -160,12 +169,16 @@ class LocalStorageBackend:
         return self.resolve_path(storage_key).read_bytes()
 
     def resolve_path(self, storage_key: str) -> Path:
+        candidate = self.resolve_target_path(storage_key)
+        if not candidate.exists() or not candidate.is_file():
+            raise FileNotFoundError("Arquivo local não encontrado.")
+        return candidate
+
+    def resolve_target_path(self, storage_key: str) -> Path:
         candidate = (self.root / storage_key).resolve()
         root = self.root.resolve()
         if root not in candidate.parents and candidate != root:
-            raise FileNotFoundError("Chave de arquivo local fora de data/uploads.")
-        if not candidate.exists() or not candidate.is_file():
-            raise FileNotFoundError("Arquivo local não encontrado.")
+            raise FileNotFoundError("Chave de arquivo local fora da raiz configurada.")
         return candidate
 
     def generate_download_url(self, storage_key: str, original_filename: str | None = None) -> None:
@@ -241,18 +254,19 @@ class R2StorageBackend:
 
 
 def get_active_storage_backend(database_url: str | None = None) -> LocalStorageBackend | R2StorageBackend:
-    config = get_r2_config()
-    if config is not None:
-        return R2StorageBackend(config)
+    del database_url  # Database and file-storage selection are intentionally independent.
+    selected = selected_storage_backend()
+    if selected == "local":
+        return LocalStorageBackend()
 
-    if database_url or database_url_configured():
+    config = get_r2_config()
+    if config is None:
         missing = ", ".join(missing_r2_config_keys())
         raise StorageConfigurationError(
-            "Uploads em produção exigem Cloudflare R2 configurado. "
-            f"Defina estes secrets/variáveis: {missing}."
+            "STORAGE_BACKEND=r2 exige configuração R2 completa. "
+            f"Defina: {missing}."
         )
-
-    return LocalStorageBackend()
+    return R2StorageBackend(config)
 
 
 def get_storage_backend_for_name(storage_backend: str) -> LocalStorageBackend | R2StorageBackend:

@@ -9,6 +9,8 @@ from typing import Any
 
 import pandas as pd
 
+from labcim_manager.errors import safe_exception_message
+
 try:
     import psycopg
     from psycopg.rows import dict_row
@@ -1517,7 +1519,11 @@ def change_booking_status(
         return True, "Status da reserva atualizado com histórico."
     except Exception as exc:
         conn.rollback()
-        return False, f"Erro ao atualizar status da reserva: {exc}"
+        return False, safe_exception_message(
+            exc,
+            context="atualização de status da reserva",
+            user_message="Não foi possível atualizar o status da reserva.",
+        )
 
 
 def create_booking(
@@ -1603,7 +1609,15 @@ def create_booking(
         return True, "Reserva registrada com sucesso.", booking_id
     except Exception as exc:
         conn.rollback()
-        return False, f"Erro ao registrar reserva: {exc}", None
+        return (
+            False,
+            safe_exception_message(
+                exc,
+                context="registro de reserva",
+                user_message="Não foi possível registrar a reserva.",
+            ),
+            None,
+        )
 
 
 def update_booking_status(conn: sqlite3.Connection, booking_id: int, status: str) -> None:
@@ -1871,7 +1885,11 @@ def update_equipment_master(
         return False, "Já existe outro equipamento com este código."
     except Exception as exc:
         conn.rollback()
-        return False, f"Erro ao atualizar equipamento: {exc}"
+        return False, safe_exception_message(
+            exc,
+            context="atualização de equipamento",
+            user_message="Não foi possível atualizar o equipamento.",
+        )
 
 
 def create_user(

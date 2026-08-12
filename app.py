@@ -12,6 +12,7 @@ from email.message import EmailMessage
 import hashlib
 from html import escape
 from io import BytesIO
+import json
 from numbers import Integral, Real
 import os
 import secrets as py_secrets
@@ -29,6 +30,15 @@ import streamlit.components.v1 as components
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+from labcim_manager.config import (
+    ConfigurationError,
+    PROJECT_ROOT,
+    build_public_static_url,
+    build_public_url,
+    get_local_work_root,
+    get_public_app_url,
+    project_path,
+)
 from labcim_manager.db import (
     change_booking_status,
     change_maintenance_status,
@@ -80,6 +90,7 @@ from labcim_manager.db import (
     inactivate_maintenance_record,
     verify_access_code_record,
 )
+from labcim_manager.errors import configure_logging, safe_exception_message
 from labcim_manager.storage import (
     LocalStorageBackend,
     R2StorageBackend,
@@ -92,11 +103,11 @@ from labcim_manager.storage import (
 
 APP_TITLE = "LabCim Manager"
 APP_SUBTITLE = "Gestão integrada, rastreabilidade e governança operacional do LabCim"
-DB_PATH = Path("data/labcim_manager.db")
-BASE_XLSX = Path("data/LabCim_Base.xlsx")
-LOGO_PATH = Path("assets/logo_labcim.png")
-APP_ICON_PATH = Path("assets/app_icon.png")
-POP_DIR = Path("assets/pops")
+DB_PATH = project_path("data", "labcim_manager.db")
+BASE_XLSX = project_path("data", "LabCim_Base.xlsx")
+LOGO_PATH = project_path("assets", "logo_labcim.png")
+APP_ICON_PATH = project_path("assets", "app_icon.png")
+POP_DIR = project_path("assets", "pops")
 ACCESS_CODE_TTL_MINUTES = 10
 CACHE_TTL_SECONDS = 120
 DB_CONNECTION_KEY = "labcim_db_connection"
@@ -328,8 +339,16 @@ COLUMN_LABELS = {
 
 def inject_pwa_metadata() -> None:
     """Inject PWA launcher metadata for Android home-screen shortcuts."""
-    components.html(
-        """
+    public_url = get_public_app_url()
+    if public_url:
+        manifest_url = build_public_static_url(public_url, "manifest.json")
+        icon_url = build_public_static_url(public_url, "app-icon-192.png")
+        apple_icon_url = build_public_static_url(public_url, "apple-touch-icon.png")
+    else:
+        manifest_url = "app/static/manifest.json"
+        icon_url = "app/static/app-icon-192.png"
+        apple_icon_url = "app/static/apple-touch-icon.png"
+    html_template = """
         <script>
         (function() {
             let doc = document;
@@ -367,9 +386,9 @@ def inject_pwa_metadata() -> None:
 
             removeInjected();
 
-            addLink("manifest", "app/static/manifest.json");
-            addLink("icon", "app/static/app-icon-192.png", {"type": "image/png", "sizes": "192x192"});
-            addLink("apple-touch-icon", "app/static/apple-touch-icon.png", {"sizes": "180x180"});
+            addLink("manifest", __MANIFEST_URL__, {"type": "application/manifest+json"});
+            addLink("icon", __ICON_URL__, {"type": "image/png", "sizes": "192x192"});
+            addLink("apple-touch-icon", __APPLE_ICON_URL__, {"sizes": "180x180"});
 
             addMeta("theme-color", "#0033A0");
             addMeta("mobile-web-app-capable", "yes");
@@ -378,7 +397,14 @@ def inject_pwa_metadata() -> None:
             addMeta("application-name", "LabCim Manager");
         })();
         </script>
-        """,
+        """
+    html_template = (
+        html_template.replace("__MANIFEST_URL__", json.dumps(manifest_url))
+        .replace("__ICON_URL__", json.dumps(icon_url))
+        .replace("__APPLE_ICON_URL__", json.dumps(apple_icon_url))
+    )
+    components.html(
+        html_template,
         height=0,
         width=0,
     )
@@ -1008,7 +1034,7 @@ def cached_project_services(*, active_only: bool = True) -> pd.DataFrame:
 
 
 def _storage_config_fingerprint() -> str:
-    keys = (*R2_REQUIRED_KEYS, "R2_ACCOUNT_ID")
+    keys = ("APP_ENV", "STORAGE_BACKEND", "LOCAL_STORAGE_ROOT", *R2_REQUIRED_KEYS, "R2_ACCOUNT_ID")
     values = [resolve_config_value(key) or "" for key in keys]
     digest = hashlib.sha256("\0".join(values).encode("utf-8")).hexdigest()[:16]
     return f"storage:{digest}"
@@ -1098,7 +1124,11 @@ def send_email(to_email: str, subject: str, body: str) -> tuple[bool, str]:
             smtp.send_message(msg)
         return True, "E-mail enviado."
     except Exception as exc:
-        return False, str(exc)
+        return False, safe_exception_message(
+            exc,
+            context="envio SMTP",
+            user_message="Não foi possível enviar o e-mail.",
+        )
 
 
 def _auth_debug_codes_enabled() -> bool:
@@ -1887,11 +1917,11 @@ def _resolve_local_doc(path_value) -> Path | None:
         return None
     path = Path(path_text)
     if not path.is_absolute():
-        path = Path.cwd() / path
+        path = PROJECT_ROOT / path
     try:
         path = path.resolve()
-        cwd = Path.cwd().resolve()
-        if cwd not in path.parents and path != cwd:
+        project_root = PROJECT_ROOT.resolve()
+        if project_root not in path.parents and path != project_root:
             return None
     except Exception:
         return None
@@ -3768,7 +3798,13 @@ def _render_attachment_download(attachment_row, label: str, key: str) -> bool:
             )
             return True
     except Exception as exc:
-        st.warning(f"Não foi possível abrir o anexo persistido: {exc}")
+        st.warning(
+            safe_exception_message(
+                exc,
+                context="download de anexo persistido",
+                user_message="Não foi possível abrir o anexo persistido.",
+            )
+        )
     return False
 
 
@@ -7435,7 +7471,7 @@ def _equipment_qr_zip_bytes(
             if _equipment_has_pop_document(row, pop_attachment_equipment_ids):
                 suffixes.append("pop")
             for suffix in suffixes:
-                url = f"{base_url}?eq={code}&view={suffix}"
+                url = build_public_url(base_url, {"eq": code, "view": suffix})
                 zf.writestr(f"equipamentos/{code}_{suffix}.png", _make_qr_png(url))
     return zip_buf.getvalue()
 
@@ -7446,7 +7482,7 @@ def _supply_qr_zip_bytes(supplies: pd.DataFrame, base_url: str) -> bytes:
         for _, row in supplies.iterrows():
             supply_id = int(row["id"])
             safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", clean_value(row.get("supply_name")))
-            url = f"{base_url}?view=insumo&sid={supply_id}"
+            url = build_public_url(base_url, {"view": "insumo", "sid": supply_id})
             zf.writestr(f"insumos/INSUMO_{supply_id}_{safe_name}.png", _make_qr_png(url))
     return zip_buf.getvalue()
 
@@ -7466,8 +7502,13 @@ def page_qrcodes(conn):
         """,
     )
     supplies = query_df(conn, "SELECT * FROM supplies WHERE active=1 ORDER BY supply_name")
-    base_url = st.text_input("URL pública do aplicativo", value="https://labcim-manager.streamlit.app", key="qr_base_url")
-    base_url = base_url.rstrip("/")
+    try:
+        base_url = get_public_app_url(required=True)
+    except ConfigurationError as exc:
+        st.error(str(exc))
+        st.caption("Defina APP_BASE_URL no ambiente administrativo antes de gerar QR Codes.")
+        return
+    st.caption(f"Destino público configurado: `{base_url}`")
 
     tab_eq, tab_sup = st.tabs(["Equipamentos", "Insumos"])
 
@@ -7505,7 +7546,7 @@ def page_qrcodes(conn):
 
             cols = st.columns(len(cards))
             for (label, suffix, instruction), col in zip(cards, cols):
-                url = f"{base_url}?eq={eq}&view={suffix}"
+                url = build_public_url(base_url, {"eq": eq, "view": suffix})
                 png = _make_qr_png(url)
                 with col:
                     st.markdown(f"#### {label}")
@@ -7554,7 +7595,7 @@ def page_qrcodes(conn):
             selected_supply = supplies[supplies["id"] == supply_id].iloc[0]
             render_supply_quick_card(conn, selected_supply)
 
-            url = f"{base_url}?view=insumo&sid={supply_id}"
+            url = build_public_url(base_url, {"view": "insumo", "sid": supply_id})
             png = _make_qr_png(url)
             c1, c2 = st.columns([1, 2])
             with c1:
@@ -7600,7 +7641,8 @@ def page_importar(conn):
     st.write("Use esta página para atualizar a base a partir do arquivo `LabCim_Base.xlsx`.")
     uploaded = st.file_uploader("Enviar arquivo Excel", type=["xlsx"])
     if uploaded is not None:
-        tmp = Path("data/_uploaded_base.xlsx")
+        tmp = get_local_work_root() / "_uploaded_base.xlsx"
+        tmp.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_bytes(uploaded.getvalue())
         if st.button("Importar arquivo enviado", type="primary"):
             try:
@@ -7609,7 +7651,13 @@ def page_importar(conn):
                 clear_app_caches()
                 st.rerun()
             except Exception as exc:
-                st.error(f"Erro na importação: {exc}")
+                st.error(
+                    safe_exception_message(
+                        exc,
+                        context="importação de base Excel",
+                        user_message="A importação não pôde ser concluída.",
+                    )
+                )
 
     if BASE_XLSX.exists():
         if st.button("Reimportar arquivo local data/LabCim_Base.xlsx"):
@@ -7635,6 +7683,7 @@ def apply_url_params_hint():
 
 
 def main():
+    configure_logging()
     setup_page()
     _reset_perf_events()
     with perf_timer("get_conn"):

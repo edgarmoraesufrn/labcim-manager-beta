@@ -8,6 +8,18 @@ font = "sans serif"
 
 [client]
 toolbarMode = "minimal"
+showErrorDetails = "none"
 
 [server]
 enableStaticServing = true
+baseUrlPath = "manager"
+address = "127.0.0.1"
+port = 8501
+headless = true
+enableCORS = true
+enableXsrfProtection = true
+maxUploadSize = 50
+maxMessageSize = 50
+
+[browser]
+gatherUsageStats = false
