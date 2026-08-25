@@ -356,9 +356,13 @@ def init_db(conn: DatabaseConnection) -> None:
             recommended_temperature TEXT,
             characterization_summary TEXT,
             active INTEGER DEFAULT 1,
+            inactive_reason TEXT,
+            inactive_by_id INTEGER,
+            inactive_at TEXT,
             notes TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(inactive_by_id) REFERENCES users(id)
         );
 
         CREATE TABLE IF NOT EXISTS supply_lots (
@@ -528,6 +532,9 @@ def init_db(conn: DatabaseConnection) -> None:
     _add_column(conn, "supplies", "supply_code", "TEXT")
     _add_column(conn, "supplies", "manufacturer_code", "TEXT")
     _add_column(conn, "supplies", "compatible_model_family", "TEXT")
+    _add_column(conn, "supplies", "inactive_reason", "TEXT")
+    _add_column(conn, "supplies", "inactive_by_id", "INTEGER")
+    _add_column(conn, "supplies", "inactive_at", "TEXT")
     _add_column(conn, "supply_movements", "service_id", "INTEGER")
     _add_column(conn, "supply_movements", "supply_lot_id", "INTEGER")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bookings_service ON bookings (service_id)")
@@ -549,6 +556,7 @@ def init_db(conn: DatabaseConnection) -> None:
     conn.execute("UPDATE maintenance_preventive SET is_active = 1 WHERE is_active IS NULL")
     conn.execute("UPDATE maintenance_corrective SET is_active = 1 WHERE is_active IS NULL")
     conn.execute("UPDATE supplies SET supply_type = 'Insumo' WHERE supply_type IS NULL OR TRIM(supply_type) = ''")
+    conn.execute("UPDATE supplies SET active = 1 WHERE active IS NULL")
     conn.execute("UPDATE projects SET status = 'em andamento' WHERE status IS NULL OR TRIM(status) = ''")
     conn.execute("UPDATE users SET role = 'manager' WHERE LOWER(COALESCE(role, '')) IN ('operator', 'operador', 'gerente')")
     conn.commit()
@@ -2993,6 +3001,253 @@ def update_supply(
         ],
     )
     conn.commit()
+
+
+def get_supply_usage_summary(
+    conn: DatabaseConnection,
+    supply_id: int,
+) -> dict[str, Any] | None:
+    supply = conn.execute(
+        """
+        SELECT id, COALESCE(active, 1) AS active, current_quantity,
+               safety_doc_path, technical_doc_path
+        FROM supplies
+        WHERE id = ?
+        """,
+        [supply_id],
+    ).fetchone()
+
+    if not supply:
+        return None
+
+    movements = conn.execute(
+        """
+        SELECT COUNT(*) AS n
+        FROM supply_movements
+        WHERE supply_id = ?
+        """,
+        [supply_id],
+    ).fetchone()["n"]
+
+    lots = conn.execute(
+        """
+        SELECT COUNT(*) AS n
+        FROM supply_lots
+        WHERE supply_id = ?
+        """,
+        [supply_id],
+    ).fetchone()["n"]
+
+    equipment_links = conn.execute(
+        """
+        SELECT COUNT(*) AS n
+        FROM equipment_spare_parts
+        WHERE supply_id = ?
+        """,
+        [supply_id],
+    ).fetchone()["n"]
+
+    attachments = conn.execute(
+        """
+        SELECT COUNT(*) AS n
+        FROM attachments
+        WHERE entity_type = 'supply'
+          AND entity_id = ?
+        """,
+        [supply_id],
+    ).fetchone()["n"]
+
+    has_legacy_document = bool(
+        str(supply["safety_doc_path"] or "").strip()
+        or str(supply["technical_doc_path"] or "").strip()
+    )
+
+    return {
+        "active": int(supply["active"] or 0),
+        "movements": int(movements or 0),
+        "lots": int(lots or 0),
+        "equipment_links": int(equipment_links or 0),
+        "attachments": int(attachments or 0),
+        "current_quantity": float(supply["current_quantity"] or 0),
+        "has_legacy_document": has_legacy_document,
+    }
+
+
+def inactivate_supply(
+    conn: DatabaseConnection,
+    supply_id: int,
+    *,
+    inactive_reason: str,
+    inactive_by_id: int | None = None,
+) -> tuple[bool, str]:
+    reason = str(inactive_reason or "").strip()
+
+    if not reason:
+        return False, "Informe o motivo da inativação."
+
+    try:
+        supply = conn.execute(
+            """
+            SELECT id, COALESCE(active, 1) AS active, current_quantity
+            FROM supplies
+            WHERE id = ?
+            """,
+            [supply_id],
+        ).fetchone()
+
+        if not supply:
+            conn.rollback()
+            return False, "Item não encontrado."
+
+        if int(supply["active"] or 0) == 0:
+            conn.rollback()
+            return False, "O item já está inativo."
+
+        total_balance = float(supply["current_quantity"] or 0)
+        lot_balance_row = conn.execute(
+            """
+            SELECT COALESCE(SUM(current_quantity), 0) AS total
+            FROM supply_lots
+            WHERE supply_id = ?
+              AND COALESCE(is_active, 1) = 1
+            """,
+            [supply_id],
+        ).fetchone()
+        active_lot_balance = float(lot_balance_row["total"] or 0)
+
+        if total_balance > 1e-9 or active_lot_balance > 1e-9:
+            conn.rollback()
+            return (
+                False,
+                "Não é possível inativar um item com saldo em estoque. "
+                "Registre a saída, descarte ou ajuste necessário antes da inativação.",
+            )
+
+        cursor = conn.execute(
+            """
+            UPDATE supplies
+            SET active = 0,
+                inactive_reason = ?,
+                inactive_by_id = ?,
+                inactive_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+              AND COALESCE(active, 1) = 1
+            """,
+            [reason, inactive_by_id, supply_id],
+        )
+
+        if cursor.rowcount != 1:
+            conn.rollback()
+            return False, "O item foi alterado por outra sessão. Recarregue e tente novamente."
+
+        conn.commit()
+        return True, "Item inativado. O histórico foi preservado."
+
+    except Exception as exc:
+        conn.rollback()
+        return False, f"Erro ao inativar item: {exc}"
+
+
+def reactivate_supply(
+    conn: DatabaseConnection,
+    supply_id: int,
+) -> tuple[bool, str]:
+    try:
+        supply = conn.execute(
+            """
+            SELECT id, COALESCE(active, 1) AS active
+            FROM supplies
+            WHERE id = ?
+            """,
+            [supply_id],
+        ).fetchone()
+
+        if not supply:
+            conn.rollback()
+            return False, "Item não encontrado."
+
+        if int(supply["active"] or 0) == 1:
+            conn.rollback()
+            return False, "O item já está ativo."
+
+        cursor = conn.execute(
+            """
+            UPDATE supplies
+            SET active = 1,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+              AND COALESCE(active, 1) = 0
+            """,
+            [supply_id],
+        )
+
+        if cursor.rowcount != 1:
+            conn.rollback()
+            return False, "O item foi alterado por outra sessão. Recarregue e tente novamente."
+
+        conn.commit()
+        return True, "Item reativado com sucesso."
+
+    except Exception as exc:
+        conn.rollback()
+        return False, f"Erro ao reativar item: {exc}"
+
+
+def delete_supply_if_unused(
+    conn: DatabaseConnection,
+    supply_id: int,
+) -> tuple[bool, str]:
+    try:
+        usage = get_supply_usage_summary(conn, supply_id)
+
+        if usage is None:
+            conn.rollback()
+            return False, "Item não encontrado."
+
+        blockers: list[str] = []
+
+        if usage["movements"]:
+            blockers.append("movimentações")
+        if usage["lots"]:
+            blockers.append("lotes")
+        if usage["equipment_links"]:
+            blockers.append("associações com equipamentos")
+        if usage["attachments"]:
+            blockers.append("anexos")
+        if usage["has_legacy_document"]:
+            blockers.append("documentos cadastrados")
+        if abs(usage["current_quantity"]) > 1e-9:
+            blockers.append("saldo de estoque")
+
+        if blockers:
+            conn.rollback()
+            return (
+                False,
+                "Exclusão definitiva não permitida. "
+                "O item possui "
+                + ", ".join(blockers)
+                + ". Use a inativação para preservar a rastreabilidade.",
+            )
+
+        cursor = conn.execute(
+            """
+            DELETE FROM supplies
+            WHERE id = ?
+            """,
+            [supply_id],
+        )
+
+        if cursor.rowcount != 1:
+            conn.rollback()
+            return False, "Item não encontrado."
+
+        conn.commit()
+        return True, "Cadastro sem histórico excluído definitivamente."
+
+    except Exception as exc:
+        conn.rollback()
+        return False, f"Erro ao excluir item: {exc}"
 
 
 def _non_negative_float(value: Any, field_label: str) -> float:
