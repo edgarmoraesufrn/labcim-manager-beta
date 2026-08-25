@@ -47,10 +47,13 @@ from labcim_manager.db import (
     create_supply_movement,
     create_user,
     deactivate_attachment,
+    delete_supply_if_unused,
     get_active_user_by_email,
+    get_supply_usage_summary,
     get_attachment,
     get_latest_attachment_for_entity,
     import_base_xlsx,
+    inactivate_supply,
     inactivate_supply_lot,
     init_db,
     is_operational_database_empty,
@@ -64,6 +67,7 @@ from labcim_manager.db import (
     list_upcoming_preventive_maintenance,
     log_notification,
     query_df,
+    reactivate_supply,
     seed_default_pops,
     set_spare_part_equipment_links,
     table_counts,
@@ -189,6 +193,7 @@ INSTALL_APP_HELP_KEY = "labcim_show_install_app_help"
 SUPPLY_FLASH_KEY = "labcim_supply_flash"
 SUPPLY_PENDING_MODE_KEY = "labcim_supply_pending_mode"
 SUPPLY_JUST_CREATED_ID_KEY = "labcim_supply_just_created_id"
+SUPPLY_ADMIN_FLASH_KEY = "labcim_supply_admin_flash"
 PAGE_ICONS = {
     "Painel inicial": "🏠",
     "Reservas": "📅",
@@ -3682,7 +3687,8 @@ def _supply_options(supplies: pd.DataFrame) -> list[str]:
         item_type = clean_value(r.get("supply_type"), "Insumo")
         code = clean_input(r.get("supply_code"))
         code_text = f"{code} · " if code else ""
-        return f"{int(r['id'])} — {code_text}{clean_value(r.get('supply_name'))} · {item_type} · saldo: {qty:g} {clean_value(r.get('unit'), '')}"
+        status_text = "" if truthy(r.get("active")) else " · INATIVO"
+        return f"{int(r['id'])} — {code_text}{clean_value(r.get('supply_name'))} · {item_type} · saldo: {qty:g} {clean_value(r.get('unit'), '')}{status_text}"
     return supplies.apply(_label, axis=1).tolist()
 
 
@@ -4453,6 +4459,14 @@ def page_insumos(conn):
             f"ID {int(supply_flash.get('id'))}"
         )
 
+    admin_flash = st.session_state.pop(SUPPLY_ADMIN_FLASH_KEY, None)
+    if admin_flash:
+        message = clean_value(admin_flash.get("message"))
+        if admin_flash.get("level") == "error":
+            st.error(message)
+        else:
+            st.success(message)
+
     tab_visao, tab_cadastro, tab_mov, tab_hist = st.tabs([
         "Visão geral",
         "Cadastrar/editar insumo",
@@ -4529,6 +4543,15 @@ def page_insumos(conn):
                         st.session_state["supply_edit_select"] = _supply_options(
                             just_created
                         )[0]
+
+                current_edit_selection = st.session_state.get(
+                    "supply_edit_select"
+                )
+                if (
+                    current_edit_selection is not None
+                    and current_edit_selection not in edit_options
+                ):
+                    st.session_state.pop("supply_edit_select", None)
 
                 label = st.selectbox(
                     "Selecionar item",
@@ -4676,7 +4699,17 @@ def page_insumos(conn):
                         selected_equipment_ids = _equipment_ids_from_labels(equipment, selected_equipment_labels)
 
                 notes = st.text_area("Observações", value=clean_input(selected_supply.get("notes")) if selected_supply is not None else "")
-                active = st.checkbox("Item ativo", value=True if selected_supply is None else truthy(selected_supply.get("active")))
+                active = 1 if selected_supply is None else int(
+                    truthy(selected_supply.get("active"))
+                )
+                if selected_supply is None:
+                    st.caption("O novo item será cadastrado como ativo.")
+                else:
+                    status_label = "Ativo" if active else "Inativo"
+                    st.caption(
+                        f"Status atual: **{status_label}**. "
+                        "Use a seção Administração do item para alterar o status."
+                    )
                 submitted = st.form_submit_button("Salvar insumo", type="primary")
 
             if selected_supply is not None and not is_spare_part:
@@ -4707,6 +4740,202 @@ def page_insumos(conn):
 
             if selected_supply is not None:
                 render_supply_lots_section(conn, selected_supply, supply_lots)
+
+                supply_id_for_admin = int(selected_supply["id"])
+                usage = get_supply_usage_summary(
+                    conn,
+                    supply_id_for_admin,
+                )
+
+                if usage is not None:
+                    with st.expander(
+                        "⚠️ Administração do item",
+                        expanded=False,
+                    ):
+                        item_is_active = bool(usage["active"])
+
+                        if item_is_active:
+                            st.success("Status atual: ATIVO")
+                        else:
+                            st.warning("Status atual: INATIVO")
+                            inactive_reason = clean_input(
+                                selected_supply.get("inactive_reason")
+                            )
+                            inactive_at = clean_input(
+                                selected_supply.get("inactive_at")
+                            )
+                            if inactive_reason:
+                                st.caption(
+                                    f"Último motivo de inativação: {inactive_reason}"
+                                )
+                            if inactive_at:
+                                try:
+                                    inactive_at_dt = datetime.fromisoformat(
+                                        inactive_at.replace("Z", "+00:00")
+                                    )
+                                    inactive_at_label = inactive_at_dt.strftime(
+                                        "%d/%m/%Y %H:%M"
+                                    )
+                                except ValueError:
+                                    inactive_at_label = inactive_at
+                                st.caption(
+                                    f"Inativado em: {inactive_at_label}"
+                                )
+
+                        st.caption(
+                            "Movimentações: "
+                            f"{int(usage['movements'])} · "
+                            "Lotes: "
+                            f"{int(usage['lots'])} · "
+                            "Associações com equipamentos: "
+                            f"{int(usage['equipment_links'])} · "
+                            "Anexos: "
+                            f"{int(usage['attachments'])} · "
+                            "Saldo: "
+                            f"{float(usage['current_quantity']):g} "
+                            f"{clean_value(selected_supply.get('unit'), '')}"
+                        )
+
+                        if item_is_active:
+                            reason = st.text_input(
+                                "Motivo da inativação",
+                                key=f"supply_inactivate_reason_{supply_id_for_admin}",
+                                placeholder=(
+                                    "Ex.: cadastro duplicado, item descontinuado, "
+                                    "substituído por novo cadastro"
+                                ),
+                            )
+                            confirm_inactivate = st.checkbox(
+                                "Confirmo que desejo inativar este item.",
+                                key=f"supply_inactivate_confirm_{supply_id_for_admin}",
+                            )
+
+                            if float(usage["current_quantity"]) > 1e-9:
+                                st.info(
+                                    "O item possui saldo. Registre a saída, descarte "
+                                    "ou ajuste necessário antes da inativação."
+                                )
+
+                            if st.button(
+                                "Inativar item",
+                                key=f"supply_inactivate_button_{supply_id_for_admin}",
+                                disabled=not (
+                                    clean_input(reason)
+                                    and confirm_inactivate
+                                ),
+                            ):
+                                user = current_user()
+                                changed_by_id = (
+                                    int(user["id"])
+                                    if user and user.get("id") is not None
+                                    else None
+                                )
+                                ok, message = inactivate_supply(
+                                    conn,
+                                    supply_id_for_admin,
+                                    inactive_reason=reason,
+                                    inactive_by_id=changed_by_id,
+                                )
+                                if ok:
+                                    st.session_state[SUPPLY_ADMIN_FLASH_KEY] = {
+                                        "level": "success",
+                                        "message": "✅ " + message,
+                                    }
+                                    st.session_state[
+                                        SUPPLY_PENDING_MODE_KEY
+                                    ] = "Editar item existente"
+                                    clear_app_caches()
+                                    st.rerun()
+                                else:
+                                    st.error(message)
+
+                        else:
+                            st.caption(
+                                "A reativação devolve o item às listas operacionais. "
+                                "O registro da última inativação é preservado."
+                            )
+                            if st.button(
+                                "Reativar item",
+                                key=f"supply_reactivate_button_{supply_id_for_admin}",
+                                type="primary",
+                            ):
+                                ok, message = reactivate_supply(
+                                    conn,
+                                    supply_id_for_admin,
+                                )
+                                if ok:
+                                    st.session_state[SUPPLY_ADMIN_FLASH_KEY] = {
+                                        "level": "success",
+                                        "message": "✅ " + message,
+                                    }
+                                    st.session_state[
+                                        SUPPLY_PENDING_MODE_KEY
+                                    ] = "Editar item existente"
+                                    clear_app_caches()
+                                    st.rerun()
+                                else:
+                                    st.error(message)
+
+                        can_delete_permanently = (
+                            int(usage["movements"]) == 0
+                            and int(usage["lots"]) == 0
+                            and int(usage["equipment_links"]) == 0
+                            and int(usage["attachments"]) == 0
+                            and not bool(usage["has_legacy_document"])
+                            and abs(float(usage["current_quantity"])) <= 1e-9
+                        )
+
+                        st.divider()
+                        if is_admin():
+                            if can_delete_permanently:
+                                st.error(
+                                    "Este cadastro ainda não possui histórico "
+                                    "operacional e pode ser excluído definitivamente. "
+                                    "Esta ação não pode ser desfeita."
+                                )
+                                confirm_delete = st.checkbox(
+                                    "Confirmo a exclusão definitiva deste cadastro.",
+                                    key=f"supply_delete_confirm_{supply_id_for_admin}",
+                                )
+                                if st.button(
+                                    "Excluir cadastro definitivamente",
+                                    key=f"supply_delete_button_{supply_id_for_admin}",
+                                    disabled=not confirm_delete,
+                                ):
+                                    ok, message = delete_supply_if_unused(
+                                        conn,
+                                        supply_id_for_admin,
+                                    )
+                                    if ok:
+                                        st.session_state[
+                                            SUPPLY_ADMIN_FLASH_KEY
+                                        ] = {
+                                            "level": "success",
+                                            "message": "✅ " + message,
+                                        }
+                                        st.session_state[
+                                            SUPPLY_PENDING_MODE_KEY
+                                        ] = "Novo item"
+                                        st.session_state.pop(
+                                            SUPPLY_JUST_CREATED_ID_KEY,
+                                            None,
+                                        )
+                                        clear_app_caches()
+                                        st.rerun()
+                                    else:
+                                        st.error(message)
+                            else:
+                                st.caption(
+                                    "Exclusão definitiva indisponível: este item "
+                                    "já possui saldo, histórico, lote, associação "
+                                    "ou documento. Use a inativação para preservar "
+                                    "a rastreabilidade."
+                                )
+                        else:
+                            st.caption(
+                                "A exclusão definitiva de cadastro sem histórico "
+                                "é restrita ao Administrador."
+                            )
 
             if submitted:
                 if not can_manage_master_data():
