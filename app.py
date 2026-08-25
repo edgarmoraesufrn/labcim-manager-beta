@@ -18,6 +18,7 @@ import secrets as py_secrets
 import smtplib
 from time import perf_counter
 import zipfile
+import unicodedata
 from pathlib import Path
 import re
 
@@ -185,6 +186,9 @@ SIDEBAR_URL_PAGE_KEY = "labcim_sidebar_url_page"
 SCROLL_TO_TOP_PAGE_KEY = "labcim_scroll_to_top_page"
 MOBILE_MENU_PAGE_KEY = "mobile_menu_navigation_page"
 INSTALL_APP_HELP_KEY = "labcim_show_install_app_help"
+SUPPLY_FLASH_KEY = "labcim_supply_flash"
+SUPPLY_PENDING_MODE_KEY = "labcim_supply_pending_mode"
+SUPPLY_JUST_CREATED_ID_KEY = "labcim_supply_just_created_id"
 PAGE_ICONS = {
     "Painel inicial": "🏠",
     "Reservas": "📅",
@@ -263,6 +267,7 @@ COLUMN_LABELS = {
     "stock_status": "Status de estoque",
     "association_notes": "Observação da associação",
     "alerta": "Alerta",
+    "possible_duplicate_reason": "Motivo do alerta",
     "quantity_to_minimum": "Falta para o mínimo",
     "days_until_expiration": "Dias até validade",
     "certificate_status": "Status do certificado",
@@ -3552,6 +3557,125 @@ def _save_upload(
     return _attachment_ref(attachment_id)
 
 
+
+def _normalize_supply_identity(value: object) -> str:
+    text = clean_input(value)
+    if not text:
+        return ""
+
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(
+        char for char in text
+        if not unicodedata.combining(char)
+    )
+    text = text.casefold()
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def _find_supply_duplicates(
+    conn,
+    *,
+    supply_name: str,
+    supply_type: str,
+    supply_code: str | None = None,
+    commercial_name: str | None = None,
+    manufacturer: str | None = None,
+    manufacturer_code: str | None = None,
+) -> pd.DataFrame:
+    existing = query_df(
+        conn,
+        """
+        SELECT id, supply_type, supply_name, supply_code,
+               commercial_name, manufacturer, manufacturer_code,
+               current_quantity, unit, active
+        FROM supplies
+        ORDER BY active DESC, supply_name
+        """,
+    )
+
+    if existing.empty:
+        return pd.DataFrame(
+            columns=[
+                *existing.columns.tolist(),
+                "possible_duplicate_reason",
+            ]
+        )
+
+    target = {
+        "name": _normalize_supply_identity(supply_name),
+        "type": _normalize_supply_identity(supply_type),
+        "code": _normalize_supply_identity(supply_code),
+        "commercial": _normalize_supply_identity(commercial_name),
+        "manufacturer": _normalize_supply_identity(manufacturer),
+        "manufacturer_code": _normalize_supply_identity(manufacturer_code),
+    }
+
+    matches: list[dict[str, object]] = []
+
+    for _, row in existing.iterrows():
+        candidate = {
+            "name": _normalize_supply_identity(row.get("supply_name")),
+            "type": _normalize_supply_identity(row.get("supply_type")),
+            "code": _normalize_supply_identity(row.get("supply_code")),
+            "commercial": _normalize_supply_identity(row.get("commercial_name")),
+            "manufacturer": _normalize_supply_identity(row.get("manufacturer")),
+            "manufacturer_code": _normalize_supply_identity(row.get("manufacturer_code")),
+        }
+
+        reasons: list[str] = []
+
+        if target["code"] and target["code"] == candidate["code"]:
+            reasons.append("mesmo código interno")
+
+        if (
+            target["manufacturer_code"]
+            and target["manufacturer_code"] == candidate["manufacturer_code"]
+            and (
+                not target["manufacturer"]
+                or not candidate["manufacturer"]
+                or target["manufacturer"] == candidate["manufacturer"]
+            )
+        ):
+            reasons.append("mesmo código do fabricante")
+
+        manufacturer_compatible = (
+            not target["manufacturer"]
+            or not candidate["manufacturer"]
+            or target["manufacturer"] == candidate["manufacturer"]
+        )
+        commercial_compatible = (
+            not target["commercial"]
+            or not candidate["commercial"]
+            or target["commercial"] == candidate["commercial"]
+        )
+
+        same_descriptive_identity = (
+            bool(target["name"])
+            and target["name"] == candidate["name"]
+            and target["type"] == candidate["type"]
+            and manufacturer_compatible
+            and commercial_compatible
+        )
+
+        if same_descriptive_identity:
+            reasons.append("mesmo nome, fabricante e nome comercial")
+
+        if reasons:
+            record = row.to_dict()
+            record["possible_duplicate_reason"] = "; ".join(dict.fromkeys(reasons))
+            matches.append(record)
+
+    if not matches:
+        return pd.DataFrame(
+            columns=[
+                *existing.columns.tolist(),
+                "possible_duplicate_reason",
+            ]
+        )
+
+    return pd.DataFrame(matches)
+
+
 def _supply_options(supplies: pd.DataFrame) -> list[str]:
     def _label(r: pd.Series) -> str:
         qty = 0.0 if is_blank(r.get("current_quantity")) else float(r.get("current_quantity"))
@@ -4321,6 +4445,14 @@ def page_insumos(conn):
         else:
             st.warning("QR de insumo detectado, mas o insumo não foi encontrado no banco atual.")
 
+    supply_flash = st.session_state.pop(SUPPLY_FLASH_KEY, None)
+    if supply_flash:
+        st.success(
+            "✅ Item cadastrado com sucesso: "
+            f"**{clean_value(supply_flash.get('name'))}** · "
+            f"ID {int(supply_flash.get('id'))}"
+        )
+
     tab_visao, tab_cadastro, tab_mov, tab_hist = st.tabs([
         "Visão geral",
         "Cadastrar/editar insumo",
@@ -4376,14 +4508,43 @@ def page_insumos(conn):
         if not can_manage_master_data():
             st.info("Cadastro, edição estrutural, lotes, certificados e associação de peças são restritos a Gerente ou Administrador.")
         else:
+            pending_mode = st.session_state.pop(SUPPLY_PENDING_MODE_KEY, None)
+            if pending_mode in {"Novo item", "Editar item existente"}:
+                st.session_state["supply_edit_mode"] = pending_mode
+
             mode = st.radio("Modo", ["Novo item", "Editar item existente"], horizontal=True, key="supply_edit_mode")
             selected_supply = None
             if mode == "Editar item existente":
                 if supplies.empty:
                     st.info("Cadastre um item de estoque antes de editar.")
                     return
-                label = st.selectbox("Selecionar item", _supply_options(supplies), key="supply_edit_select")
-                selected_supply = supplies[supplies["id"] == _supply_id_from_label(supplies, label)].iloc[0]
+                edit_options = _supply_options(supplies)
+                just_created_id = st.session_state.get(SUPPLY_JUST_CREATED_ID_KEY)
+
+                if just_created_id is not None:
+                    just_created = supplies[
+                        supplies["id"].astype(int) == int(just_created_id)
+                    ]
+                    if not just_created.empty:
+                        st.session_state["supply_edit_select"] = _supply_options(
+                            just_created
+                        )[0]
+
+                label = st.selectbox(
+                    "Selecionar item",
+                    edit_options,
+                    key="supply_edit_select",
+                )
+                selected_supply = supplies[
+                    supplies["id"] == _supply_id_from_label(supplies, label)
+                ].iloc[0]
+
+                if (
+                    just_created_id is not None
+                    and int(selected_supply["id"]) == int(just_created_id)
+                ):
+                    st.success("🟢 Cadastrado agora")
+                    st.session_state.pop(SUPPLY_JUST_CREATED_ID_KEY, None)
 
             current_supply_type = _supply_type_value(selected_supply)
             supply_type_key = f"supply_type_{mode}_{int(selected_supply['id']) if selected_supply is not None else 'new'}"
@@ -4556,6 +4717,52 @@ def page_insumos(conn):
                     pass
                 else:
                     if mode == "Novo item":
+                        duplicates = _find_supply_duplicates(
+                            conn,
+                            supply_name=supply_name.strip(),
+                            supply_type=supply_type,
+                            supply_code=supply_code.strip() or None,
+                            commercial_name=commercial_name.strip() or None,
+                            manufacturer=manufacturer.strip() or None,
+                            manufacturer_code=manufacturer_code.strip() or None,
+                        )
+
+                        if not duplicates.empty:
+                            st.warning(
+                                "⚠️ Possível item já cadastrado. "
+                                "O novo cadastro não foi realizado."
+                            )
+
+                            duplicate_columns = [
+                                "possible_duplicate_reason",
+                                "id",
+                                "supply_name",
+                                "supply_code",
+                                "commercial_name",
+                                "manufacturer",
+                                "manufacturer_code",
+                                "current_quantity",
+                                "unit",
+                                "active",
+                            ]
+                            duplicate_columns = [
+                                column
+                                for column in duplicate_columns
+                                if column in duplicates.columns
+                            ]
+
+                            st.dataframe(
+                                _display_df(duplicates[duplicate_columns]),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                            st.info(
+                                "Verifique o cadastro encontrado em "
+                                "**Editar item existente** antes de criar outro."
+                            )
+                            return
+
+                    if mode == "Novo item":
                         supply_id = create_supply(
                             conn,
                             supply_type=supply_type,
@@ -4632,7 +4839,17 @@ def page_insumos(conn):
                                 column="technical_doc_path",
                                 value=technical_ref,
                             )
-                        st.success("Item cadastrado com sucesso.")
+                        st.session_state[SUPPLY_FLASH_KEY] = {
+                            "id": int(supply_id),
+                            "name": supply_name.strip(),
+                        }
+                        st.session_state[
+                            SUPPLY_PENDING_MODE_KEY
+                        ] = "Editar item existente"
+                        st.session_state[
+                            SUPPLY_JUST_CREATED_ID_KEY
+                        ] = int(supply_id)
+
                         clear_app_caches()
                         st.rerun()
                     else:
