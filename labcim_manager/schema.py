@@ -9,6 +9,7 @@ from labcim_manager.migrations import (
     v001_legacy_core,
     v002_approved_schema,
     v003_auth_abuse_protection,
+    v004_supply_lifecycle,
 )
 
 
@@ -74,6 +75,13 @@ def _migration_payload(version: int) -> str:
         )
     if version == v003_auth_abuse_protection.VERSION:
         return v003_auth_abuse_protection.SQL
+    if version == v004_supply_lifecycle.VERSION:
+        return "\n".join(
+            (
+                repr(v004_supply_lifecycle.COLUMN_ADDITIONS),
+                v004_supply_lifecycle.NORMALIZATION_SQL,
+            )
+        )
     raise ValueError(f"Versão de migration desconhecida: {version}.")
 
 
@@ -86,6 +94,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     _migration(v001_legacy_core.VERSION, v001_legacy_core.NAME),
     _migration(v002_approved_schema.VERSION, v002_approved_schema.NAME),
     _migration(v003_auth_abuse_protection.VERSION, v003_auth_abuse_protection.NAME),
+    _migration(v004_supply_lifecycle.VERSION, v004_supply_lifecycle.NAME),
 )
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1].version
 
@@ -215,10 +224,17 @@ V2_TABLE_COLUMNS.update(
     }
 )
 
-CURRENT_TABLE_COLUMNS: dict[str, frozenset[str]] = dict(V2_TABLE_COLUMNS)
-CURRENT_TABLE_COLUMNS["auth_rate_limit_events"] = frozenset(
+V3_TABLE_COLUMNS: dict[str, frozenset[str]] = dict(V2_TABLE_COLUMNS)
+V3_TABLE_COLUMNS["auth_rate_limit_events"] = frozenset(
     {"id", "identity_hash", "origin_hash", "event_type", "outcome", "occurred_at"}
 )
+
+CURRENT_TABLE_COLUMNS: dict[str, frozenset[str]] = dict(V3_TABLE_COLUMNS)
+CURRENT_TABLE_COLUMNS["supplies"] = CURRENT_TABLE_COLUMNS["supplies"] | {
+    "inactive_reason",
+    "inactive_by_id",
+    "inactive_at",
+}
 
 
 V2_INDEXES = frozenset(
@@ -237,11 +253,13 @@ V2_INDEXES = frozenset(
     }
 )
 
-CURRENT_INDEXES = V2_INDEXES | {
+V3_INDEXES = V2_INDEXES | {
     "idx_auth_rate_identity_event_time",
     "idx_auth_rate_origin_event_time",
     "idx_auth_rate_event_time",
 }
+
+CURRENT_INDEXES = V3_INDEXES
 
 
 CRITICAL_COLUMN_TYPES: dict[tuple[str, str], str] = {
@@ -346,6 +364,9 @@ def structural_issues(conn: DatabaseConnection, version: int = LATEST_SCHEMA_VER
     elif version == 2:
         contract = V2_TABLE_COLUMNS
         expected_indexes = V2_INDEXES
+    elif version == 3:
+        contract = V3_TABLE_COLUMNS
+        expected_indexes = V3_INDEXES
     else:
         contract = CURRENT_TABLE_COLUMNS
         expected_indexes = CURRENT_INDEXES
@@ -551,6 +572,11 @@ def _apply_migration(conn: DatabaseConnection, migration: Migration) -> None:
             migration_sql_for_dialect(v003_auth_abuse_protection.SQL, db_backend(conn)),
         )
         return
+    if migration.version == 4:
+        for table, column, definition in v004_supply_lifecycle.COLUMN_ADDITIONS:
+            _add_column(conn, table, column, definition)
+        _execute_script(conn, v004_supply_lifecycle.NORMALIZATION_SQL)
+        return
     raise SchemaLifecycleError(f"Migration sem executor: {migration.version}.")
 
 
@@ -616,8 +642,11 @@ def _adoptable_version(conn: DatabaseConnection) -> tuple[int | None, tuple[str,
     if not current_issues:
         return LATEST_SCHEMA_VERSION, ()
     tables = _table_names(conn)
+    version_three_issues = structural_issues(conn, 3)
+    if not version_three_issues:
+        return 3, ()
     if "auth_rate_limit_events" in tables:
-        return None, current_issues
+        return None, version_three_issues
 
     version_two_issues = structural_issues(conn, 2)
     if not version_two_issues:

@@ -100,6 +100,10 @@ class SchemaLifecycleTests(unittest.TestCase):
             checksums[2],
             "a07a72c9752d99324b0e8fbb07e510342e253b785da85f0fa74e06ae7981b8a0",
         )
+        self.assertEqual(
+            checksums[4],
+            "71a3a63c959c0a310ac64c6cb403e310a8767db16e69d1531870cb5ff783a502",
+        )
 
     def test_fresh_sqlite_initializes_to_current_schema_without_seed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -531,11 +535,14 @@ class SchemaLifecycleTests(unittest.TestCase):
                     conn.execute("SELECT equipment_name FROM equipment").fetchone()["equipment_name"],
                     "Equipamento restaurado",
                 )
-                self.assertEqual(conn.raw_conn.total_changes - before_changes, 3)
+                self.assertEqual(
+                    conn.raw_conn.total_changes - before_changes,
+                    LATEST_SCHEMA_VERSION,
+                )
             finally:
                 conn.close()
 
-    def test_unversioned_v2_snapshot_is_adopted_then_upgraded_to_v3(self) -> None:
+    def test_unversioned_v2_snapshot_is_adopted_then_upgraded_to_current(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "restored-v2.db"
             conn = connect(path)
@@ -551,14 +558,75 @@ class SchemaLifecycleTests(unittest.TestCase):
                 adopted = baseline_existing_schema(conn, confirmed=True)
                 self.assertEqual(adopted.state, SchemaState.BEHIND)
                 self.assertEqual(adopted.current_version, 2)
-                self.assertEqual(adopted.pending_versions, (3,))
+                self.assertEqual(adopted.pending_versions, (3, 4))
                 current = upgrade_schema(conn)
                 self.assertTrue(current.compatible)
-                self.assertEqual(current.current_version, 3)
+                self.assertEqual(current.current_version, 4)
                 self.assertEqual(
                     conn.execute("SELECT full_name FROM users").fetchone()["full_name"],
                     "V2 User",
                 )
+            finally:
+                conn.close()
+
+    def test_version_three_upgrades_to_v4_and_normalizes_supply_active(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "v3-to-v4.db"
+            conn = connect(path)
+            try:
+                initialize_schema(conn)
+                supply_id = create_supply(
+                    conn,
+                    supply_type="Insumo",
+                    supply_name="Normalização v4",
+                    supply_code=None,
+                    commercial_name=None,
+                    manufacturer=None,
+                    manufacturer_code=None,
+                    category=None,
+                    physical_state=None,
+                    application_function=None,
+                    addition_mode=None,
+                    compatible_model_family=None,
+                    unit="kg",
+                    current_quantity=0,
+                    minimum_quantity=0,
+                    lot=None,
+                    expiration_date=None,
+                    location=None,
+                    responsible_name=None,
+                    safety_doc_path=None,
+                    technical_doc_path=None,
+                    density=None,
+                    recommended_concentration=None,
+                    recommended_temperature=None,
+                    characterization_summary=None,
+                    notes=None,
+                )
+                conn.execute("UPDATE supplies SET active = NULL WHERE id = ?", [supply_id])
+                conn.execute(f"DELETE FROM {MIGRATION_TABLE} WHERE version = 4")
+                conn.commit()
+
+                before = inspect_schema(conn)
+                self.assertEqual(before.state, SchemaState.BEHIND)
+                self.assertEqual(before.current_version, 3)
+                self.assertEqual(before.pending_versions, (4,))
+
+                current = upgrade_schema(conn)
+                self.assertTrue(current.compatible)
+                self.assertEqual(current.current_version, 4)
+                row = conn.execute(
+                    """
+                    SELECT active, inactive_reason, inactive_by_id, inactive_at
+                    FROM supplies
+                    WHERE id = ?
+                    """,
+                    [supply_id],
+                ).fetchone()
+                self.assertEqual(int(row["active"]), 1)
+                self.assertIsNone(row["inactive_reason"])
+                self.assertIsNone(row["inactive_by_id"])
+                self.assertIsNone(row["inactive_at"])
             finally:
                 conn.close()
 
